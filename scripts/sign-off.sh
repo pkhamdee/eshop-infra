@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
-# Sign off a release candidate (docs/git-workflow.md, "Releasing"): the "Sign off release candidate" workflow
-# (.github/workflows/sign-off.yml) runs it on main; it is not meant to be run by hand.
+# Sign off a release candidate (docs/git-workflow.md, "Sign-off"; ADR 0008): the sign-off workflow
+# (.github/workflows/sign-off.yml) runs it on a push to main that adds or changes a release's record releases/X.Y.Z.md,
+# i.e. when a sign-off PR (scripts/sign-off-pr.sh) is merged. It is not meant to be run by hand.
 #
-#   SIGN_OFF_ACTOR=<github login> scripts/sign-off.sh 0.3.0-rc.1
+#   scripts/sign-off.sh <before> <after>   # the push: main's commit before it and after it
 #
-# Refuses, changing nothing, unless:
-#   - SIGN_OFF_ACTOR is a maintainer of $REPO (repo role admin or maintain);
-#   - tag vX.Y.Z-rc.N is on origin (annotated);
+# The record names the candidate (a line `Candidate: `vX.Y.Z-rc.N``); who signed off is whoever merged the PR that
+# brought in <after>. A push that adds or changes no record does nothing.
+# Refuses, changing nothing (and failing, so the workflow run shows it), unless:
+#   - the push adds or changes exactly one record, which names a candidate of its version, tag vX.Y.Z-rc.N on origin
+#     (annotated);
+#   - a merged PR brought in <after> (its merger signs off), and its merger is a maintainer of $REPO (repo role
+#     admin or maintain): anyone else's merge signs off nothing, and the run fails saying so;
 #   - origin/main pins eshop-qa to exactly that candidate and apps-qa is not suspended (scripts/pin-release.sh qa);
-#   - the latest completed QA run of it on main, "E2E qa X.Y.Z-rc.N" (e2e.yml), created since main last changed
-#     QA's pin (older runs tested an earlier deployment), passed. That run checked of the
-#     cluster that QA served the candidate before and after the test (e2e/check-serving.sh), which a hosted runner
-#     can't ask itself;
+#   - QA's latest Deployment of vX.Y.Z-rc.N (e2e.yml, scripts/deployment.sh) created since main last changed QA's
+#     pin succeeded (scripts/lib/qa.sh): older ones tested an earlier deployment. That run checked of the cluster that
+#     QA served the candidate before and after the test (e2e/check-serving.sh);
 #   - every candidate image $IMAGE_REGISTRY/<service>:X.Y.Z-rc.N (.github/services.json) exists, and any X.Y.Z image
 #     that already exists has the candidate's digest;
 #   - tag vX.Y.Z is absent, or is this candidate's sign-off (same commit, made by this script).
 # Then, in this order, each step skipped or updated when an earlier run already did it, so a failed sign-off is
-# finished by running it again:
+# finished by re-running the workflow's job:
 #   1. copies each candidate image to X.Y.Z by digest (crane copy; never rebuilt) and checks the digest;
 #   2. tags vX.Y.Z (annotated) on the candidate's commit and pushes it; images first, so the tag never names
-#      images that don't exist;
-#   3. publishes (or updates) the GitHub Release vX.Y.Z: the images with digests, the QA run, who signed off;
+#      images that don't exist. The tag message names the merger and the PR;
+#   3. publishes (or updates) the GitHub Release vX.Y.Z: the images with digests, the QA Deployment and run, who
+#      signed off in which PR;
 #   4. opens (or updates) the prod promotion PR: scripts/promotion-pr.sh prod X.Y.Z.
 #
-# Environment: SIGN_OFF_ACTOR (required), REPO and IMAGE_REGISTRY (defaults: scripts/lib/repo.sh),
-# SIGN_OFF_RUN_URL (the workflow run, linked in the Release and PR), SIGN_OFF_READ_TOKEN (a token for the checks,
-# e.g. the workflow's own; default: gh's token). Needs a clean checkout of main, push access to
-# origin, `gh` with a token that may create Releases and PRs, crane logged in to the registry with push access, and
-# jq. scripts/tests/release-scripts.sh tests it with fake gh and crane against a throwaway origin.
+# Environment: REPO and IMAGE_REGISTRY (defaults: scripts/lib/repo.sh), SIGN_OFF_RUN_URL (the workflow run, linked in
+# the Release and PR), SIGN_OFF_READ_TOKEN (a token for the checks, e.g. the workflow's own; default: gh's token).
+# Needs a clean checkout of main with <before> and <after>, push access to origin, `gh` with a token that may create
+# Releases and PRs, crane logged in to the registry with push access, and jq. scripts/tests/release-scripts.sh tests
+# it with fake gh and crane against a throwaway origin.
 set -euo pipefail
 # shellcheck source=lib/versions.sh
 . "$(dirname "$0")/lib/versions.sh"
@@ -35,29 +40,55 @@ set -euo pipefail
 . "$(dirname "$0")/lib/repo.sh"
 # shellcheck source=lib/images.sh
 . "$(dirname "$0")/lib/images.sh"
+# shellcheck source=lib/qa.sh
+. "$(dirname "$0")/lib/qa.sh"
 
-usage() { echo "usage: scripts/sign-off.sh X.Y.Z-rc.N" >&2; exit 2; }
+usage() { echo "usage: scripts/sign-off.sh <before> <after>" >&2; exit 2; }
 refuse() { echo "Sign-off refused: $*" >&2; exit 1; }
-# The checks read GitHub with SIGN_OFF_READ_TOKEN when given (the workflow's token may read Actions runs).
-gh_read() { if [ -n "${SIGN_OFF_READ_TOKEN:-}" ]; then GH_TOKEN=$SIGN_OFF_READ_TOKEN gh "$@"; else gh "$@"; fi; }
 
 main() {
-  local candidate=${1:-}
-  is_candidate "$candidate" || usage
-  local version
-  version=$(release_of "$candidate")
-  local rc_tag="v$candidate" tag="v$version"
-  local actor=${SIGN_OFF_ACTOR:?SIGN_OFF_ACTOR (who signs off) is required}
-  local repo=$REPO registry=$IMAGE_REGISTRY
+  [ $# -eq 2 ] || usage
   cd "$(git rev-parse --show-toplevel)"
+  local after before
+  after=$(git rev-parse --verify --quiet "$2^{commit}") || refuse "no commit $2 here"
+  # No <before> (a new branch's all-zero SHA, a force push's lost commit): the last commit alone.
+  before=$(git rev-parse --verify --quiet "$1^{commit}") || before=$(git rev-parse "$after^1")
+
+  # --- Which release: the record this push added or changed ---
+
+  local records
+  records=$(git diff --name-only --diff-filter=AM "$before" "$after" -- 'releases/*.md')
+  if [ -z "$records" ]; then
+    echo "This push adds or changes no release record (releases/X.Y.Z.md): no release record, nothing to sign off"
+    return 0
+  fi
+  [ "$(wc -l <<<"$records")" -eq 1 ] \
+    || refuse "this push changes several release records ($(paste -sd ' ' <<<"$records")): a sign-off PR adds one"
+  local record=$records version candidate
+  version=$(basename "$record" .md)
+  is_release "$version" || refuse "$record is not named after a release X.Y.Z"
+  # shellcheck disable=SC2016 # Markdown's backticks, not an expansion
+  candidate=$(git show "$after:$record" | sed -nE 's/^Candidate: `v([^`]+)`$/\1/p' | head -n 1)
+  { is_candidate "$candidate" && [ "$(release_of "$candidate")" = "$version" ]; } \
+    || refuse "$record names candidate ${candidate:-(none)}, which is not a candidate of $version (a line \`Candidate: \`v$version-rc.N\`\`)"
+  local rc_tag="v$candidate" tag="v$version"
+  local repo=$REPO registry=$IMAGE_REGISTRY
 
   # --- Checks: nothing is changed until every one passed ---
 
+  local pr_number pr actor
+  pr_number=$(gh_read api "repos/$repo/commits/$after/pulls" \
+    --jq '[.[] | select(.merged_at != null)][0].number // empty') || refuse "could not read the PR that brought in $after"
+  [ -n "$pr_number" ] || refuse "no merged pull request brought in $after: a release is signed off by merging its sign-off PR"
+  read -r pr actor < <(gh_read api "repos/$repo/pulls/$pr_number" --jq '"\(.html_url) \(.merged_by.login // "")"') \
+    || refuse "could not read PR #$pr_number"
+  [ -n "$actor" ] || refuse "can't tell who merged $pr"
   local role
   role=$(gh_read api "repos/$repo/collaborators/$actor/permission" --jq .role_name) \
     || refuse "could not read $actor's role in $repo"
   if [ "$role" != admin ] && [ "$role" != maintain ]; then
-    refuse "$actor is not a maintainer of $repo (role: $role); only admin or maintain may sign off"
+    refuse "$actor merged $pr but is not a maintainer of $repo (role: $role); only admin or maintain may sign off." \
+      "Revert the record's merge, or have a maintainer merge a new sign-off PR"
   fi
 
   git fetch --quiet origin main
@@ -77,36 +108,27 @@ main() {
     tagged=true # an earlier sign-off of this candidate got this far: finish it
   fi
 
-  local pins
-  pins=$(mktemp -d)
-  # shellcheck disable=SC2064 # expand now: $pins is local
-  trap "rm -rf '$pins'" EXIT
-  git archive origin/main clusters/local | tar -x -C "$pins"
-  local qa
-  qa=$(PIN_DIR="$pins/clusters/local" scripts/pin-release.sh qa 2>/dev/null) || refuse "eshop-qa's pin on main is unreadable"
-  if PIN_DIR="$pins/clusters/local" scripts/pin-release.sh --suspended qa; then
-    refuse "eshop-qa has no release yet on main (apps-qa is suspended): QA must be running $candidate"
-  fi
+  local qa pinned=0
+  qa=$(qa_pin) || pinned=$?
+  case "$pinned" in
+    0) ;;
+    3) refuse "eshop-qa has no release yet on main (apps-qa is suspended): QA must be running $candidate" ;;
+    *) refuse "eshop-qa's pin on main is unreadable" ;;
+  esac
   [ "$qa" = "$candidate" ] || refuse "eshop-qa is pinned to $qa on main, not $candidate: QA must be running the candidate it signs off"
 
-  # Only runs created since main last changed QA's pin (on main's first-parent line, so a promotion PR counts from
-  # its merge): after rc.1 -> rc.2 -> rc.1, a run of rc.1 from before rc.2 tested an earlier deployment of it.
-  local pinned_at
-  pinned_at=$(TZ=UTC git log -1 --first-parent -m -G '# release-pin(-until)?: qa$' \
-    --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd origin/main -- clusters/local)
+  local pinned_at deployment state qa_run qa_deployment_id
+  pinned_at=$(qa_pinned_at)
   [ -n "$pinned_at" ] || refuse "can't find the commit on main that pinned eshop-qa"
-  local run conclusion qa_run
-  run=$(gh_read run list --repo "$repo" --workflow e2e.yml --branch main --event workflow_dispatch --status completed \
-    --limit 100 --json databaseId,displayTitle,conclusion,url,createdAt \
-    --jq "[.[] | select(.displayTitle == \"E2E qa $candidate\" and .createdAt >= \"$pinned_at\")] | first") \
-    || refuse "could not list QA runs"
-  if [ -z "$run" ] || [ "$run" = null ]; then
-    refuse "no completed QA run of $candidate on main since eshop-qa was pinned to it ($pinned_at)" \
-      "(\"E2E qa $candidate\"): run e2e/run-on-actions.sh qa $candidate"
-  fi
-  conclusion=$(jq -r .conclusion <<<"$run")
-  qa_run=$(jq -r .url <<<"$run")
-  [ "$conclusion" = success ] || refuse "the latest QA run of $candidate did not pass ($conclusion): $qa_run"
+  deployment=$(qa_deployment "$candidate" "$pinned_at") || refuse "could not read QA's Deployments"
+  [ -n "$deployment" ] \
+    || refuse "no Deployment of $rc_tag to qa since eshop-qa was pinned to it ($pinned_at): QA's smoke test of it" \
+      "runs when its promotion is merged, or by hand: e2e/run-on-actions.sh qa $candidate"
+  state=$(jq -r .state <<<"$deployment")
+  qa_run=$(jq -r .log_url <<<"$deployment")
+  qa_deployment_id=$(jq -r .id <<<"$deployment")
+  [ "$state" = success ] \
+    || refuse "QA's latest Deployment of $candidate is $state$(jq -r '.description | if . != "" then " (\(.))" else "" end' <<<"$deployment"): $qa_run"
 
   # Each service as "<service> <digest> <exists>": the candidate's digest, and whether X.Y.Z already exists.
   local images="" plan="" svc digest tags existing
@@ -136,15 +158,18 @@ main() {
 
   if ! $tagged; then
     git tag --force -a "$tag" "$commit" -m "Release $version" \
-      -m "Signed off from $rc_tag by @$actor. QA run: $qa_run"
+      -m "Signed off from $rc_tag by @$actor, merging $pr. QA's Deployment $qa_deployment_id of it: $qa_run"
     git push --quiet origin "refs/tags/$tag"
   fi
   echo "Tag $tag on $commit"
 
   local notes
-  notes="$pins/notes.md"
+  notes=$(mktemp)
+  # shellcheck disable=SC2064 # expand now: $notes is local
+  trap "rm -f '$notes'" EXIT
   {
-    echo "Release **$tag**, signed off by @$actor from release candidate **$rc_tag** (commit $commit)."
+    echo "Release **$tag**, signed off by @$actor by merging $pr, from release candidate **$rc_tag** (commit $commit)."
+    echo "Its record: [\`$record\`](https://github.com/$repo/blob/$after/$record)."
     echo
     echo "### Images"
     echo
@@ -154,8 +179,9 @@ main() {
     echo
     echo "### QA"
     echo
-    echo "QA's Playwright run of $candidate against https://qa.eshop.localhost passed: [E2E qa $candidate]($qa_run)."
-    echo "It checked that eshop-qa served exactly this candidate before and after the test."
+    echo "QA's smoke test of $candidate against https://qa.eshop.localhost passed: GitHub Deployment $qa_deployment_id"
+    echo "of \`$rc_tag\` to \`qa\`, [run]($qa_run). It checked that eshop-qa served exactly this candidate before and"
+    echo "after the test."
     if [ -n "${SIGN_OFF_RUN_URL:-}" ]; then echo; echo "Signed off in [this run]($SIGN_OFF_RUN_URL)."; fi
     echo
     echo "### Deploying"
@@ -175,7 +201,8 @@ main() {
   PROMOTION_IMAGES=$images PROMOTION_DETAILS=$(
     echo "### Sign-off"
     echo
-    echo "Signed off by @$actor from release candidate $rc_tag. QA's run of it passed: [E2E qa $candidate]($qa_run)."
+    echo "Signed off by @$actor by merging $pr, from release candidate $rc_tag. QA's smoke test of it passed:"
+    echo "Deployment $qa_deployment_id, [run]($qa_run)."
     echo "Release: $release${SIGN_OFF_RUN_URL:+ ([sign-off run]($SIGN_OFF_RUN_URL))}. The images are $rc_tag's, copied by digest."
   ) scripts/promotion-pr.sh prod "$version"
 }

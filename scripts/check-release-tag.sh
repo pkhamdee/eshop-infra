@@ -15,7 +15,7 @@ tag=${1:?usage: scripts/check-release-tag.sh <tag>}
 version=${tag#v}
 
 if [ "$tag" = "v$version" ] && is_release "$version"; then
-  echo "$tag is a release: the \"Sign off release candidate\" workflow tags it and copies the candidate's images," \
+  echo "$tag is a release: sign-off (a merged sign-off PR, sign-off.yml) tags it and copies the candidate's images," \
     "so CI builds nothing for it" >&2
   exit 0
 fi

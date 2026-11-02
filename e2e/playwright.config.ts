@@ -1,5 +1,5 @@
 import { defineConfig, devices } from '@playwright/test'
-import { baseURL } from './environment'
+import { baseURL, gatewayHost } from './environment'
 
 // Seam 4: the definition-of-done demo in a real browser against a deployed environment (never on every CI run).
 // npm run e2e                                          -> https://eshop.localhost (eshop-dev)
@@ -14,15 +14,31 @@ export default defineConfig({
   // its own Customers, Contract, Auction and Lot (tests/steps.ts), so tests running side by side never share data.
   fullyParallel: true,
   workers: 2,
-  retries: 0,
+  // In the pipeline (CI is set), a failed test runs once more: a pass on the retry counts, but the report keeps the
+  // first attempt's failure, and the run summary names the test (e2e.yml reads results.json). Locally, no retry.
+  retries: process.env.CI ? 1 : 0,
   forbidOnly: !!process.env.CI,
-  reporter: [['list'], ['html', { open: 'never' }]],
+  reporter: [
+    ['list'],
+    ['html', { open: 'never' }],
+    ...(process.env.CI ? [['json', { outputFile: 'results.json' }] as const] : []),
+  ],
   use: {
     baseURL,
     // The local cluster's certificate comes from a self-signed CA.
     ignoreHTTPSErrors: true,
     // ...but Chromium still refuses to register a service worker (#59) on an untrusted origin without this flag.
-    launchOptions: { args: ['--ignore-certificate-errors'] },
+    // In the cluster, the eShop hostnames go to the Gateway (environment.ts); the URL, Host header and TLS name
+    // stay eshop.localhost. Requests made outside the browser (page.request, global-setup) resolve them through
+    // /etc/hosts instead, which the workflow points at the Gateway.
+    launchOptions: {
+      args: [
+        '--ignore-certificate-errors',
+        ...(gatewayHost
+          ? [`--host-resolver-rules=MAP eshop.localhost ${gatewayHost}, MAP *.eshop.localhost ${gatewayHost}`]
+          : []),
+      ],
+    },
     locale: 'th-TH',
     timezoneId: 'Asia/Bangkok',
     // Traces record request bodies (the Staff sign-in) and SMS codes: keep them local, never in CI artifacts.

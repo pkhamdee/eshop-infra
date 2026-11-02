@@ -1,0 +1,59 @@
+# The runner image of the scale set eshop-e2e (eshop-e2e.yaml) follows GitHub's runner releases: the ImagePolicy picks
+# the newest ghcr.io/actions/actions-runner:X.Y.Z, and the ImageUpdateAutomation rewrites the setter marker on the
+# `image:` line in eshop-e2e.yaml and commits to main ("runners: update images"), as dev's and thirdparty's do.
+# Pinned rather than `latest`, so the image a smoke test ran on is in Git; kept current, because GitHub stops
+# accepting runners some time after a newer release. Flux's commit is a push to main: it smoke-tests dev, on the
+# new runner. To pin by hand instead (e.g. a broken runner release), set the tag and remove the marker.
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageRepository
+metadata:
+  name: actions-runner
+  namespace: arc-runners
+spec:
+  image: ghcr.io/actions/actions-runner
+  interval: 6h
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImagePolicy
+metadata:
+  name: actions-runner
+  namespace: arc-runners
+spec:
+  imageRepositoryRef:
+    name: actions-runner
+  # Releases only: X.Y.Z, not the per-commit or `latest` tags.
+  filterTags:
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+  policy:
+    semver:
+      range: ">=2.0.0"
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageUpdateAutomation
+metadata:
+  name: runners
+  namespace: arc-runners
+spec:
+  interval: 1h
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: fluxcdbot
+        email: fluxcdbot@users.noreply.github.com
+      messageTemplate: |
+        runners: update images
+        {{ range .Changed.Changes -}}
+        - {{ .OldValue }} -> {{ .NewValue }}
+        {{ end -}}
+    push:
+      branch: main
+  update:
+    path: ./deploy/infrastructure/runners
+    strategy: Setters

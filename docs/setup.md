@@ -84,6 +84,7 @@ Bootstrap installs Flux, commits `clusters/local/flux-system/` to `main` if it c
 
 ```sh
 flux get kustomizations          # flux-system, infra-controllers, infra-configs, thirdparty, apps-dev, apps-prod: Ready
+                                 # infra-runners: Ready once its GitHub token exists ("Cluster runner")
                                  # apps-qa: SUSPENDED True until the first release candidate is promoted to QA
 kubectl get gateway -n gateway   # eshop, PROGRAMMED True
 curl -k https://eshop.localhost/api/product-categories   # catalog JSON from eshop-api
@@ -330,28 +331,135 @@ npm run report                                       # HTML report of the last r
 - **Staff credentials** come from the environment's SOPS Secret (`deploy/apps/<env>/eshop-api-staff.sops.yaml`),
   decrypted at run time by `global-setup.ts` with `sops` and the age key (`SOPS_AGE_KEY_FILE`, default
   `~/.config/sops/age/keys.txt`) into the test process's environment only; it is never printed or written to the
-  report. Or set `STAFF_USERNAME` / `STAFF_PASSWORD` yourself. `E2E_ENV=dev|qa|prod` overrides the environment name
+  report. On the cluster's runner (in a pod: `KUBERNETES_SERVICE_HOST` is set) they come instead from the Secret
+  `eshop-<env>/eshop-api-staff` that Flux applied, read with `kubectl` as the pod's service account; no age key is
+  in the cluster. Or set `STAFF_USERNAME` / `STAFF_PASSWORD` yourself. `E2E_ENV=dev|qa|prod` overrides the environment name
   derived from the host (`qa.` → qa, `prod.` → prod, otherwise dev); it picks the Enterprise database in the admin tool and the Secret.
 - The certificate is self-signed; the test accepts it.
-- **GitHub Actions**: `e2e/run-on-actions.sh [prod|qa|dev] [version]` (default `prod`, no version) runs
-  `.github/workflows/e2e.yml` on GitHub Actions with the job on this machine, which GitHub-hosted runners can't
-  reach. The repository is public, so no runner stays registered: the script registers an ephemeral runner
-  (label `eshop-e2e` only), dispatches the workflow to it, follows the run (the Playwright report is a run
-  artifact) and unregisters the runner when it ends. It needs `gh` logged in as a repo admin, and `sops` with the
-  age key: the job decrypts the Staff account itself, so no Staff secrets are stored in GitHub. Workflow runs
-  from outside contributors' pull requests always wait for approval (repo setting), so nobody else's workflow
-  can reach a runner here unreviewed.
-- **QA's test of a release candidate** is `e2e/run-on-actions.sh qa X.Y.Z-rc.N`: only such a run counts for
-  sign-off (git-workflow.md, "QA test run"). Given a version (required for `qa`, optional `X.Y.Z` for `prod`, none
+- **GitHub Actions**: `e2e/run-on-actions.sh [prod|qa|dev] [version]` (default `prod`, no version) starts
+  `.github/workflows/e2e.yml` from `main` and follows the run (the Playwright report is a run artifact). The job
+  runs on the runner inside the cluster, which GitHub-hosted runners can't reach ([Cluster runner](#cluster-runner));
+  nothing is registered on this machine. It needs `gh` logged in with write access. Starting it from the Actions
+  tab works too. In the runner pod, `*.eshop.localhost` goes to Traefik's Service
+  (`traefik.kube-system.svc.cluster.local`): Node finds it in `/etc/hosts` (a workflow step), Chromium through a
+  host-resolver rule (`e2e/environment.ts`), because Chromium answers `*.localhost` with loopback itself.
+  `E2E_GATEWAY_HOST` sets that target anywhere, e.g. `KUBERNETES_SERVICE_HOST=x E2E_GATEWAY_HOST=192.168.64.2 npm run e2e:prod`
+  tries the in-cluster mode from the Mac.
+- **QA's test of a release candidate** runs by itself when its QA promotion PR is merged; `e2e/run-on-actions.sh qa
+  X.Y.Z-rc.N` runs it again. Only such a run's Deployment counts for sign-off, and a pass opens the sign-off PR
+  (git-workflow.md, "QA test run" and "Sign-off"). Given a version (required for `qa`, optional `X.Y.Z` for `prod`, none
   for `dev`), the run refuses unless the environment is actually serving it, checked against the cluster by
   `e2e/check-serving.sh <env> <version>` (Flux applied tag `v<version>` to `apps-<env>`, and every Deployment in
   `eshop-<env>` finished rolling out with the `<version>` images), before and again after the test. The script makes
   the check here first, so `e2e/run-on-actions.sh qa 0.3.0-rc.1` while QA serves something else stops at once:
   `eshop-qa is not serving 0.3.0-rc.1: apps-qa applied v0.3.0-rc.2@sha1:...` (while QA has no release yet:
   `... apps-qa is suspended ...`). The run is named `E2E <environment>[ <version>]` (`E2E qa 0.3.0-rc.1`) and its
-  summary lists the version, the applied revision and the images. The job uses this machine's `kubectl` and `jq`
-  (the runner inherits the shell's `PATH` and `~/.kube/config`, current context the Rancher Desktop cluster).
-  Tests for the check, with a fake kubectl: `e2e/check-serving.test.sh` (run in CI's `repo rules` job).
+  summary lists the version, the applied revision and the images. In the job, `kubectl` (installed by the workflow)
+  acts as the runner pod's service account.
+  For dev the check takes a `main` commit (`e2e/check-serving.sh dev <commit>`, short or full): `apps-dev` applied
+  `main@sha1:<commit>` and every Deployment finished rolling out with the images that revision pins. With `--wait`
+  it checks again every 10 s until the environment serves, and after 15 min (`--timeout SECONDS`) refuses with
+  "not deployed", naming the Kustomization to look at (`flux get kustomization apps-<env>`).
+  Tests for the check, with a fake kubectl: `e2e/check-serving.test.sh`; for the script, with a fake gh:
+  `e2e/run-on-actions.test.sh` (both run in CI's `repo rules` job).
+
+### Smoke test email
+
+Each smoke test result on GitHub Actions is emailed (`e2e.yml`'s `notify` job, `scripts/notify.sh`): every QA and
+prod result, and for dev only a failure and the first pass after one (judged from dev's previous Deployment). The
+subject says what happened, e.g. `[eShop] prod v0.3.0: deployed and smoke test passed` or
+`[eShop] qa v0.3.1-rc.1: smoke test FAILED` (also `passed on retry`, `NOT DEPLOYED`, and for QA and prod
+`NOT TESTED (superseded)` or `NOT TESTED (cancelled)`: docs/git-workflow.md, "QA test run"); the body links the run and
+its Playwright report artifact (`playwright-report-<env>`). A prod failure names the last release that passed in prod
+and the rollback: `scripts/promotion-pr.sh prod <that version>`, whose PR's commit is
+`scripts/pin-release.sh prod <that version>`, then merge it.
+
+It is sent over SMTP with `curl` (`smtps://smtp.gmail.com:465`, TLS required), from a Gmail account to one address.
+The password is a secret of the `smoke-test` environment, which only `main` can use; the job reads it without
+recording a deployment. **Human**, once, in this order:
+
+1. **The sending account**: a Gmail account for the mails (a separate one, e.g. `eshop.smoke.test@gmail.com`, keeps
+   your own account's password out of CI). Turn on 2-Step Verification for it (Google Account → Security).
+2. **Its app password**: Google Account → Security → 2-Step Verification → App passwords (or
+   <https://myaccount.google.com/apppasswords>); create one named e.g. `eshop smoke test` and copy the 16 letters.
+   Gmail refuses the account's normal password over SMTP.
+3. **The `smoke-test` environment**: `scripts/protect-main.sh --dry-run`, then `scripts/protect-main.sh`
+   ([Protecting main](#protecting-main)); it creates the environment, deployable from `main` only.
+4. **The secret and the variables** (`gh secret set` prompts for the value, so it never lands in shell history):
+
+```sh
+gh secret set SMTP_PASSWORD --env smoke-test --repo pkhamdee/modernapp           # the app password (step 2)
+gh variable set SMTP_USERNAME --body eshop.smoke.test@gmail.com --repo pkhamdee/modernapp   # the sending account
+gh variable set NOTIFY_EMAIL --body you@example.com --repo pkhamdee/modernapp    # who gets them (comma-separated)
+gh secret list --env smoke-test --repo pkhamdee/modernapp && gh variable list --repo pkhamdee/modernapp
+```
+
+Until all three are set, the `notify` job fails on every run, naming what is missing; the smoke test's own job and
+its Deployment are unaffected (the Deployment is finished before `notify` starts, and `notify` may only read
+Deployments). A run dispatched from another branch can't use the environment, so its `notify` job fails the same way.
+To check the setup without waiting for a deploy: `e2e/run-on-actions.sh qa <the version QA serves>` mails the
+result. Mails land in the recipient's inbox from the sending account; if not, look in spam and mark it "not spam"
+once.
+
+### Cluster runner
+
+The E2E job (`runs-on: eshop-e2e`) runs inside the cluster (ADR 0008). Flux installs Actions Runner Controller
+(`deploy/infrastructure/controllers/actions-runner-controller.yaml`, namespace `arc-systems`, watching only
+`arc-runners`) and the runner scale set `eshop-e2e` (`deploy/infrastructure/runners`, Kustomization `infra-runners`):
+0 runners while idle, at most 1, one runner pod per job, deleted after it. A listener pod in `arc-systems` waits for
+queued jobs. The runner pod's service account `eshop-e2e-runner` may only get the Kustomizations `apps-dev`,
+`apps-qa`, `apps-prod`, read Deployments, ReplicaSets and Pods in `eshop-dev`, `eshop-qa`, `eshop-prod`, and get each
+one's Staff Secret `eshop-api-staff` (`runner-rbac.yaml`). The token below is not given to runner pods (they get a
+one-job registration instead).
+
+ARC registers the scale set with a GitHub token, the Secret `arc-runners/eshop-e2e-github`. Until it exists no job
+can run: the scale set has no listener, and `infra-runners` may show not Ready. Nothing depends on `infra-runners`,
+so the apps deploy as usual meanwhile.
+
+**Human**, once (and again before the token expires), in this order:
+
+1. github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   Name `modernapp eshop-e2e runner`; resource owner `pkhamdee`; expiration 90 days (or what you accept);
+   **Repository access**: Only select repositories → `pkhamdee/modernapp`; **Repository permissions**:
+   Administration **Read and write** (Metadata read-only is added by itself). Nothing else.
+2. Put it in a SOPS Secret without it ever touching the disk in plain text: write the file with a placeholder,
+   encrypt it, then replace the placeholder in `sops`' editor:
+
+   ```sh
+   cat >deploy/infrastructure/runners/eshop-e2e-github.sops.yaml <<'EOF'
+   # GitHub token of the eshop-e2e runner scale set (docs/setup.md, "Cluster runner"): a fine-grained token for
+   # pkhamdee/modernapp only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: eshop-e2e-github
+     namespace: arc-runners
+   type: Opaque
+   stringData:
+     github_token: placeholder
+   EOF
+   sops --encrypt --in-place deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+   SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml   # paste the token
+   ```
+
+3. In `deploy/infrastructure/runners/kustomization.yaml`, uncomment `- eshop-e2e-github.sops.yaml` (only together
+   with the file: a listed file that is missing breaks the whole Kustomization). Check with
+   `scripts/validate-manifests.sh`, then open a PR with both files and merge it.
+4. Check: `flux get kustomization infra-runners` Ready; `kubectl -n arc-systems get pods` shows the controller and
+   an `eshop-e2e-...-listener` pod Running; Settings → Actions → Runners lists the scale set `eshop-e2e`. Then a run
+   on it: `e2e/run-on-actions.sh prod X.Y.Z` (the release prod serves) passes.
+5. Keep Settings → Actions → General → "Approval for running fork pull request workflows from contributors" at
+   **Require approval for all external contributors** (it is set; check with
+   `gh api repos/pkhamdee/modernapp/actions/permissions/fork-pr-contributor-approval`, `all_external_contributors`).
+   The repository is public, and on a personal account a runner can't be limited to chosen workflows: a fork PR
+   whose workflow says `runs-on: eshop-e2e` would run in the cluster. Approve a fork's workflow run only after
+   reading what it runs.
+
+**Renewal**: create a new token with the same settings, `sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml`,
+replace the value, PR, merge. An expired token shows as listener errors (`kubectl -n arc-systems logs` on the
+listener pod) and runs that stay queued.
+
+The local runner of earlier versions is gone; its cache can be deleted: `rm -rf ~/.cache/eshop-e2e-runner`.
 
 ## Releasing
 
@@ -385,13 +493,19 @@ gh pr list --head promote/qa-0.3.0-rc.1
 flux get kustomization apps-qa                        # Applied revision: v0.3.0-rc.1@…
 kubectl -n eshop-qa get deploy -o wide               # images :0.3.0-rc.1, all READY
 
-# 4. QA's Playwright run against https://qa.eshop.localhost, recorded as "E2E qa 0.3.0-rc.1"
-e2e/run-on-actions.sh qa 0.3.0-rc.1
+#    That merge also starts QA's smoke test (e2e.yml, run "E2E push <commit>"): a Deployment of v0.3.0-rc.1 to qa
+gh api 'repos/pkhamdee/modernapp/deployments?environment=qa&ref=v0.3.0-rc.1' --jq '.[0].id'
+gh api "repos/pkhamdee/modernapp/deployments/<id>/statuses" --jq '.[0].state'   # success
+#    (to test it again: e2e/run-on-actions.sh qa 0.3.0-rc.1)
 
-# 5. Sign-off (a maintainer, from main): refuses unless main pins QA to 0.3.0-rc.1 and its latest QA run passed;
-#    copies the images to 0.3.0 by digest, tags v0.3.0 on the candidate's commit, publishes the GitHub Release and
-#    opens the prod promotion PR "eshop-prod: deploy v0.3.0"; merging that is the production approval
-gh workflow run sign-off.yml --ref main -f version=0.3.0-rc.1
+# 4. Its pass opens the sign-off PR "Sign off v0.3.0-rc.1", adding releases/0.3.0.md (candidate, digests, the run and
+#    its Playwright report). Review it; merging it is the sign-off (the QA lead's step)
+gh pr list --head sign-off/0.3.0-rc.1
+
+# 5. The merge runs sign-off.yml: refuses unless main still pins QA to 0.3.0-rc.1 and QA's latest Deployment of it
+#    since that pin succeeded; copies the images to 0.3.0 by digest, tags v0.3.0 on the candidate's commit (naming
+#    who merged), publishes the GitHub Release and opens the prod promotion PR "eshop-prod: deploy v0.3.0"; merging
+#    that is the production approval
 gh run watch "$(gh run list --workflow sign-off.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 gh pr list --head promote/prod-0.3.0
 
@@ -407,15 +521,17 @@ If the promotion token is missing, CI's `open the QA promotion PR` job fails aft
 the secret; set it and re-run that job, or open the PR yourself with `scripts/promotion-pr.sh qa 0.3.0-rc.1`
 (`PROMOTION_PUSH=0` first shows the commit and description without pushing).
 
-Sign-off's refusals say what is missing (QA pinned to another candidate or suspended, no passing QA run, a missing
-image, `v0.3.0` already released). If it fails half-way (a registry or GitHub error), run it again with the same
-version: it skips what is done and finishes. It needs `PROMOTION_TOKEN` and the same Docker Hub credentials as CI's
-push job (variable `DOCKERHUB_USERNAME`, `release` environment secret `DOCKERHUB_TOKEN`, Read & Write), and only maintainers (repo role
-admin or maintain) may run it (git-workflow.md, "Releasing").
+Sign-off's refusals fail the `sign-off.yml` run and say what is missing (QA pinned to another candidate or suspended,
+no successful QA Deployment of the candidate since its pin, a missing image, `v0.3.0` already released). If it fails
+half-way (a registry or GitHub error), re-run the failed job: it skips what is done and finishes. It needs
+`PROMOTION_TOKEN` and the same Docker Hub credentials as CI's push job (variable `DOCKERHUB_USERNAME`, `release`
+environment secret `DOCKERHUB_TOKEN`, Read & Write). Whoever may merge into `main` may sign off; the tag and the
+Release name them (git-workflow.md, "Sign-off"). A stale sign-off PR (QA moved to another candidate, or its test
+failed) is closed by the pipeline with a comment.
 
 ### Promotion token
 
-CI opens promotion PRs (and, with sign-off, pushes the release tag) with a **fine-grained personal access token**,
+CI opens promotion and sign-off PRs (and, with sign-off, pushes the release tag) with a **fine-grained personal access token**,
 stored as the secret `PROMOTION_TOKEN` of the `release` environment. Not the workflow's own `GITHUB_TOKEN`: GitHub runs no workflow for a PR
 or tag that token creates, so a promotion PR would never get its required checks. Commits and PRs made with it show
 you as the actor (the commits themselves are authored by `github-actions[bot]`).
@@ -435,12 +551,12 @@ you as the actor (the commits themselves are authored by `github-actions[bot]`).
 `gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/modernapp`. An expired or revoked token makes the promotion job fail at `git push` or `gh pr create` with an
 authentication error; the images are already pushed, so re-run just that job once the secret is updated. The
 token must belong to a repository admin or maintainer: only they may create `v*` tags (ruleset "Create release
-tags"; git-workflow.md, "Tags"). It pushes only `promote/*` branches and `vX.Y.Z` tags, never `main`,
-so `main`'s ruleset needs no bypass for it either: a person merges the promotion PR.
+tags"; git-workflow.md, "Tags"). It pushes only `promote/*` and `sign-off/*` branches and `vX.Y.Z` tags, never
+`main`, so `main`'s ruleset needs no bypass for it either: a person merges the promotion and sign-off PRs.
 
 ### Protecting main
 
-`main`'s ruleset and the `release` environment are code: `scripts/protect-main.sh` (what it sets and why:
+`main`'s ruleset and the `release` and `smoke-test` environments are code: `scripts/protect-main.sh` (what it sets and why:
 git-workflow.md, "Protecting main"). **Human** (a repo admin), once after it lands on `main`, and again whenever it
 or the names of ci-release.yml's pull-request jobs change:
 
@@ -448,13 +564,15 @@ or the names of ci-release.yml's pull-request jobs change:
 git checkout main && git pull
 scripts/protect-main.sh --dry-run    # prints every request it would send; reads only
 scripts/protect-main.sh              # creates or updates rulesets "Protect main", "Protect release tags",
-                                     # "Create release tags" and environment "release"
+                                     # "Create release tags" and environments "release"
+                                     # and "smoke-test"
 ```
 
 Check: Settings → Rules → Rulesets → **Protect main** (Active; bypass: Deploy keys; required checks listed),
 **Protect release tags** (no bypass; deletion, update, force-push), **Create release tags** (bypass: Repository
 admin and Maintain roles; creation), and
-Settings → Environments → **release** (Deployment branches and tags: `main`, tag `v*`). Then:
+Settings → Environments → **release** (Deployment branches and tags: `main`, tag `v*`) and **smoke-test**
+(`main` only; [Smoke test email](#smoke-test-email)). Then:
 
 - `git push origin HEAD:main` from a clone is rejected (`GH013: Repository rule violations`);
 - a PR with a failing required check can't be merged;
@@ -469,7 +587,7 @@ status *Disabled*, merge the fix by PR, then run `scripts/protect-main.sh` again
 
 The two release secrets belong to the `release` environment, so only `main` and `v*` tags can use them
 (git-workflow.md, "The release environment"): `DOCKERHUB_TOKEN` (CI's `push images` and sign-off) and
-`PROMOTION_TOKEN` (CI's `open the QA promotion PR` and sign-off). **Human**, once, after `scripts/protect-main.sh`
+`PROMOTION_TOKEN` (CI's `open the QA promotion PR`, the smoke test's `Sign-off PR` and sign-off). **Human**, once, after `scripts/protect-main.sh`
 created the environment (`gh secret set` prompts for each value, so it never lands in shell history):
 
 ```sh
@@ -528,8 +646,9 @@ Enterprise sync steps can't pass there.
 | `clusters/local/` | Cluster entry point: `flux-system/` (generated by bootstrap) plus the Kustomizations below | `flux-system` |
 | `clusters/local/prod-release.yaml` | What `eshop-prod` runs, the **prod pin**: GitRepository `eshop-release` (one release tag) and Kustomization `apps-prod` with that release's `X.Y.Z` images; the `# release-pin: prod` lines change only in a promotion PR (`scripts/pin-release.sh`) | `flux-system` |
 | `clusters/local/qa-release.yaml` | What `eshop-qa` runs, the **QA pin**, same shape: GitRepository `eshop-qa` (one release-candidate tag) and Kustomization `apps-qa` with its `X.Y.Z-rc.N` images; the `# release-pin: qa` lines change only in a QA promotion PR. Suspended until the first one | `flux-system` |
-| `deploy/infrastructure/controllers/` | Namespaces, Traefik `HelmChartConfig` (Gateway API provider), cert-manager, CloudNativePG operator | `infra-controllers` |
+| `deploy/infrastructure/controllers/` | Namespaces, Traefik `HelmChartConfig` (Gateway API provider), cert-manager, CloudNativePG operator, Actions Runner Controller | `infra-controllers` |
 | `deploy/infrastructure/configs/` | Issuers, the `eshop` Gateway and its certificate, platform secrets | `infra-configs` (after controllers) |
+| `deploy/infrastructure/runners/` | The E2E job's runner scale set `eshop-e2e`, its service account's permissions and its GitHub token ([Cluster runner](#cluster-runner)) | `infra-runners` (after controllers; nothing depends on it) |
 | `deploy/apps/base/` | One directory per app, environment-neutral | – |
 | `deploy/apps/dev/` | `eshop-dev` overlay, follows `main` | `apps-dev` (after configs) |
 | `deploy/apps/dev/image-automation.yaml` | Flux image automation: newest `main-<sha>-<ts>` image per service, committed back to `main` | `apps-dev` |
@@ -541,7 +660,8 @@ Enterprise sync steps can't pass there.
 | `services/thirdparty-mock/` | Node 24 + Express (TypeScript run directly): mock SMS (+ inbox page), ID Verification and Credit Check; adjustable delay; mock Enterprise System admin tool | – |
 | `services/eshop-node-api/` | Image service: Node 24 + Express + TypeScript (run directly by Node), SMB share via `smbclient` | – |
 | `e2e/` | Seam 4: Playwright smoke test of the whole demo against a deployed environment (`npm run e2e`) | – |
-| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `sign-off.sh` signs off a candidate (the sign-off workflow); `protect-main.sh` sets `main`'s ruleset and the `release` environment (admin-run); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
+| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets `main`'s ruleset and the `release` environment (admin-run); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
+| `releases/` | One record per release, `X.Y.Z.md`: the signed-off candidate, its image digests, QA's passing run and Deployment. Added by the sign-off PR (`scripts/sign-off-pr.sh`); merging it signs off (git-workflow.md, "Sign-off") | – |
 | `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `image-scan.sh` (Trivy on built images), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
 | `.github/services.json` | Container images CI builds (context, Dockerfile, source paths): changed ones on `main`, all of them on a release-candidate tag | – |
 

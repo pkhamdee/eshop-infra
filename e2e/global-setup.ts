@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { request } from '@playwright/test'
-import { baseURL, environment } from './environment'
+import { baseURL, environment, inCluster } from './environment'
 
 // The tests set Auction times from this machine's clock while the cluster judges them by its own (#65). A Mac
 // that sleeps mid-run leaves the Rancher Desktop VM's clock behind (the VM runs no time sync), and the demo then
@@ -37,14 +37,44 @@ async function expectClusterClockInSync() {
 }
 
 /**
- * Staff credentials for the back-office steps. STAFF_USERNAME / STAFF_PASSWORD win (CI passes them from
- * secrets); otherwise they are decrypted from the environment's SOPS Secret
- * deploy/apps/<env>/eshop-api-staff.sops.yaml with the local age key. They only ever live in this process's
- * environment (inherited by the test workers) and are never printed.
+ * Staff credentials for the back-office steps. STAFF_USERNAME / STAFF_PASSWORD win; otherwise they come from the
+ * environment's Staff Secret eshop-api-staff: in the cluster (the e2e workflow's runner) as Flux applied it, read
+ * with kubectl and the runner's service account; elsewhere decrypted from deploy/apps/<env>/eshop-api-staff.sops.yaml
+ * with the local age key. They only ever live in this process's environment (inherited by the test workers) and are
+ * never printed.
  */
 function readStaffCredentials() {
   if (process.env.STAFF_USERNAME && process.env.STAFF_PASSWORD) return
+  const secret = inCluster ? clusterSecret() : sopsFile()
+  try {
+    process.env.STAFF_USERNAME = secret.read('username')
+    process.env.STAFF_PASSWORD = secret.read('password')
+  } catch {
+    throw new Error(`No Staff credentials: set STAFF_USERNAME and STAFF_PASSWORD, or ${secret.otherwise}.`)
+  }
+}
 
+/** Reads one key of the Staff Secret; `otherwise` says what makes it readable when it is not. */
+type StaffSecret = { read: (key: string) => string; otherwise: string }
+
+function clusterSecret(): StaffSecret {
+  const namespace = `eshop-${environment}`
+  const read = (key: string) => {
+    const encoded = execFileSync(
+      'kubectl',
+      ['-n', namespace, 'get', 'secret', 'eshop-api-staff', '-o', `jsonpath={.data.${key}}`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim()
+    if (!encoded) throw new Error(`no ${key}`)
+    return Buffer.from(encoded, 'base64').toString('utf8')
+  }
+  return {
+    read,
+    otherwise: `let this pod's service account get Secret ${namespace}/eshop-api-staff (deploy/infrastructure/runners)`,
+  }
+}
+
+function sopsFile(): StaffSecret {
   const file = resolve(import.meta.dirname, '..', 'deploy', 'apps', environment, 'eshop-api-staff.sops.yaml')
   const env = {
     ...process.env,
@@ -56,14 +86,10 @@ function readStaffCredentials() {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim()
-
-  try {
-    process.env.STAFF_USERNAME = read('username')
-    process.env.STAFF_PASSWORD = read('password')
-  } catch {
-    throw new Error(
-      `No Staff credentials: set STAFF_USERNAME and STAFF_PASSWORD, or install sops with the age key ` +
-        `(SOPS_AGE_KEY_FILE, default ~/.config/sops/age/keys.txt) so ${file} can be decrypted.`,
-    )
+  return {
+    read,
+    otherwise:
+      `install sops with the age key (SOPS_AGE_KEY_FILE, default ~/.config/sops/age/keys.txt) so ${file} can be ` +
+      `decrypted`,
   }
 }

@@ -27,6 +27,9 @@
 # 3. Environment "release", deployable only from main and from v* tags. ci-release.yml's push and promote-qa jobs and
 #    sign-off.yml use it, so its secrets (DOCKERHUB_TOKEN, PROMOTION_TOKEN) are out of reach of a workflow run from
 #    any other branch. The secrets themselves are a human step (docs/setup.md, "Release secrets").
+# 4. Environment "smoke-test", deployable only from main. e2e.yml's notify job uses it (recording no deployment) for
+#    SMTP_PASSWORD, to email the smoke test's results; a run from any other branch can't read it. The secret and the
+#    repository variables SMTP_USERNAME and NOTIFY_EMAIL are a human step (docs/setup.md, "Smoke test email").
 #
 # Needs gh signed in as a repo admin, and jq. scripts/tests/release-scripts.sh tests it against a fake gh.
 set -euo pipefail
@@ -38,6 +41,7 @@ TAG_CREATION_RULESET="Create release tags"
 ROLE_MAINTAIN=2
 ROLE_ADMIN=5
 ENVIRONMENT=release
+SMOKE_TEST_ENVIRONMENT=smoke-test
 GITHUB_ACTIONS_APP_ID=15368 # required checks must come from GitHub Actions, not from any status a token can post
 
 usage() { echo "usage: scripts/protect-main.sh [--dry-run] [--approvals N]   (N from 0 to 10; default 0)" >&2; exit 2; }
@@ -135,25 +139,30 @@ upsert_ruleset "$ruleset"
 upsert_ruleset "$tag_ruleset"
 upsert_ruleset "$tag_creation_ruleset"
 
-# 3. The environment and its deployment branch and tag policies: exactly main and v* tags.
-send PUT "repos/$REPO/environments/$ENVIRONMENT" \
-  '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
-policies_path="repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies"
-if ! existing=$(gh api "$policies_path" 2>/dev/null); then
-  $dry_run || { echo "can't read $policies_path" >&2; exit 1; }
-  existing='{"branch_policies":[]}' # the environment doesn't exist yet
-fi
-wanted='[{"name":"main","type":"branch"},{"name":"v*","type":"tag"}]'
-jq -c --argjson wanted "$wanted" '$wanted - [.branch_policies[] | {name, type}] | .[]' <<<"$existing" |
-  while read -r policy; do send POST "$policies_path" "$policy"; done
-jq -r --argjson wanted "$wanted" '.branch_policies[] | select({name, type} as $p | $wanted | index([$p]) | not) | .id' \
-  <<<"$existing" | while read -r extra; do send DELETE "$policies_path/$extra"; done
+# 3. and 4. Each environment and its deployment branch and tag policies: exactly the wanted ones.
+environment() { # environment <name> <wanted policies: a JSON array of {name, type}>
+  local policies_path existing
+  send PUT "repos/$REPO/environments/$1" \
+    '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+  policies_path="repos/$REPO/environments/$1/deployment-branch-policies"
+  if ! existing=$(gh api "$policies_path" 2>/dev/null); then
+    $dry_run || { echo "can't read $policies_path" >&2; exit 1; }
+    existing='{"branch_policies":[]}' # the environment doesn't exist yet
+  fi
+  jq -c --argjson wanted "$2" '$wanted - [.branch_policies[] | {name, type}] | .[]' <<<"$existing" |
+    while read -r policy; do send POST "$policies_path" "$policy"; done
+  jq -r --argjson wanted "$2" '.branch_policies[] | select({name, type} as $p | $wanted | index([$p]) | not) | .id' \
+    <<<"$existing" | while read -r extra; do send DELETE "$policies_path/$extra"; done
+}
+environment "$ENVIRONMENT" '[{"name":"main","type":"branch"},{"name":"v*","type":"tag"}]'
+environment "$SMOKE_TEST_ENVIRONMENT" '[{"name":"main","type":"branch"}]'
 
 if $dry_run; then
   echo "Dry run: nothing sent. Required checks:"; while read -r check; do echo "  $check"; done <<<"$checks"
   echo "v* tags: never deleted, moved or force-pushed; created only by repository admins and maintainers."
 else
   echo "main is protected ($approvals approvals); v* tags are immutable and only admins and maintainers create them;"
-  echo "environment $ENVIRONMENT deploys from main and v* tags only."
-  echo "Next, if not done yet: the release secrets (docs/setup.md, \"Release secrets\")."
+  echo "environment $ENVIRONMENT deploys from main and v* tags only, environment $SMOKE_TEST_ENVIRONMENT from main only."
+  echo "Next, if not done yet: the release secrets (docs/setup.md, \"Release secrets\") and the smoke test's email"
+  echo "settings (docs/setup.md, \"Smoke test email\")."
 fi

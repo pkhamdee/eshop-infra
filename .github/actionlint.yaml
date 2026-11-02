@@ -1,0 +1,4 @@
+# actionlint (CI: repo rules). eshop-e2e is the cluster's runner scale set (deploy/infrastructure/runners).
+self-hosted-runner:
+  labels:
+    - eshop-e2e

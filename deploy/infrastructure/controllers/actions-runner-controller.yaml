@@ -1,0 +1,43 @@
+# Actions Runner Controller (ADR 0008): the operator only, watching nothing but arc-runners, where the eshop-e2e
+# runner scale set lives (deploy/infrastructure/runners). It needs no GitHub credential itself; the scale set's
+# listener does. Chart and scale-set chart versions move together (same ARC release).
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: actions-runner-controller
+  namespace: arc-systems
+spec:
+  type: oci
+  interval: 24h
+  url: oci://ghcr.io/actions/actions-runner-controller-charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: arc
+  namespace: arc-systems
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: gha-runner-scale-set-controller
+      version: "0.15.1"
+      sourceRef:
+        kind: HelmRepository
+        name: actions-runner-controller
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    # Named, so the scale set refers to it directly instead of looking the controller up.
+    serviceAccount:
+      name: arc-controller
+    flags:
+      logLevel: info
+      # Only arc-runners: the cluster runs unrelated workloads, so ARC gets Roles there instead of a ClusterRole.
+      watchSingleNamespace: arc-runners

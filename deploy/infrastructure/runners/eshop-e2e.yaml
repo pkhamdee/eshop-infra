@@ -1,0 +1,58 @@
+# The runner scale set `eshop-e2e` (ADR 0008): GitHub Actions jobs with `runs-on: eshop-e2e` (.github/workflows/e2e.yml)
+# run here, in the cluster that serves the environments. No runner waits idle: the listener pod (arc-systems) asks
+# GitHub for queued jobs, and ARC starts one ephemeral runner pod per job (at most one at a time), registered for
+# that job only and deleted after it. The pod runs the stock runner image as the service account eshop-e2e-runner,
+# which may read only what the test needs (runner-rbac.yaml).
+#
+# GitHub credential: the Secret eshop-e2e-github (key github_token) in arc-runners, a SOPS file a maintainer
+# creates (docs/setup.md, "Cluster runner"). Until it exists ARC has nothing to register the scale set with, so no
+# job can run; nothing else depends on infra-runners.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: actions-runner-controller
+  namespace: arc-runners
+spec:
+  type: oci
+  interval: 24h
+  url: oci://ghcr.io/actions/actions-runner-controller-charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: eshop-e2e
+  namespace: arc-runners
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: gha-runner-scale-set
+      version: "0.15.1" # same ARC release as deploy/infrastructure/controllers/actions-runner-controller.yaml
+      sourceRef:
+        kind: HelmRepository
+        name: actions-runner-controller
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    githubConfigUrl: https://github.com/pkhamdee/modernapp
+    githubConfigSecret: eshop-e2e-github
+    runnerScaleSetName: eshop-e2e
+    minRunners: 0
+    maxRunners: 1
+    controllerServiceAccount:
+      name: arc-controller
+      namespace: arc-systems
+    template:
+      spec:
+        serviceAccountName: eshop-e2e-runner
+        containers:
+          # The chart's stock image (Ubuntu, passwordless sudo). The workflow installs what it lacks: Node,
+          # kubectl, Chromium and its libraries. Pinned to a runner release, which Flux keeps current
+          # (image-automation.yaml): GitHub stops accepting old runner versions.
+          - name: runner
+            image: ghcr.io/actions/actions-runner:2.338.0 # {"$imagepolicy": "arc-runners:actions-runner"}
+            command: ["/home/runner/run.sh"]
