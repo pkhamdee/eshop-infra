@@ -1579,5 +1579,21 @@ clones_service_repos() {
 check "clone-all.sh skips a service repository not created yet, clones it beside this one once it exists, and leaves the clone alone after" \
   clones_service_repos
 
+# --- scripts/gates/artifact-dirs.sh (the image pipeline's downloads: one folder per artifact) ---
+
+artifact_dirs_normalizes() {
+  local d="$work/artifacts"
+  rm -rf "$d" && mkdir -p "$d/flat" "$d/many/image-eshop-api"
+  printf 'docker.io/pkhamdee/eshop-web:main-abc1234\ndocker.io/pkhamdee/eshop-web:main-abc1234-100\n' >"$d/flat/tags.txt"
+  echo tar >"$d/flat/image.tar"
+  echo tags >"$d/many/image-eshop-api/tags.txt"
+  "$root/scripts/gates/artifact-dirs.sh" "$d/flat" >"$work/out" 2>&1 \
+    && "$root/scripts/gates/artifact-dirs.sh" "$d/many" >>"$work/out" 2>&1 \
+    && [ -f "$d/flat/image-eshop-web/image.tar" ] && [ -f "$d/flat/image-eshop-web/tags.txt" ] \
+    && [ ! -e "$d/flat/tags.txt" ] && [ "$(ls "$d/many")" = image-eshop-api ]
+}
+check "artifact-dirs.sh moves a single flat image artifact into image-<service> and leaves per-artifact folders alone" \
+  artifact_dirs_normalizes
+
 [ "$failures" -eq 0 ] || { echo "$failures failed"; exit 1; }
 echo "all passed"
