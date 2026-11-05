@@ -215,11 +215,24 @@ on such a commit, tag pushes included, so the tag would never build (that is how
 reason Flux's commit templates carry no marker (CI ignores `deploy/**` and `clusters/**` pushes instead), and CI's
 `repo rules` job fails if one comes back.
 
-### 2. CI builds it and opens the QA promotion PR
+### 2. CI makes its images and opens the QA promotion PR
 
-For a `vX.Y.Z-rc.N` tag CI lints and tests, validates the tag (annotated, on `release/N.x`), builds **every** service
-in `.github/services.json`, runs the same gates and scan as for `main`, pushes `docker.io/pkhamdee/<service>:X.Y.Z-rc.N`,
-and only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
+For a `vX.Y.Z-rc.N` tag CI lints and tests and validates the tag (annotated, on `release/N.x`). It then makes
+`docker.io/pkhamdee/<service>:X.Y.Z-rc.N` for every service in `.github/services.json`, **copying by digest** what
+already passed rather than rebuilding it (`scripts/candidate-images.sh`,
+[ADR 0009](adr/0009-one-repository-per-service-candidates-promote-dev-tested-images.md)):
+
+- **A candidate that brings in `main`** (a new `release/N.x`, or the merge above): every image is the one that `main`
+  commit's dev pins name (`deploy/apps/dev`, and `deploy/thirdparty` for thirdparty-mock), which is what dev's smoke
+  test passed. Nothing is built, so the gates and the image scan don't run again: each image passed them when it was
+  built on `main`. QA gets the exact bytes dev tested.
+- **Any other candidate** (the branch head): the services whose files changed since the previous `v*` tag on the
+  branch are built at the tag, through the same temporary copy, gates and scan as for `main` (unchanged services run
+  in the copy as the images they will be); every other service is copied from that previous version's image. A change
+  to `ci-release.yml` or `services.json` builds every service.
+
+A pin or an image it can't resolve fails the run: nothing untested is filled in. Every copy is checked against its
+source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
 `main` whose only commit is the pin edit, and a PR **`eshop-qa: deploy vX.Y.Z-rc.N`** listing the candidate's
 commit, its images with digests, each gate's result and the CI run (whose artifacts are the gate reports).
 

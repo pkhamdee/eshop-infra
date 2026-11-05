@@ -6,9 +6,13 @@
 #                                        push docker.io/pkhamdee/<service>:main-<sha>[-<unix-ts>]
 #                                        (Flux image automation deploys the newest to eshop-dev)
 #   - push tag vX.Y.Z-rc.N            -> lint + test, validate the tag (release candidate: annotated, on release/N.x),
-#                                        build EVERY service, temporary copy, gates, scan, push
-#                                        docker.io/pkhamdee/<service>:X.Y.Z-rc.N, then open the QA promotion PR
-#                                        (scripts/promotion-pr.sh, with PROMOTION_TOKEN); merging it deploys eshop-qa
+#                                        then (ADR 0009, scripts/candidate-images.sh) copy by digest the images that
+#                                        already passed: for a candidate bringing in main, the ones dev tested (main's
+#                                        dev pins); on a release branch's head, the previous tag's, building at the
+#                                        tag (temporary copy, gates, scan) only the services changed since. Every
+#                                        image lands as docker.io/pkhamdee/<service>:X.Y.Z-rc.N; then open the QA
+#                                        promotion PR (scripts/promotion-pr.sh, with PROMOTION_TOKEN); merging it
+#                                        deploys eshop-qa
 #   - push tag vX.Y.Z                 -> lint + test only: a release is tagged by sign-off (merging the
 #                                        sign-off PR, sign-off.yml), which copies the images and publishes the Release
 #   - workflow_dispatch               -> no input, on main: rebuild, gate and push every service as main-<sha>
@@ -216,8 +220,9 @@ jobs:
         run: .claude/hooks/test-guard-sops.sh
 
   # Decides what to build, after every service's lint/test and the SAST and dependency-scan gates passed:
-  #   - tag vX.Y.Z-rc.N: validate the tag (scripts/check-release-tag.sh: annotated, on a release/N.x branch); build
-  #     every service as X.Y.Z-rc.N, and promote=qa. Tag vX.Y.Z: build nothing (sign-off made it).
+  #   - tag vX.Y.Z-rc.N: validate the tag (scripts/check-release-tag.sh: annotated, on a release/N.x branch); ask
+  #     scripts/candidate-images.sh which images to copy by digest (copy) and which to build as X.Y.Z-rc.N (matrix),
+  #     and promote=qa. Tag vX.Y.Z: build nothing (sign-off made it).
   #   - workflow_dispatch with `version`: release dry run; build every service as that pre-release tag.
   #   - main: build services whose `paths` changed since the previous push, tagged main-<sha>. Everything is
   #     rebuilt when the push has no usable base (first push, force push), when this workflow or services.json
@@ -233,10 +238,17 @@ jobs:
       version: ${{ steps.select.outputs.version }}
       promote: ${{ steps.select.outputs.promote }} # qa for a release candidate: open the QA promotion PR after push
       push: ${{ steps.select.outputs.push }} # false for a dry run off main: build, gate and scan, push nothing
+      copy: ${{ steps.select.outputs.copy }} # a candidate's images copied by digest: [{service, image: repo@digest}]
+      source: ${{ steps.select.outputs.source }} # where a candidate's copied images come from, for its promotion PR
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # crane reads the registry (public repositories: no login) for scripts/candidate-images.sh.
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        if: github.ref_type == 'tag'
+        with:
+          version: v0.22.1
       - id: select
         env:
           EVENT: ${{ github.event_name }}
@@ -245,14 +257,18 @@ jobs:
           TAG: ${{ github.ref_name }}
           BEFORE: ${{ github.event.before }}
           DRY_RUN_VERSION: ${{ inputs.version }}
+          IMAGE_REGISTRY: docker.io/${{ vars.DOCKERHUB_USERNAME }}
         run: |
           all=$(jq -c . .github/services.json)
           version=""
           promote=""
           push=true
+          copy="[]"
+          source=
           if [ "$REF_TYPE" = "tag" ]; then
-            # Release candidate vX.Y.Z-rc.N (annotated, on a release/N.x branch): build, gate, push, then open the
-            # QA promotion PR. Plain vX.Y.Z: made by sign-off from a candidate's images, so nothing to build.
+            # Release candidate vX.Y.Z-rc.N (annotated, on a release/N.x branch): copy what already passed, build and
+            # gate only what changed, then open the QA promotion PR. Plain vX.Y.Z: made by sign-off from a
+            # candidate's images, so nothing to build.
             git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
             if ! version=$(scripts/check-release-tag.sh "$TAG" 2>"$RUNNER_TEMP/tag-check"); then
               echo "::error::$(cat "$RUNNER_TEMP/tag-check")"; exit 1
@@ -261,7 +277,13 @@ jobs:
               echo "::notice::$(cat "$RUNNER_TEMP/tag-check")"
               matrix="[]"
             else
-              matrix="$all"
+              if ! candidate=$(scripts/candidate-images.sh "$TAG" 2>"$RUNNER_TEMP/candidate"); then
+                echo "::error::$(cat "$RUNNER_TEMP/candidate")"; exit 1
+              fi
+              source=$(jq -r .source <<<"$candidate")
+              matrix=$(jq -c .build <<<"$candidate")
+              copy=$(jq -c .copy <<<"$candidate")
+              echo "Images: $source; copied: $(jq -r 'map(.service) | join(", ")' <<<"$copy")"
               promote=qa
             fi
           elif [ "$EVENT" = "workflow_dispatch" ] && [ -n "$DRY_RUN_VERSION" ]; then
@@ -294,7 +316,8 @@ jobs:
               ' .github/services.json)
             fi
           fi
-          { echo "matrix=$matrix"; echo "version=$version"; echo "promote=$promote"; echo "push=$push"; } >> "$GITHUB_OUTPUT"
+          { echo "matrix=$matrix"; echo "version=$version"; echo "promote=$promote"; echo "push=$push"
+            echo "copy=$copy"; echo "source=$source"; } >> "$GITHUB_OUTPUT"
           echo "Version: ${version:-main-<sha>}; services to build: $(jq -r 'map(.service) | join(", ")' <<<"$matrix")"
 
   # Release gates (ADR 0007): nothing is pushed until every image is built, the temporary copy made from them is
@@ -378,12 +401,17 @@ jobs:
       - name: Choose the copy's images
         env:
           REGISTRY: docker.io/${{ vars.DOCKERHUB_USERNAME }}
+          COPY: ${{ needs.plan.outputs.copy }}
         run: |
-          # Built by this run: its first tag. Not rebuilt (main push): the newest main build, as eshop-dev runs.
+          # Built by this run: its first tag. Copied into a release candidate: the image it copies. Otherwise (main
+          # push): the newest main build, as eshop-dev runs.
           for service in eshop-web eshop-api eshop-node-api thirdparty-mock; do
             tags="$RUNNER_TEMP/images/image-$service/tags.txt"
+            copied=$(jq -r --arg s "$service" '.[] | select(.service == $s) | .image' <<<"${COPY:-[]}")
             if [ -f "$tags" ]; then
               image=$(head -n 1 "$tags")
+            elif [ -n "$copied" ]; then
+              image=$copied
             else
               image=$(scripts/gates/latest-main-image.sh "$REGISTRY/$service")
             fi
@@ -461,13 +489,20 @@ jobs:
           if-no-files-found: ignore
 
   # Pushes every image only when every build, the temporary copy (and its gates) and every scan passed, and, for a
-  # version, only when none of its images exists yet (scripts/check-new-images.sh).
+  # version, only when none of its images exists yet (scripts/check-new-images.sh). A release candidate's copied
+  # images (plan.copy) are tagged X.Y.Z-rc.N here by digest (crane copy), never rebuilt; when it builds nothing,
+  # there is nothing to gate or scan, and this job runs with gate and scan skipped.
   # Environment `release` (scripts/protect-main.sh) deploys only from main and v* tags, so its DOCKERHUB_TOKEN is out
   # of reach of a run from any other branch, where a modified copy of this workflow could misuse it.
   push:
     name: push images
     needs: [plan, gate, scan]
-    if: needs.plan.outputs.push == 'true' # a dry run from another branch stops after the scan (plan says why)
+    # A dry run from another branch stops after the scan (plan says why). Gate and scan must pass whenever anything
+    # was built; they are skipped only when nothing was (a candidate that copies every image).
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.push == 'true'
+      && (needs.plan.outputs.matrix != '[]' || needs.plan.outputs.copy != '[]')
+      && (needs.plan.outputs.matrix == '[]' || (needs.gate.result == 'success' && needs.scan.result == 'success'))
     runs-on: ubuntu-24.04-arm
     environment: release
     permissions:
@@ -476,10 +511,12 @@ jobs:
       images: ${{ steps.push.outputs.images }} # every tag pushed, as image:tag@sha256:digest, one per line
     steps:
       - uses: actions/download-artifact@v8
+        if: needs.plan.outputs.matrix != '[]'
         with:
           pattern: image-*
           path: ${{ runner.temp }}/images
       - name: Load the images
+        if: needs.plan.outputs.matrix != '[]'
         run: for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
       # Docker Hub repositories are created public on first push. Needs the repo variable DOCKERHUB_USERNAME and
       # the `release` environment's secret DOCKERHUB_TOKEN (a Docker Hub access token with Read & Write); see
@@ -499,20 +536,40 @@ jobs:
           version: v0.22.1
       - name: Refuse to overwrite ${{ needs.plan.outputs.version }}
         if: needs.plan.outputs.version != ''
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          COPY: ${{ needs.plan.outputs.copy }}
         run: |
-          # shellcheck disable=SC2046 # one image per line, no spaces
-          scripts/check-new-images.sh $(cat "$RUNNER_TEMP"/images/image-*/tags.txt)
+          # Built (tags.txt) and copied (repository:X.Y.Z-rc.N) alike.
+          targets=$(cat "$RUNNER_TEMP"/images/image-*/tags.txt 2>/dev/null || true)
+          targets+=$'\n'$(jq -r --arg v "$VERSION" '.[] | "\(.image | split("@")[0]):\($v)"' <<<"${COPY:-[]}")
+          # shellcheck disable=SC2086 # one image per line, no spaces
+          scripts/check-new-images.sh $targets
       - name: Push
         id: push
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          COPY: ${{ needs.plan.outputs.copy }}
         run: |
           pushed="$RUNNER_TEMP/pushed.txt"
           : > "$pushed"
           for tags in "$RUNNER_TEMP"/images/image-*/tags.txt; do
+            [ -f "$tags" ] || continue # nothing built
             while read -r tag; do
               docker push "$tag" | tee "$RUNNER_TEMP/push.log"
               digest=$(grep -oE 'digest: sha256:[0-9a-f]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2 | tail -n 1)
               echo "${tag}${digest:+@$digest}" >> "$pushed"
             done < "$tags"
+          done
+          # A candidate's copied images: the digest that already passed, tagged X.Y.Z-rc.N, checked after the copy.
+          for source in $(jq -r '.[].image' <<<"${COPY:-[]}"); do
+            target="${source%@*}:$VERSION"
+            crane copy "$source" "$target"
+            digest=$(crane digest "$target")
+            if [ "$digest" != "${source#*@}" ]; then
+              echo "::error::$target has digest $digest after copying $source"; exit 1
+            fi
+            echo "$target@$digest" >> "$pushed"
           done
           { echo "images<<PUSHED"; cat "$pushed"; echo "PUSHED"; } >> "$GITHUB_OUTPUT"
 
@@ -525,7 +582,8 @@ jobs:
   promote-qa:
     name: open the QA promotion PR
     needs: [plan, sast, deps, gate, scan, push]
-    if: needs.plan.outputs.promote == 'qa'
+    # push succeeds only when gate and scan passed or nothing was built (push's own condition).
+    if: always() && needs.plan.outputs.promote == 'qa' && needs.push.result == 'success'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -558,11 +616,17 @@ jobs:
           DEPS: ${{ needs.deps.result }}
           GATE: ${{ needs.gate.result }}
           SCAN: ${{ needs.scan.result }}
+          SOURCE: ${{ needs.plan.outputs.source }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Nothing built: every image is copied from a build that passed these gates when it was made.
+          [ "$GATE" != skipped ] || GATE="not run: nothing built, every image copied"
+          [ "$SCAN" != skipped ] || SCAN="not run: nothing built, every image copied"
           PROMOTION_DETAILS=$(cat <<EOF
           ### Gates
+
+          Images: $SOURCE (scripts/candidate-images.sh; copied ones by digest, never rebuilt).
 
           Every gate passed before any image was pushed ([CI run]($RUN_URL); reports are its artifacts):
 
