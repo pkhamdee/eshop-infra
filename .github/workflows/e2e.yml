@@ -1,36 +1,75 @@
-# Seam 4: the definition-of-done demo as one Playwright browser test against a DEPLOYED environment.
-# Run by hand (Actions -> E2E smoke test -> Run workflow), never on push or PR:
-#   - QA's test of a release candidate: environment `qa`, version `X.Y.Z-rc.N` (required). Sign-off
-#     (docs/git-workflow.md, "QA test run") looks for a passing run of exactly that candidate by its run name.
-#   - the post-release smoke test on prod: environment `prod`, version `X.Y.Z` optional;
-#   - dev (follows main, no version).
+# Seam 4: the definition-of-done demo as one Playwright browser test against a DEPLOYED environment, after every
+# deploy (ADR 0008):
+#   - every push to main: Flux deploys each main commit to eshop-dev (its own image-update commits included), so
+#     the run tests dev at the pushed commit;
+#   - a push to main that changes a `# release-pin: <env>` line (a merged QA or prod promotion PR, or a rollback):
+#     that environment at the newly pinned version, both environments if both pins moved. A push changing nothing
+#     but pins doesn't test dev, whose deploy it didn't change; a still-suspended environment is not tested;
+#   - by hand (Actions -> E2E smoke test -> Run workflow, or e2e/run-on-actions.sh [environment] [version]):
+#     QA's test of a release candidate (environment `qa`, version `X.Y.Z-rc.N`, required), e.g. to test it again;
+#     prod at `X.Y.Z` (default: prod's pin on main); dev at a main commit (default: main's head).
+# The first job decides the targets, `<environment> <version or commit>` (scripts/smoke-targets.sh), and the test
+# job runs once per target.
 #
-# Given a version, the job refuses unless the environment is actually serving it, asked of the cluster rather than
-# Git (e2e/check-serving.sh: Flux applied tag vX and every Deployment runs the X images), and checks again after
-# the test, so a passing run tested that version from start to end.
+# Each target is recorded as a GitHub Deployment of that version (tag vX) or commit to that environment
+# (scripts/deployment.sh, the Deployments API, not the job's `environment:` key, which would record main): in
+# progress when the job starts, then success or failure (or inactive when nothing was tested), linked to this run
+# and the environment's URL. Only a run on main records one, naming main as its workflow_ref in the payload; sign-off
+# and release.sh count only those (scripts/lib/deployments.sh). A run dispatched from another branch tests only. The job
+# waits until the environment serves exactly the target, asked of the cluster rather than Git
+# (e2e/check-serving.sh --wait: Flux applied tag vX, or main at the commit, and every Deployment rolled out from it);
+# not serving it after 15 minutes is a failure, "not deployed". It checks again after the test, so a pass tested
+# the target from start to end. Failed tests run once more (playwright.config.ts); a pass on the retry still passes,
+# and the run summary names the test. A successful Deployment marks the environment's earlier successful ones
+# inactive, "replaced by <ref>": GitHub then shows each environment's current version as its one active Deployment.
 #
-# The run name records what was tested, `E2E <environment>[ <version>]`, e.g. `E2E qa 0.3.0-rc.1`. The latest
-# passing QA run for a version (sign-off's query):
-#   gh run list --repo pkhamdee/modernapp --workflow e2e.yml --branch main --event workflow_dispatch \
-#     --status completed --limit 100 --json databaseId,displayTitle,conclusion,url \
-#     --jq '[.[] | select(.displayTitle == "E2E qa 0.3.0-rc.1")] | first'
-# and its conclusion must be "success". `--branch main` matters: a run dispatched from another branch runs that
-# branch's copy of this workflow, which may skip the check.
+# The result is emailed (the notify job, scripts/notify.sh; docs/setup.md "Smoke test email"): every QA and prod
+# result, a not-tested one included, dev only a failure and the first pass after one. A prod failure names the last
+# release that passed in prod and the rollback promotion PR.
+#
+# Dev: one run at a time. A newer dev run cancels the running or waiting one: dev has moved on, so that run's
+# Deployment is marked inactive, "superseded", not failed, and nobody is emailed.
+# QA and prod: runs are never cancelled or dropped, so every promotion's target is tested or reported as not tested.
+# They have no concurrency group (GitHub keeps only the newest of several runs waiting in one), so two runs of one
+# environment can overlap, e.g. rc.1's promotion still waiting when rc.2's is merged. The decision is
+# scripts/smoke-result.sh's, against main's pin read afresh: a run whose version is no longer the environment's pin
+# skips the wait, or, failing later (not deployed, or redeployed during the test as Flux moved on), ends inactive,
+# "superseded", and its email says it was not tested and why. Otherwise it is tested as usual. A pass always
+# stands: the environment served the target before and after the test. The cluster's runner scale set runs one job
+# at a time anyway, so overlapping runs mostly queue for the runner rather than test at once.
+#
+# The run name records what was tested: a push's `E2E push <commit>`, a manual run's `E2E <environment>[ <version>]`,
+# e.g. `E2E qa 0.3.0-rc.1`.
+#
+# After a run on main that tested QA, the sign-off-pr job keeps the sign-off PRs in line with QA
+# (scripts/sign-off-pr.sh): QA's Deployment of the candidate it runs succeeded -> the PR "Sign off vX.Y.Z-rc.N"
+# (merging it is the sign-off, sign-off.yml); an open sign-off PR for another candidate, or for one whose latest QA
+# test failed, is closed with a comment. Sign-off goes by QA's Deployments, never by run names.
 #
 # The environments live on a local cluster (https://eshop.localhost, https://qa.eshop.localhost,
-# https://prod.eshop.localhost), which GitHub-hosted runners cannot reach. The job runs on an on-demand runner on
-# the machine that hosts the cluster: `e2e/run-on-actions.sh [environment] [version]` registers an ephemeral
-# runner labelled `eshop-e2e`, dispatches this workflow to it and unregisters it afterwards (the repository is
-# public, so no runner stays registered). Dispatching from the Actions tab only works while such a runner is
-# online. Or simply run `npm run e2e` there (docs/setup.md "End-to-end smoke test"); only a run here counts for
-# sign-off.
+# https://prod.eshop.localhost), which GitHub-hosted runners cannot reach, so the test job runs inside that cluster
+# (ADR 0008): `runs-on: eshop-e2e` is the Actions Runner Controller scale set in deploy/infrastructure/runners.
+# ARC starts one runner pod for the job (the stock runner image, Ubuntu) and deletes it afterwards; no runner stays
+# registered while idle. Deciding the targets needs no cluster and runs on a GitHub-hosted runner. Or simply run
+# `npm run e2e` on the Mac (docs/setup.md "End-to-end smoke test"): no retry, nothing recorded; only a run here
+# counts for sign-off. The repository is public: a fork PR could name this runner, so "Require approval for all
+# external contributors" must stay set (docs/setup.md, "Cluster runner").
 #
-# Staff account: the test decrypts deploy/apps/<env>/eshop-api-staff.sops.yaml with sops and the age key on
-# the runner. Optional secrets E2E_STAFF_USERNAME / E2E_STAFF_PASSWORD take precedence; none are needed.
+# In the pod, kubectl uses the pod's service account, which may only read the apps-<env> Kustomizations, the
+# environments' Deployments, ReplicaSets and Pods, and their Staff Secret eshop-api-staff
+# (deploy/infrastructure/runners/runner-rbac.yaml). The test reads the Staff account from that Secret (no age key
+# in the cluster); optional secrets E2E_STAFF_USERNAME / E2E_STAFF_PASSWORD take precedence. *.eshop.localhost is
+# sent to Traefik's Service: by /etc/hosts for Node, by a Chromium host-resolver rule for the browser
+# (e2e/environment.ts), since Chromium resolves *.localhost to the pod itself whatever /etc/hosts says.
 name: E2E smoke test
-run-name: E2E ${{ inputs.environment }}${{ inputs.version != '' && format(' {0}', inputs.version) || '' }}
+run-name: >-
+  ${{ github.event_name == 'push' && format('E2E push {0}', github.sha)
+  || format('E2E {0}{1}', inputs.environment, inputs.version != '' && format(' {0}', inputs.version) || '') }}
 
 on:
+  # Every push to main, deploy/** and clusters/** included: Flux's image-update commits are dev deploys too.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
@@ -39,68 +78,172 @@ on:
         options: [prod, qa, dev]
         default: prod
       version:
-        description: "The version the environment must be serving: qa X.Y.Z-rc.N (required), prod X.Y.Z (optional), dev none"
+        description: "What the environment must be serving: qa X.Y.Z-rc.N (required), prod X.Y.Z (default: its pin on main), dev a main commit (default: main's head)"
         required: false
         default: ""
-      runner:
-        description: "Runner label that can reach the cluster"
-        required: true
-        default: "eshop-e2e"
 
 permissions:
   contents: read
 
-concurrency:
-  group: e2e-${{ inputs.environment }}
-  cancel-in-progress: false
-
 jobs:
+  targets:
+    name: What to test
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.decide.outputs.targets }}
+    steps:
+      # Full history: the push's commits, and origin/main for a dispatch's defaults.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Decide the targets
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          E2E_ENV: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            set -- push "$BEFORE" "$AFTER"
+          else
+            set -- dispatch "$E2E_ENV" ${VERSION:+"$VERSION"}
+          fi
+          if ! scripts/smoke-targets.sh "$@" >targets.txt 2>error.txt; then
+            cat error.txt
+            echo "::error::$(head -n 1 error.txt)"
+            exit 1
+          fi
+          cat targets.txt
+          echo "targets=$(jq -cRn '[inputs | split(" ") | {env: .[0], target: .[1]}]' targets.txt)" >>"$GITHUB_OUTPUT"
+
   e2e:
-    name: Playwright demo (${{ inputs.environment }}${{ inputs.version != '' && format(' {0}', inputs.version) || '' }})
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 25
+    name: Playwright demo (${{ matrix.env }} ${{ matrix.target }})
+    needs: targets
+    if: needs.targets.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.targets.outputs.targets) }}
+    # Dev: a newer dev run cancels this one, running or waiting (group e2e-dev): only the newest dev deploy is worth
+    # testing. QA and prod: no concurrency group at all (a group of their own per run), since GitHub keeps only the
+    # newest of several runs waiting in a group and would drop the others unreported. Every QA and prod target is
+    # tested or reported as not tested: overlapping runs are sorted out by scripts/smoke-result.sh (see "Still the
+    # target?" and "Decide the result" below).
+    concurrency:
+      group: ${{ matrix.env == 'dev' && 'e2e-dev' || format('e2e-{0}-run-{1}', matrix.env, github.run_id) }}
+      cancel-in-progress: ${{ matrix.env == 'dev' }}
+    runs-on: eshop-e2e
+    # Up to 15 minutes waiting for the deploy, ~8 testing, a few installing.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      deployments: write # the Deployment of the target (scripts/deployment.sh)
+      actions: read # whether another in-progress Deployment's run has ended (deployment.sh sweep)
     defaults:
       run:
         working-directory: e2e
     env:
-      E2E_ENV: ${{ inputs.environment }}
-      E2E_BASE_URL: ${{ inputs.environment == 'dev' && 'https://eshop.localhost' || format('https://{0}.eshop.localhost', inputs.environment) }}
-      VERSION: ${{ inputs.version }}
+      E2E_ENV: ${{ matrix.env }}
+      TARGET: ${{ matrix.target }}
+      # The Deployment's ref: the version's tag, or the dev commit.
+      REF: ${{ matrix.env == 'dev' && matrix.target || format('v{0}', matrix.target) }}
+      E2E_BASE_URL: ${{ matrix.env == 'dev' && 'https://eshop.localhost' || format('https://{0}.eshop.localhost', matrix.env) }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      # Why the job failed, for the Deployment's description: the step that fails writes it.
+      OUTCOME: ${{ github.workspace }}/outcome.txt
       STAFF_USERNAME: ${{ secrets.E2E_STAFF_USERNAME }}
       STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
-      - name: Record what this run tests
+      # The stock runner image has neither gh nor kubectl: the versions below, checked against their published
+      # SHA-256.
+      - name: Install gh and kubectl
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_VERSION: 2.103.3
+          KUBECTL_VERSION: v1.36.2 # k3s v1.36 (docs/setup.md)
         run: |
-          tested="none given, not checked"
-          [ -z "$VERSION" ] || tested="\`$VERSION\`"
+          case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "::error::no binaries for $(uname -m)"; exit 1 ;; esac
+          mkdir -p bin
+          gh_file="gh_${GH_VERSION}_linux_$arch.tar.gz"
+          gh_url="https://github.com/cli/cli/releases/download/v$GH_VERSION"
+          curl -fsSLO "$gh_url/$gh_file"
+          curl -fsSL "$gh_url/gh_${GH_VERSION}_checksums.txt" | grep " $gh_file\$" | sha256sum -c -
+          tar -xzf "$gh_file" && install -m 0755 "${gh_file%.tar.gz}/bin/gh" bin/gh && rm -rf "$gh_file" "${gh_file%.tar.gz}"
+          url="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$arch/kubectl"
+          curl -fsSLo kubectl "$url"
+          echo "$(curl -fsSL "$url.sha256")  kubectl" | sha256sum -c -
+          install -m 0755 kubectl bin/kubectl && rm kubectl
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      # The Deployment exists from here on, and the last step always finishes it. A run cancelled while waiting
+      # for its turn never got here, so it leaves no Deployment behind (notify reports it as not tested).
+      #
+      # Only a run on main records one (scripts/deployment.sh refuses otherwise, and records the workflow's ref in
+      # the payload): a copy of this workflow dispatched from another branch still tests, but leaves no evidence for
+      # sign-off or release.sh, which read only main's Deployments (scripts/lib/deployments.sh).
+      #
+      # Abandoned: a run finishes its own Deployment in its last step, even when cancelled, but that's best effort:
+      # a runner pod that is killed, or a last step that fails, would leave it in progress for ever. So each run
+      # also marks inactive, "abandoned", every other in-progress Deployment of its environment whose run attempt
+      # has ended (deployment.sh sweep). Runs still going are left alone: QA and prod runs may overlap.
+      - name: Record the Deployment of ${{ matrix.target }} to ${{ matrix.env }}
+        id: deployment
+        working-directory: .
+        run: |
           {
-            echo "## E2E smoke test: $E2E_ENV${VERSION:+ $VERSION}"
+            echo "## E2E smoke test: $E2E_ENV $TARGET"
             echo
             echo "| | |"
             echo "|---|---|"
             echo "| Environment | \`$E2E_ENV\` ($E2E_BASE_URL) |"
-            echo "| Version | $tested |"
-            echo "| Test code | \`$GITHUB_SHA\` ($GITHUB_REF_NAME) |"
           } >>"$GITHUB_STEP_SUMMARY"
-          if [ "$E2E_ENV" = qa ] && [ -z "$VERSION" ]; then
-            echo "::error::A QA run needs the release candidate QA is serving: version X.Y.Z-rc.N"
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::warning::A run from $GITHUB_REF tests, but records no Deployment: only main's count as evidence."
+            echo "| Target | \`$TARGET\` (no Deployment recorded: run from \`$GITHUB_REF_NAME\`, not main) |" >>"$GITHUB_STEP_SUMMARY"
+          else
+            id=$(scripts/deployment.sh start "$E2E_ENV" "$REF" "$RUN_URL" "$E2E_BASE_URL")
+            echo "id=$id" >>"$GITHUB_OUTPUT"
+            scripts/deployment.sh sweep "$E2E_ENV" "$id"
+            echo "| Target | \`$TARGET\` (Deployment $id of \`$REF\`) |" >>"$GITHUB_STEP_SUMMARY"
+          fi
+          echo "| Test code | \`$GITHUB_SHA\` ($GITHUB_REF_NAME) |" >>"$GITHUB_STEP_SUMMARY"
+      # QA and prod: is the target still the environment's pin on main? A newer promotion (or rollback) merged
+      # while this run waited for the runner means Flux is deploying something else: don't wait 15 minutes for a
+      # version that's going away. The run ends "superseded" (Decide the result, below), not failed. Dev's runs are
+      # cancelled by newer ones instead.
+      - name: Still the target?
+        if: matrix.env != 'dev'
+        working-directory: .
+        run: |
+          git fetch --quiet --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if ! scripts/smoke-result.sh current "$E2E_ENV" "$TARGET" >"$OUTCOME"; then
+            echo "::error::$TARGET is no longer $E2E_ENV's target: $(cat "$OUTCOME")"
             exit 1
           fi
-      # Refuse unless the cluster serves exactly this version (stderr says why not).
-      - name: Check ${{ inputs.environment }} is serving ${{ inputs.version }}
-        if: ${{ inputs.version != '' }}
+      - name: Send the eShop hostnames to Traefik
         run: |
-          if ! ./check-serving.sh "$E2E_ENV" "$VERSION" >serving.txt 2>&1; then
-            cat serving.txt
-            echo "::error::$(tail -n 1 serving.txt)"
-            { echo; echo "**Refused**: $(tail -n 1 serving.txt)"; } >>"$GITHUB_STEP_SUMMARY"
+          gateway=traefik.kube-system.svc.cluster.local
+          ip=$(getent ahostsv4 "$gateway" | awk 'NR == 1 { print $1 }')
+          [ -n "$ip" ] || { echo "::error::cannot resolve $gateway"; exit 1; }
+          echo "$ip eshop.localhost qa.eshop.localhost prod.eshop.localhost" | sudo tee -a /etc/hosts
+      # Wait (up to 15 minutes) until the cluster serves exactly this target; stderr says what it's waiting for.
+      - name: Wait until ${{ matrix.env }} serves ${{ matrix.target }}
+        id: wait
+        run: |
+          status=0
+          ./check-serving.sh --wait "$E2E_ENV" "$TARGET" 2>&1 >serving.txt | tee waiting.txt || status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 1 waiting.txt >"$OUTCOME"
+            echo "::error::$(cat "$OUTCOME")"
+            { echo; echo "**Not serving it**: $(cat "$OUTCOME")"; } >>"$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           cat serving.txt
           { echo; echo "Serving before the test:"; echo '```'; cat serving.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
-      # No `cache: npm`: on this machine's runner it would upload the user's whole ~/.npm to the repository's
-      # Actions cache (readable by pull-request workflows); npm already reuses ~/.npm locally.
+      # No `cache: npm`: the download is small next to Chromium's, and the runner pod starts empty either way.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -108,32 +251,198 @@ jobs:
       - name: Type-check
         run: npm run typecheck
       - name: Install Chromium
-        run: npx playwright install ${{ runner.os == 'Linux' && '--with-deps' || '' }} chromium
+        run: npx playwright install --with-deps chromium
       - name: Run the demo
-        run: npm run e2e
-      # The environment must not have moved during the test (a promotion merged meanwhile): otherwise the pass
-      # proves nothing about this version.
-      - name: Check ${{ inputs.environment }} still serves ${{ inputs.version }}
-        if: ${{ inputs.version != '' }}
+        run: npm run e2e || { echo "the Playwright demo failed" >"$OUTCOME"; exit 1; }
+      # A test that failed and then passed on its retry: the run passes, but says so.
+      - name: Name the tests that passed only on retry
+        if: ${{ !cancelled() && hashFiles('e2e/results.json') != '' }}
         run: |
-          if ! ./check-serving.sh "$E2E_ENV" "$VERSION" >serving-after.txt 2>&1; then
+          jq -r '.. | objects | select(has("specs")) | .specs[] as $spec | $spec.tests[]
+                 | select(.status == "flaky") | "\(.projectName): \($spec.file) › \($spec.title)"' results.json >retried.txt
+          [ -s retried.txt ] || exit 0
+          echo "::warning::$(wc -l <retried.txt | tr -d ' ') test(s) passed only on retry: $(paste -sd ';' retried.txt)"
+          {
+            echo
+            echo "**Passed only on retry** (the first failure is in the Playwright report):"
+            sed 's/^/- /' retried.txt
+          } >>"$GITHUB_STEP_SUMMARY"
+      # The environment must not have moved during the test (a deploy landed meanwhile): otherwise the pass proves
+      # nothing about this target.
+      - name: Check ${{ matrix.env }} still serves ${{ matrix.target }}
+        run: |
+          if ! ./check-serving.sh "$E2E_ENV" "$TARGET" >serving-after.txt 2>&1; then
             cat serving-after.txt
-            echo "::error::Changed during the test: $(tail -n 1 serving-after.txt)"
+            echo "changed during the test: $(tail -n 1 serving-after.txt)" >"$OUTCOME"
+            echo "::error::$(cat "$OUTCOME")"
             { echo; echo "**Changed during the test**: $(tail -n 1 serving-after.txt)"; } >>"$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           if ! diff -q serving.txt serving-after.txt >/dev/null; then
             diff serving.txt serving-after.txt || true
-            echo "::error::$E2E_ENV was redeployed during the test"
+            echo "$E2E_ENV was redeployed during the test" >"$OUTCOME"
+            echo "::error::$(cat "$OUTCOME")"
             { echo; echo "**Redeployed during the test**"; } >>"$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          { echo; echo "Still serving $VERSION after the test."; } >>"$GITHUB_STEP_SUMMARY"
+          { echo; echo "Still serving $TARGET after the test."; } >>"$GITHUB_STEP_SUMMARY"
       - name: Upload the Playwright report
+        id: report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.env }}
           # The report carries no traces in CI (see playwright.config.ts) and never the Staff password.
-          path: e2e/playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/results.json
           retention-days: 14
+      # The result, whatever happened above (scripts/smoke-result.sh of): passed, retried, not-deployed (never
+      # served the target), failed, cancelled (QA or prod, by hand), or superseded: dev cancelled by a newer run, or
+      # a QA or prod run that failed or was cancelled once main pinned the environment to something else (a newer
+      # promotion merged while it waited or tested, so its failure, "not deployed" or "redeployed during the test",
+      # says nothing about its target). A pass stands: the environment served the target before and after the test.
+      # main is fetched afresh here, so a promotion merged during the test counts.
+      - name: Decide the result
+        id: result
+        if: ${{ always() }}
+        working-directory: .
+        env:
+          JOB_STATUS: ${{ job.status }}
+          WAITED: ${{ steps.wait.outcome }}
+        run: |
+          git fetch --quiet --depth=1 origin +refs/heads/main:refs/remotes/origin/main \
+            || echo "::warning::could not fetch main: the result goes by the job's status alone"
+          read -r result why < <(scripts/smoke-result.sh of "$E2E_ENV" "$TARGET" "$JOB_STATUS" "$WAITED" e2e/retried.txt \
+            || echo failed)
+          [ -z "$why" ] || echo "$why" >"$OUTCOME"
+          echo "result=$result" >>"$GITHUB_OUTPUT"
+          echo "$E2E_ENV $TARGET: $result${why:+ ($why)}"
+      # The Deployment's outcome: success, failure (and why), or inactive when nothing was tested.
+      - name: Record the outcome on the Deployment
+        if: ${{ always() && steps.deployment.outputs.id != '' }}
+        working-directory: .
+        env:
+          ID: ${{ steps.deployment.outputs.id }}
+          RESULT: ${{ steps.result.outputs.result || 'failed' }}
+        run: |
+          retried=
+          [ ! -s e2e/retried.txt ] || retried=$(wc -l <e2e/retried.txt | tr -d ' ')
+          why=$(cat "$OUTCOME" 2>/dev/null || true)
+          case "$RESULT" in
+            passed | retried) set -- success "passed${retried:+, $retried test(s) only on retry}" ;;
+            failed | not-deployed) set -- failure "${why:-the smoke test job failed}" ;;
+            *) set -- inactive "$RESULT${why:+: $why}" ;; # superseded, cancelled
+          esac
+          scripts/deployment.sh finish "$ID" "$1" "$RUN_URL" "$E2E_BASE_URL" "$2"
+      # The result for the notify job's email, as artifact smoke-result-<env> (one target per environment a run):
+      # the result and the Deployment's id, why it failed or wasn't tested, the tests that passed only on retry and
+      # the Playwright report's link (scripts/notify.sh results reads it).
+      - name: Keep the result for the email
+        if: ${{ always() }}
+        working-directory: .
+        env:
+          ID: ${{ steps.deployment.outputs.id }}
+          RESULT: ${{ steps.result.outputs.result || 'failed' }}
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+        run: |
+          mkdir -p smoke-result
+          [ ! -s e2e/retried.txt ] || cp e2e/retried.txt smoke-result/
+          echo "$RESULT $ID" >smoke-result/result
+          cat "$OUTCOME" >smoke-result/detail 2>/dev/null || : >smoke-result/detail
+          echo "${REPORT_URL:-$RUN_URL}" >smoke-result/report-url
+      - name: Upload the result for the email
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-result-${{ matrix.env }}
+          path: smoke-result
+          retention-days: 14
+
+  # Emails each target's result (scripts/notify.sh results): qa and prod every result, a not-tested one too
+  # (superseded or cancelled), dev only a failure and the first pass after one. A job of its own, on a GitHub-hosted runner (it needs no cluster), because SMTP_PASSWORD is a secret
+  # of environment smoke-test, which deploys from main only (scripts/protect-main.sh):
+  #   - in the e2e job, that environment would also stop a run dispatched from another branch from testing at all,
+  #     and would put the secret within reach of the whole job (npm packages, the browser) on the cluster's runner;
+  #   - `deployment: false`: the job reads the environment's secret without GitHub recording a deployment to
+  #     "smoke-test", which would sit beside the Deployments of what was tested (scripts/deployment.sh).
+  # notify.sh reads the e2e job's results from artifacts smoke-result-<env> (a matrix job has no per-target outputs).
+  # A target with no result is "cancelled", not tested and never "FAILED": its job was cancelled while waiting for
+  # its turn (a newer dev run), or died before the end; for QA and prod the email says it was not tested. The Deployments are finished before
+  # this job starts, and it may only read them: a failure here (a missing SMTP setting, Gmail refusing) fails this
+  # job, visibly, and never changes what the smoke test recorded.
+  notify:
+    name: Email the results
+    needs: [targets, e2e]
+    if: ${{ always() && needs.targets.result == 'success' && needs.targets.outputs.targets != '[]' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: smoke-test
+      deployment: false
+    permissions:
+      contents: read
+      deployments: read # dev's previous Deployment, prod's last passing release (scripts/notify.sh)
+    steps:
+      - uses: actions/checkout@v7
+      # Whatever it finds: notify.sh handles a missing result (not tested).
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: smoke-result-*
+          path: results
+      - name: Email the results
+        env:
+          TARGETS: ${{ needs.targets.outputs.targets }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
+          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: jq -r '.[] | "\(.env) \(.target)"' <<<"$TARGETS" | scripts/notify.sh results results
+
+  # The sign-off PR (scripts/sign-off-pr.sh), after a run on main that tested QA, whatever its outcome: a pass opens
+  # "Sign off vX.Y.Z-rc.N"; a failure, or QA's pin having moved, closes the sign-off PRs that no longer hold. It reads
+  # QA's state afresh from main and the Deployments, so running it again changes nothing. A hosted runner: it needs
+  # no cluster, only GitHub and the registry. PROMOTION_TOKEN (environment `release`, main and v* tags only) opens the
+  # PR so that its checks run; `deployment: false`, as for notify, so GitHub records no deployment to "release".
+  sign-off-pr:
+    name: Sign-off PR
+    needs: [targets, e2e]
+    if: ${{ always() && github.ref == 'refs/heads/main' && contains(needs.targets.outputs.targets, '"env":"qa"') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      deployment: false
+    concurrency:
+      group: sign-off-pr
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: read # QA's Deployments
+      actions: read # the run's Playwright report artifact
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0 # when main last changed QA's pin
+          token: ${{ secrets.PROMOTION_TOKEN }} # git push of the sign-off branch
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.1
+      - name: Open or close sign-off PRs
+        env:
+          REPO: ${{ github.repository }}
+          IMAGE_REGISTRY: docker.io/${{ vars.DOCKERHUB_USERNAME }}
+          SIGN_OFF_READ_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret PROMOTION_TOKEN (environment release) is missing, so the sign-off PR can't be opened." \
+              "Create it as described in docs/setup.md, \"Promotion token\", then re-run this job."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -o pipefail
+          scripts/sign-off-pr.sh | tee "$RUNNER_TEMP/sign-off-pr.log"
+          { echo "### Sign-off PR"; echo; echo '```'; cat "$RUNNER_TEMP/sign-off-pr.log"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

@@ -9,13 +9,18 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # The fake kubectl: `-n <ns> get <kind> [<name>] -o json` prints $FAKE/<ns>.<kind>[.<name>].json, or fails like
-# kubectl does for a missing object.
+# kubectl does for a missing object. A cluster that changes while the check waits: for the first N gets of a
+# Kustomization ($FAKE/earlier/polls holds N), files in $FAKE/earlier/ take precedence.
 mkdir -p "$work/bin"
 cat >"$work/bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 ns=$2 kind=$4 name=${5:-}
 [ "$name" = "-o" ] && name=
+polls=$(cat "$FAKE/polls" 2>/dev/null || echo 0)
+[ "$kind" = kustomization ] && echo $((polls += 1)) >"$FAKE/polls"
 file="$FAKE/$ns.$kind${name:+.$name}.json"
+if [ -f "$FAKE/earlier/polls" ] && [ "$polls" -le "$(cat "$FAKE/earlier/polls")" ] &&
+  [ -f "$FAKE/earlier/${file##*/}" ]; then file="$FAKE/earlier/${file##*/}"; fi
 if [ -f "$file" ]; then cat "$file"; exit 0; fi
 echo "Error from server (NotFound): $kind \"$name\" not found" >&2
 exit 1
@@ -175,9 +180,74 @@ prod_takes_only_a_release() {
   expect refuse "prod takes a release X.Y.Z" prod 0.3.0-rc.1
 }
 
-dev_has_no_version_to_check() {
+# Dev follows main: Flux applied main at a commit, with the images that revision pins (no spec.images).
+dev_at() { # <commit>
+  kustomization dev "main@sha1:$1" unused
+  f="$FAKE/flux-system.kustomization.apps-dev.json"
+  jq 'del(.spec.images)' "$f" >"$f.x" && mv "$f.x" "$f"
+  deployments dev "eshop-api=docker.io/pkhamdee/eshop-api:main-44296ee-1793488244" \
+    "eshop-web=docker.io/pkhamdee/eshop-web:main-44296ee-1793488244"
+}
+commit=ee5d66335285f4a9e8ddd3727847f1f9a8b5ee00
+older=0dac0f7a1b2c3d4e5f60718293a4b5c6d7e8f901
+
+serves_dev_at_the_main_commit_flux_applied() {
+  fresh; dev_at "$commit"
+  expect serve "eshop-dev serves main at $commit" dev "$commit"
+  expect serve "apps-dev applied main@sha1:$commit" dev "$commit"
+  expect serve "eshop-web: docker.io/pkhamdee/eshop-web:main-44296ee-1793488244" dev "$commit"
+}
+
+serves_dev_given_a_short_commit() {
+  fresh; dev_at "$commit"
+  expect serve "apps-dev applied main@sha1:$commit" dev ee5d663
+}
+
+refuses_dev_at_an_older_commit() {
+  fresh; dev_at "$older"
+  expect refuse "eshop-dev is not serving main at $commit: apps-dev applied main@sha1:$older" dev "$commit"
+}
+
+refuses_dev_while_pods_still_run_the_previous_images() {
+  fresh; dev_at "$commit"
+  f="$FAKE/eshop-dev.deployment.json"
+  jq '.items[0].status |= (.replicas = 2 | .updatedReplicas = 1)' "$f" >"$f.x" && mv "$f.x" "$f"
+  expect refuse "eshop-api has not finished rolling out" dev "$commit"
+}
+
+waits_until_dev_serves_the_commit() {
+  fresh; dev_at "$older"
+  mkdir "$FAKE/earlier" && mv "$FAKE"/*.json "$FAKE/earlier/" && echo 3 >"$FAKE/earlier/polls"
+  dev_at "$commit"
+  expect serve "eshop-dev serves main at $commit" --wait --timeout 60 --interval 0.1 dev "$commit"
+  local polls; polls=$(cat "$FAKE/polls" 2>/dev/null || echo 0)
+  [ "$polls" -eq 4 ] || { echo "FAIL: ${FUNCNAME[0]}: polled $polls times, not 4" >&2; failures=$((failures + 1)); }
+}
+
+reports_not_deployed_when_dev_never_serves_the_commit() {
+  fresh; dev_at "$older"
+  expect refuse "not deployed" --wait --timeout 1 --interval 0.1 dev "$commit"
+  expect refuse "flux get kustomization apps-dev" --wait --timeout 1 --interval 0.1 dev "$commit"
+  expect refuse "apps-dev applied main@sha1:$older" --wait --timeout 1 --interval 0.1 dev "$commit"
+}
+
+waits_for_qa_too() {
+  fresh; serving qa 0.3.0-rc.1
+  expect serve "eshop-qa serves 0.3.0-rc.1" --wait --timeout 1 --interval 0.1 qa 0.3.0-rc.1
+  expect refuse "eshop-qa is not serving 0.3.0-rc.2: not deployed" --wait --timeout 1 --interval 0.1 qa 0.3.0-rc.2
+}
+
+does_not_wait_for_bad_arguments() {
   fresh
-  expect refuse "dev follows main and has no release to check" dev 0.3.0
+  expect refuse "dev takes a main commit" --wait dev 0.3.0
+  expect refuse "--timeout takes seconds" --wait --timeout soon dev "$commit"
+}
+
+dev_takes_only_a_commit() {
+  fresh; dev_at "$commit"
+  expect refuse "dev takes a main commit" dev 0.3.0
+  expect refuse "dev takes a main commit" dev ee5d6
+  expect refuse "dev takes a main commit" dev
 }
 
 refuses_when_the_environment_has_no_kustomization
@@ -185,7 +255,15 @@ refuses_an_image_whose_tag_only_starts_with_the_version
 accepts_an_image_pinned_by_digest_too
 qa_takes_only_a_release_candidate
 prod_takes_only_a_release
-dev_has_no_version_to_check
+serves_dev_at_the_main_commit_flux_applied
+serves_dev_given_a_short_commit
+refuses_dev_at_an_older_commit
+refuses_dev_while_pods_still_run_the_previous_images
+dev_takes_only_a_commit
+waits_until_dev_serves_the_commit
+reports_not_deployed_when_dev_never_serves_the_commit
+waits_for_qa_too
+does_not_wait_for_bad_arguments
 refuses_when_a_deployment_runs_another_image
 ignores_images_that_are_not_eshop_releases
 refuses_while_a_deployment_is_rolling_out

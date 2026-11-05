@@ -5,3 +5,4 @@ resources:
   - traefik.yaml
   - cert-manager.yaml
   - cloudnative-pg.yaml
+  - actions-runner-controller.yaml

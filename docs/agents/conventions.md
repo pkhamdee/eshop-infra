@@ -24,7 +24,8 @@ terms in `GLOSSARY.md`; decisions in `docs/adr/`. This file points there rather 
 - **Scripted API checks**: macOS `/bin/bash` 3.2 mangles Thai/multibyte JSON inside `"$(curl -d ...)"`; use Python
   `urllib` for anything with Thai text.
 - **Shared cluster**: the cluster also runs unrelated workloads: only touch namespaces this repo manages
-  (eshop-dev, eshop-qa, eshop-prod, thirdparty, gateway, cert-manager, cnpg-system, flux-system).
+  (eshop-dev, eshop-qa, eshop-prod, thirdparty, gateway, cert-manager, cnpg-system, arc-systems, arc-runners,
+  flux-system).
 - **Secrets in output**: decrypt Staff/DB/SMB passwords only inside a script that uses them and never prints them.
   Printing them is blocked for agents and leaks into logs.
 - `gh pr create` can fail with "connection reset by peer" after the push succeeded: check
@@ -236,6 +237,14 @@ eshop-sync-master:
   unfixable one add a `.trivyignore` at the repo root (CVE, reason, date): both gates run Trivy there.
 - An ImagePolicy with no matching tag stays not Ready and blocks a `wait: true` Kustomization: a new service's image
   must exist before its policy is applied.
+- **Cluster runner** (`deploy/infrastructure/runners`, `docs/setup.md` "Cluster runner"): the E2E job runs in a pod
+  of ARC's scale set `eshop-e2e`, as service account `eshop-e2e-runner`. Anything new the job reads from the cluster
+  needs a rule in `runner-rbac.yaml` (Secrets only by name). In the pod, Chromium resolves every `*.localhost` to
+  the pod itself and ignores `/etc/hosts`: hostnames reach Traefik through `--host-resolver-rules`
+  (`e2e/playwright.config.ts`), Node through `/etc/hosts` (`e2e.yml`). The ARC charts (controller and scale set)
+  share one pinned version; change both together. The runner image `ghcr.io/actions/actions-runner:X.Y.Z` is pinned
+  and Flux keeps it current (`deploy/infrastructure/runners/image-automation.yaml`, commits "runners: update
+  images"): leave the tag to Flux; to hold a version, set it and remove the `$imagepolicy` marker. `.github/actionlint.yaml` lists the `eshop-e2e` label.
 
 ## thirdparty
 
@@ -257,13 +266,25 @@ Agents are denied these; ask the user, giving the exact command:
 - making a new GHCR package public (the `gh` token has no packages scope);
 - pushing release branches and tags, and dispatching the release workflow (`docs/git-workflow.md`, "Releasing");
   `scripts/release.sh X.Y.Z-rc.N` is how a release candidate is cut, and the release tag `vX.Y.Z` comes only from
-  sign-off (`gh workflow run sign-off.yml --ref main -f version=X.Y.Z-rc.N`, a maintainer's step; its logic is
-  `scripts/sign-off.sh`, tested with fake `gh`/`crane` in `scripts/tests/release-scripts.sh`);
+  sign-off: **merging the sign-off PR** "Sign off vX.Y.Z-rc.N" (the QA lead's step; agents never merge, approve or
+  close it, nor push `sign-off/*` branches or `releases/*.md` to bring one about). The pipeline opens and closes
+  those PRs (`scripts/sign-off-pr.sh`, from `e2e.yml`) and acts on the merge (`scripts/sign-off.sh`, from
+  `sign-off.yml`), both tested with fake `gh`/`crane` in `scripts/tests/release-scripts.sh`. There is no sign-off
+  workflow to dispatch;
+- creating or renewing the cluster runner's GitHub token (`deploy/infrastructure/runners/eshop-e2e-github.sops.yaml`,
+  a fine-grained token with Administration read and write; `docs/setup.md`, "Cluster runner") and listing it in that
+  folder's `kustomization.yaml`: agents never write that file, not even with a placeholder;
+- keeping "Require approval for all external contributors" for fork PR workflows (Settings → Actions → General): a
+  public repository's fork PR could otherwise run on the cluster's runner;
 - creating or renewing secrets: `PROMOTION_TOKEN` and `DOCKERHUB_TOKEN` are secrets of the `release` environment
   (`gh secret set <NAME> --env release`; `docs/setup.md`, "Release secrets"), not repo secrets;
-- applying `scripts/protect-main.sh` (main's ruleset, the `v*` tag rulesets and the `release` environment) or changing any repo setting;
+- the smoke test's email settings (`docs/setup.md`, "Smoke test email"): the Gmail sending account and its app
+  password, secret `SMTP_PASSWORD` of the `smoke-test` environment (`gh secret set SMTP_PASSWORD --env smoke-test`)
+  and repository variables `SMTP_USERNAME` and `NOTIFY_EMAIL` (`gh variable set`). Agents never set them and never
+  send a real email: `scripts/notify.sh` is tested with a fake `curl` in `scripts/tests/release-scripts.sh`;
+- applying `scripts/protect-main.sh` (main's ruleset, the `v*` tag rulesets, the `release` and `smoke-test` environments) or changing any repo setting;
   give the user `scripts/protect-main.sh --dry-run` first. Test `scripts/release.sh`, `scripts/check-release-tag.sh`,
-  `scripts/pin-release.sh`, `scripts/promotion-pr.sh`, `scripts/sign-off.sh`, `scripts/check-new-images.sh` and `scripts/protect-main.sh` with
+  `scripts/pin-release.sh`, `scripts/promotion-pr.sh`, `scripts/sign-off-pr.sh`, `scripts/sign-off.sh`, `scripts/check-new-images.sh`, `scripts/smoke-targets.sh`, `scripts/smoke-result.sh`, `scripts/deployment.sh`, `scripts/notify.sh` and `scripts/protect-main.sh` with
   `scripts/tests/release-scripts.sh` (throwaway local repos, fake `gh`), never against GitHub.
 
 `main` is protected (`docs/git-workflow.md`, "Protecting main"): agents never push to it; every change is a PR whose
@@ -274,9 +295,13 @@ from `main` and `v*` tags, so those jobs fail on any other branch (a release dry
 `scripts/release.sh X.Y.0-rc.1` on an existing `release/N.x` merges `origin/main` into it first and refuses while the
 branch has commits not on `main` by patch-id (`git cherry`).
 
-Release and e2e scripts share `scripts/lib/` (sourced): the version grammar is `versions.sh` (`is_candidate`,
-`env_takes qa|prod <version>`, ...), the repository and image registry `repo.sh` (`REPO`, `IMAGE_REGISTRY`); use
-them rather than a new regex or a literal `pkhamdee/...`. Whether an environment is still suspended is
-`scripts/pin-release.sh --suspended <env>` (exit 0 suspended, 1 not, 2 no pin), not a grep for the marker.
+Release and e2e scripts share `scripts/lib/` (sourced): the version and environment grammar is `versions.sh`
+(`is_candidate`, `env_takes qa|prod <version>`, `is_env`, `is_commit`, `is_target <env> <target>`, ...), the
+repository and image registry `repo.sh` (`REPO`, `IMAGE_REGISTRY`, `gh_read`), the pins at a commit `pins.sh`
+(`pin_at <rev> [--suspended] <env>`), the smoke test's Deployments `deployments.sh` (`deployments_of`,
+`latest_status`, `outcome_of`, `run_ended`; only those recorded by a run on main). Use them rather than a new regex,
+a literal `pkhamdee/...`, another `git archive` of the pins or another walk of the Deployments API. Whether an
+environment is still suspended is `pin_at <rev> --suspended <env>` (`scripts/pin-release.sh --suspended <env>` on
+the working tree; exit 0 suspended, 1 not, 2 no pin), not a grep for the marker.
 
 `gh pr merge <n> --squash --delete-branch` works for agents only as a standalone command, not inside a compound one.

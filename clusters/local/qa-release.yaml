@@ -24,7 +24,6 @@ metadata:
   name: apps-qa
   namespace: flux-system
 spec:
-  suspend: true # release-pin-until: qa
   dependsOn:
     - name: infra-configs
   interval: 10m
@@ -44,13 +43,13 @@ spec:
   # The pinned release candidate's images (deploy/apps/qa has no tags). Every QA service needs a line here.
   images:
     - name: docker.io/pkhamdee/eshop-api
-      newTag: "0.2.0" # release-pin: qa
+      newTag: "0.3.0-rc.1" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-web
-      newTag: "0.2.0" # release-pin: qa
+      newTag: "0.3.0-rc.1" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-node-api
-      newTag: "0.2.0" # release-pin: qa
+      newTag: "0.3.0-rc.1" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-sync-master
-      newTag: "0.2.0" # release-pin: qa
+      newTag: "0.3.0-rc.1" # release-pin: qa
 ---
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
@@ -64,7 +63,7 @@ spec:
     name: flux-system
   ref:
     # An exact version selects exactly tag vX.Y.Z or vX.Y.Z-rc.N.
-    semver: "0.2.0" # release-pin: qa
+    semver: "0.3.0-rc.1" # release-pin: qa
   ignore: |
     /*
     !/deploy/

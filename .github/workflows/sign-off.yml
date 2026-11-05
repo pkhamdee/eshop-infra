@@ -1,30 +1,31 @@
-# Sign off a release candidate (docs/git-workflow.md, "Releasing"; ADR 0007): Actions -> Sign off release candidate ->
-# Run workflow, on main, with the candidate's version X.Y.Z-rc.N. Or: gh workflow run sign-off.yml --ref main -f version=X.Y.Z-rc.N
+# Sign off a release candidate (docs/git-workflow.md, "Sign-off"; ADR 0008): runs when a push to main adds or changes a
+# release's record releases/X.Y.Z.md, i.e. when the QA lead merges the sign-off PR "Sign off vX.Y.Z-rc.N" that e2e.yml
+# opened after QA's smoke test of the candidate passed (scripts/sign-off-pr.sh). Merging it is the sign-off; there is
+# no other way to start this.
 #
 # The decisions and steps are all in scripts/sign-off.sh (tested by scripts/tests/release-scripts.sh); this file only
-# supplies tokens and tools. It refuses, changing nothing, unless the person running it is a maintainer (repo role
-# admin or maintain), main pins eshop-qa to exactly that candidate (not suspended), and the latest completed QA run
-# of it on main ("E2E qa X.Y.Z-rc.N", e2e.yml), created since main last changed QA's pin, passed. That run asked the
-# cluster that QA served the candidate before and after the test; this hosted runner can't reach the cluster, so the
-# passing run stands in for it.
-# Then: copies the candidate's images to X.Y.Z by digest (never rebuilt), tags vX.Y.Z on the candidate's commit,
-# publishes the GitHub Release and opens the prod promotion PR. Re-running it after a failure finishes the job.
+# supplies tokens and tools. It refuses, changing nothing and failing this run, unless whoever merged the sign-off PR
+# is a maintainer (repo role admin or maintain; anyone with write access can merge a PR), main still pins eshop-qa to
+# the record's candidate (not suspended), QA's latest Deployment of it created since main last changed QA's pin
+# succeeded, and the version isn't released yet. That Deployment's run asked the cluster that QA served the candidate
+# before and after the test; this hosted runner can't reach the cluster, so the Deployment stands in for it.
+# Then: copies the candidate's images to X.Y.Z by digest (never rebuilt), tags vX.Y.Z on the candidate's commit (the
+# tag message names who merged the PR), publishes the GitHub Release and opens the prod promotion PR. Re-running the
+# failed job finishes it.
 #
 # Pushing vX.Y.Z runs ci-release.yml, whose `plan` skips a plain release tag (scripts/check-release-tag.sh): nothing
 # is built. Writes use the secret PROMOTION_TOKEN (docs/setup.md, "Promotion token") so the tag and the PR trigger
 # their workflows (a PR opened with GITHUB_TOKEN would get no checks); the workflow's own token only reads.
 # PROMOTION_TOKEN and DOCKERHUB_TOKEN are secrets of environment `release`, which deploys only from main and v* tags
-# (scripts/protect-main.sh): a copy of this workflow dispatched from another branch never gets them.
+# (scripts/protect-main.sh). `deployment: false`: the job reads the environment's secrets without GitHub recording a
+# deployment to "release" beside the smoke tests' Deployments (scripts/deployment.sh).
 name: Sign off release candidate
-run-name: Sign off ${{ inputs.version }}
+run-name: Sign off at ${{ github.sha }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Release candidate to sign off, X.Y.Z-rc.N (QA must be running it and its QA run must have passed)"
-        required: true
-        type: string
+  push:
+    branches: [main]
+    paths: ["releases/*.md"]
 
 permissions: {}
 
@@ -34,33 +35,28 @@ concurrency:
 
 jobs:
   sign-off:
-    name: sign off ${{ inputs.version }}
+    name: sign off
     runs-on: ubuntu-latest
-    environment: release # its secrets; deployable from main (and v* tags) only
+    environment: # its secrets; deployable from main (and v* tags) only
+      name: release
+      deployment: false
     permissions:
-      actions: read # the QA runs of e2e.yml
       contents: read
+      deployments: read # QA's Deployments of the candidate
+      pull-requests: read # the merged PR: who signed off
     steps:
-      - name: Only from main
-        if: github.ref != 'refs/heads/main'
-        env:
-          REF: ${{ github.ref }}
-        run: |
-          echo "::error::Sign-off runs only from main (this run: $REF): another branch's copy of this workflow could skip its checks."
-          exit 1
       - name: Check PROMOTION_TOKEN
         env:
           PROMOTION_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
         run: |
           if [ -z "$PROMOTION_TOKEN" ]; then
             echo "::error::Secret PROMOTION_TOKEN (environment release) is missing, so sign-off can't push the release tag or open" \
-              "the prod promotion PR. Create it as described in docs/setup.md, \"Promotion token\", then run this again."
+              "the prod promotion PR. Create it as described in docs/setup.md, \"Promotion token\", then re-run this job."
             exit 1
           fi
       - uses: actions/checkout@v7
         with:
-          ref: main
-          fetch-depth: 0 # main's history: when QA's pin last changed (older QA runs don't count)
+          fetch-depth: 0 # main's history: the push's commits, and when QA's pin last changed
           token: ${{ secrets.PROMOTION_TOKEN }} # git push of the release tag and the promotion branch
       - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
         with:
@@ -75,8 +71,8 @@ jobs:
       - name: Sign off
         shell: bash # -eo pipefail: a refusal fails the step despite the tee
         env:
-          VERSION: ${{ inputs.version }}
-          SIGN_OFF_ACTOR: ${{ github.triggering_actor }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
           REPO: ${{ github.repository }}
           IMAGE_REGISTRY: docker.io/${{ vars.DOCKERHUB_USERNAME }}
           SIGN_OFF_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -85,5 +81,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          scripts/sign-off.sh "$VERSION" | tee "$RUNNER_TEMP/sign-off.log"
-          { echo "### Signed off $VERSION"; echo; echo '```'; cat "$RUNNER_TEMP/sign-off.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          scripts/sign-off.sh "$BEFORE" "$AFTER" 2>&1 | tee "$RUNNER_TEMP/sign-off.log" || status=$?
+          { echo "### Sign-off"; echo; echo '```'; cat "$RUNNER_TEMP/sign-off.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::$(grep -m 1 'Sign-off refused' "$RUNNER_TEMP/sign-off.log" || tail -n 1 "$RUNNER_TEMP/sign-off.log")"
+            exit "$status"
+          fi

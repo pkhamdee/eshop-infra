@@ -1,0 +1,25 @@
+# GitHub token of the eshop-e2e runner scale set (docs/setup.md, "Cluster runner"): a fine-grained token for
+# pkhamdee/modernapp only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+    name: eshop-e2e-github
+    namespace: arc-runners
+type: Opaque
+stringData:
+    github_token: ENC[AES256_GCM,data:cAs4VYNGUVzf7GWgtYMF+bIitZYRDLo+lmhjIy88GG+u0KeFFErsMY9JjZ8SirJVyaHwN8q4/5UF1MtlKvhm+ayxjPKt9MONCztGw3VVAg81DHFJRGsuW7KJpNBr,iv:ET9CCDUbmG0qQUkQYHEOsqTYdTwOy7lRj7XZs8yE/VQ=,tag:lTWAikXfpZt4FYaerfhBog==,type:str]
+sops:
+    age:
+        - enc: |
+            -----BEGIN AGE ENCRYPTED FILE-----
+            YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBGQjJ1TGpMRUkwWjR1MXR0
+            emJ4Zzd2RjVmSXZFdG9UU05CMmNQVEVxaGtvCmVZYlBCaDBsOG9ETXFWQTZDR05j
+            NXJKUVphQXlOL3NxZG5oYjEvRGxLOWcKLS0tIHJzbXIrNHVzbnhHRkltTDl4RDRM
+            SmZ6NlMxSUUzZWtpRVFBdEhGMG5FUTgKwmC7A1DalaRx3WnemoIEwrHbUX3ZkhFX
+            NuE/3gVR/jGUuNoZz+hZLQhsNC6IKbzmrWRwM6ynsSzxXSj9ehgHCA==
+            -----END AGE ENCRYPTED FILE-----
+          recipient: age1mfq6dc0wrlwaedn2r2dwm96j3j4wg2ze4axed9zdz7vzuraddfssnuh2vh
+    encrypted_regex: ^(data|stringData)$
+    lastmodified: "2026-11-05T00:52:47Z"
+    mac: ENC[AES256_GCM,data:Ta6bOnfWElvzKZ2TrEGcEAqfdLBUodUfSeOAProkI39UQjmHgLM3K0IoS1rIc41jCagbVqI68YHXvAThrBpd7y9exfqLC+fHgE8dh0PYqGB6J/SMk4ak+r3avnZ4RH8IiETK2DFpY0q75atkWp0HlOn6fBe6HOE8Z2J37Ugg1q8=,iv:4uoR6Elqs0q3xCOuvHTeU8IgY1kwBQtYaoqmLUBWdvY=,tag:UeSU3sex78zcmX0RLQymVQ==,type:str]
+    version: 3.13.3

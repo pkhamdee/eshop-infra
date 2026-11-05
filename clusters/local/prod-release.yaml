@@ -36,13 +36,13 @@ spec:
   # The pinned release's images (deploy/apps/prod has no tags). Every prod service needs a line here.
   images:
     - name: docker.io/pkhamdee/eshop-api
-      newTag: "0.2.0" # release-pin: prod
+      newTag: "0.3.0" # release-pin: prod
     - name: docker.io/pkhamdee/eshop-web
-      newTag: "0.2.0" # release-pin: prod
+      newTag: "0.3.0" # release-pin: prod
     - name: docker.io/pkhamdee/eshop-node-api
-      newTag: "0.2.0" # release-pin: prod
+      newTag: "0.3.0" # release-pin: prod
     - name: docker.io/pkhamdee/eshop-sync-master
-      newTag: "0.2.0" # release-pin: prod
+      newTag: "0.3.0" # release-pin: prod
 ---
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
@@ -56,7 +56,7 @@ spec:
     name: flux-system
   ref:
     # An exact version selects exactly tag vX.Y.Z.
-    semver: "0.2.0" # release-pin: prod
+    semver: "0.3.0" # release-pin: prod
   ignore: |
     /*
     !/deploy/

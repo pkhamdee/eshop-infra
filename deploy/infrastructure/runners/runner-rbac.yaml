@@ -1,0 +1,129 @@
+# What the eshop-e2e runner pod (service account eshop-e2e-runner) may do in the cluster, and nothing more:
+#   - flux-system: get the Kustomizations apps-dev, apps-qa and apps-prod (e2e/check-serving.sh);
+#   - eshop-dev, eshop-qa, eshop-prod: read Deployments, ReplicaSets and Pods (has the version rolled out?) and get
+#     the Staff Secret eshop-api-staff by name (e2e/global-setup.ts signs in as Staff with it; Flux has already
+#     decrypted it, so no age key enters the cluster).
+# `get` with resourceNames allows exactly `kubectl get <kind> <name>`; listing or reading any other Secret is refused.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eshop-e2e-runner
+  namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eshop-e2e-runner
+  namespace: flux-system
+rules:
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    resourceNames: [apps-dev, apps-qa, apps-prod]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eshop-e2e-runner
+  namespace: flux-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eshop-e2e-runner
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-dev
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [eshop-api-staff]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eshop-e2e-runner
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-qa
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [eshop-api-staff]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-qa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eshop-e2e-runner
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-prod
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [eshop-api-staff]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eshop-e2e-runner
+  namespace: eshop-prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eshop-e2e-runner
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
