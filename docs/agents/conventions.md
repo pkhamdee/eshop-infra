@@ -131,27 +131,10 @@ eshop-sync-master:
   eshop-api stays invariant. Npgsql connection strings include `GSS Encryption Mode=Disable` (libgssapi noise on
   chiseled images).
 
-## Node services (`eshop-node-api`, `thirdparty-mock`)
+## Service repositories (eshop-web, eshop-node-api, thirdparty-mock)
 
-- Node 24 runs `src/*.ts` directly (type stripping): no build step, imports end in `.ts`, `erasableSyntaxOnly`,
-  so no enums or parameter properties. `npm run lint` / `typecheck` as in `package.json`.
-- eshop-node-api: ports as interfaces (`ImageStore`) with adapters (`folderImageStore`, `smbImageStore`). Tests
-  (`node --test`) start the real service on port 0 via `test/harness.ts` and assert on HTTP only;
-  `startSmbService()` puts `test/fake-smbclient/` (an ESM script: use `import`) on `PATH`. Extend that fake when the
-  adapter sends a new smbclient command.
-- SMB goes through the `smbclient` binary because pure-JS SMB libraries need NTLMv1/MD4. Use `ls`, not `allinfo`,
-  to test existence: Samba without VSS answers `allinfo` with `NT_STATUS_INVALID_DEVICE_REQUEST`.
-- `/internal/images/...` is never routed by the Gateway; through the Gateway that path returns the SPA's
-  `index.html` (200 text/html), so check the content type when verifying image privacy.
-- thirdparty-mock: one Router per mocked party in `src/<party>.ts`, mounted in `src/app.ts`; ID Verification and
-  Credit Check sit behind `simulatedDelay`, SMS does not. HTML links must be relative (served under
-  `/thirdparty-mock/`). State is in memory, one replica. Test ID numbers (outcome by last two digits) are in
-  `src/testIdNumbers.ts`; the 30-day re-apply wait follows the ID number, so use a fresh prefix per demo run.
-
-## Service repositories (eshop-web so far)
-
-- Each service in its own repository (ADR 0009) is cloned beside this one (`scripts/clone-all.sh`): eshop-web at
-  `../eshop-web`. Its own conventions are in its `docs/conventions.md` and its `CLAUDE.md`; work on it there, in a
+- Each service in its own repository (ADR 0009) is cloned beside this one (`scripts/clone-all.sh`): `../eshop-web`,
+  `../eshop-node-api`, `../thirdparty-mock`. Its own conventions are in its `docs/conventions.md` and its `CLAUDE.md`; work on it there, in a
   branch and PR of that repository, referencing issues as `pkhamdee/modernapp#N`.
 - What it builds is decided there (its `.github/workflows/ci.yml`); the gates it runs are this repository's
   `.github/workflows/service-image.yml` and `scripts/gates/`, so a gate change here applies to every service

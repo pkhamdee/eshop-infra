@@ -11,15 +11,11 @@
   },
   {
     "service": "thirdparty-mock",
-    "context": "services/thirdparty-mock",
-    "dockerfile": "services/thirdparty-mock/Dockerfile",
-    "paths": ["services/thirdparty-mock/"]
+    "repository": "pkhamdee/thirdparty-mock"
   },
   {
     "service": "eshop-node-api",
-    "context": "services/eshop-node-api",
-    "dockerfile": "services/eshop-node-api/Dockerfile",
-    "paths": ["services/eshop-node-api/"]
+    "repository": "pkhamdee/eshop-node-api"
   },
   {
     "service": "eshop-sync-master",

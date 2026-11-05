@@ -39,8 +39,8 @@ build() {
   # has no sync master.
   docker build -t temporary-copy/eshop-web:local "$(gate_service_dir eshop-web)"
   docker build -t temporary-copy/eshop-api:local -f "$root/services/eshop-api/src/Eshop.Api/Dockerfile" "$root/services/eshop-api"
-  docker build -t temporary-copy/eshop-node-api:local "$root/services/eshop-node-api"
-  docker build -t temporary-copy/thirdparty-mock:local "$root/services/thirdparty-mock"
+  docker build -t temporary-copy/eshop-node-api:local "$(gate_service_dir eshop-node-api)"
+  docker build -t temporary-copy/thirdparty-mock:local "$(gate_service_dir thirdparty-mock)"
 }
 
 report_failure() {

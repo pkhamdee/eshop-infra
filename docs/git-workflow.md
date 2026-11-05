@@ -76,8 +76,7 @@ a maintainer (docs/setup.md, "Releasing"). Run it again after changing it; it up
 
 - **Pull requests only.** Nobody pushes to `main` directly, force-pushes or deletes it, admins included.
 - **Required checks**: every job `ci-release.yml` runs on a pull request, by its name, from GitHub Actions:
-  `eshop-api (lint, test)`, `thirdparty-mock (lint, type-check)`,
-  `eshop-node-api (lint, test)`, `SAST (Semgrep, fail on ERROR)`, `dependency scan (Trivy, fail on critical)` and
+  `eshop-api (lint, test)`, `SAST (Semgrep, fail on ERROR)`, `dependency scan (Trivy, fail on critical)` and
   `repo rules (manifests, workflows, scripts, e2e)`. The script reads them from the workflow (jobs with no `needs:`
   and no `if:`). The temporary copy, gates, scan and push never run on a pull request, so they can't be required;
   they guard the push instead (a failure means no image). A PR doesn't have to be up to date with `main` first.
@@ -174,7 +173,8 @@ still going. The run is named `E2E push <commit>`. What a push tests is decided 
 
 ## Service repositories
 
-eShop's services are moving into repositories of their own (ADR 0009); so far **`pkhamdee/eshop-web`**. This
+eShop's services are moving into repositories of their own (ADR 0009); so far **`pkhamdee/eshop-web`**,
+**`pkhamdee/eshop-node-api`** and **`pkhamdee/thirdparty-mock`**. This
 repository keeps everything that describes and releases the whole system, and the one issue tracker: a service
 repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/modernapp#N`. Clone them beside this one
 with `scripts/clone-all.sh` (docs/setup.md, "Service repositories").
@@ -484,7 +484,7 @@ fix ──► release/0.x ──► v0.3.1-rc.1 ──► CI ──► QA promot
           └── same fix ──► main
 ```
 
-**A service in its own repository** (eshop-web so far) isn't patched this way yet: its `release/N.x` CI builds a
+**A service in its own repository** (eshop-web, eshop-node-api, thirdparty-mock) isn't patched this way yet: its `release/N.x` CI builds a
 `release-N.x-<sha>` image, but a patch candidate still copies that service's image from the previous tag
 (`scripts/candidate-images.sh`). Until patch candidates take those images (ADR 0009), a fix to it reaches prod
 through `main` and the next minor release.
