@@ -1,9 +1,7 @@
 [
   {
     "service": "eshop-api",
-    "context": "services/eshop-api",
-    "dockerfile": "services/eshop-api/src/Eshop.Api/Dockerfile",
-    "paths": ["services/eshop-api/"]
+    "repository": "pkhamdee/eshop-api"
   },
   {
     "service": "eshop-web",
@@ -19,8 +17,6 @@
   },
   {
     "service": "eshop-sync-master",
-    "context": "services/eshop-api",
-    "dockerfile": "services/eshop-api/src/Eshop.SyncMaster/Dockerfile",
-    "paths": ["services/eshop-api/"]
+    "repository": "pkhamdee/eshop-api"
   }
 ]

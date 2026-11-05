@@ -16,8 +16,8 @@
 #                     -> also build each image for arm64, start the temporary copy with it beside the other
 #                        services' newest main images, ZAP and Locust against it, Trivy, then push
 #                        <registry>/<service>:main-<sha> and :main-<sha>-<commit-ts> (Flux deploys the newest to dev)
-#   - push to release/N.x -> the same, pushed as <registry>/<service>:release-N.x-<sha> (a patch's image; never
-#                        deployed to dev)
+#   - push to release/N.x -> the same, pushed as <registry>/<service>:release-N.x-<sha>-<commit-ts> (a patch's
+#                        image; never deployed to dev, swapped into the next patch candidate)
 # Same pipeline as ci-release.yml (ADR 0007): build -> gate -> scan -> push, and a failure anywhere before `push`
 # means no image is pushed. Every image carries the org.opencontainers.image.revision label: the calling
 # repository's commit, which releases/X.Y.Z.md records (scripts/sign-off-pr.sh).
@@ -119,13 +119,14 @@ jobs:
       - id: tags
         run: |
           sha=$(git rev-parse --short=7 HEAD)
+          ts=$(git show -s --format=%ct HEAD)
           if [ "$BRANCH" = main ]; then
-            ts=$(git show -s --format=%ct HEAD)
             # main-<sha> for humans; main-<sha>-<commit-ts> is what Flux's eshop-dev ImagePolicy orders by.
             echo "list=${IMAGE}:main-${sha},${IMAGE}:main-${sha}-${ts}" >> "$GITHUB_OUTPUT"
           else
-            # release/N.x -> release-N.x-<sha>: a patch's image, which a patch candidate copies (ADR 0009).
-            echo "list=${IMAGE}:${BRANCH//\//-}-${sha}" >> "$GITHUB_OUTPUT"
+            # release/N.x -> release-N.x-<sha>-<commit-ts>: a patch's image. A patch candidate swaps in the newest one
+            # made after the previous tag (scripts/candidate-images.sh, ADR 0009).
+            echo "list=${IMAGE}:${BRANCH//\//-}-${sha}-${ts}" >> "$GITHUB_OUTPUT"
           fi
       - uses: docker/setup-buildx-action@v4
       - name: Build

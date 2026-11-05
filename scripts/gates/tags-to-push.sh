@@ -5,7 +5,7 @@
 #
 #   scripts/gates/tags-to-push.sh "$RUNNER_TEMP"/images/image-*/tags.txt
 #
-# Each tags.txt is one image: its tags, one per line (main-<sha> and main-<sha>-<ts>, or release-N.x-<sha>). An image
+# Each tags.txt is one image: its tags, one per line (main-<sha> and main-<sha>-<ts>, or release-N.x-<sha>-<ts>). An image
 # is all or nothing: when any of its tags exists, none is pushed (so main-<sha> never names a different build from
 # main-<sha>-<ts>), and the skip is reported. Prints the tags to push, one per line, possibly none. Exit 1 when a
 # repository's tags can't be read (unknown is not absent); a repository that doesn't exist yet has no tags. Needs

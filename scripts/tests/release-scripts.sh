@@ -442,10 +442,10 @@ candidate() { (cd "$clone" && git fetch -q --tags origin && scripts/candidate-im
 copies() { # copies <service> <digest>: the candidate copies <service> from that digest
   jq -e --arg s "$1" --arg i "docker.io/pkhamdee/$1@$2" '.copy | any(.service == $s and .image == $i)' "$work/out" >/dev/null
 }
-builds_only() { [ "$(jq -r '.build | map(.service) | join(" ")' "$work/out")" = "$*" ]; }
+builds_nothing() { [ "$(jq '.build | length' "$work/out")" = 0 ]; } # every service is built in its own repository
 copies_all_from() { # copies_all_from <digest prefix>: builds nothing and copies every service from <prefix>-<service>
   local svc
-  builds_only && for svc in $cand_services; do copies "$svc" "sha256:$1-$svc" || return 1; done
+  builds_nothing && for svc in $cand_services; do copies "$svc" "sha256:$1-$svc" || return 1; done
 }
 
 for svc in $cand_services; do put_image "$svc" main-aaaaaaa-100 "sha256:dev1-$svc"; done
@@ -467,37 +467,42 @@ merge_copies_dev() { candidate v0.6.0-rc.1 && copies_all_from dev2; }
 check "candidate-images.sh: release.sh's merge of main copies the images main's dev pins name (not the branch's)" \
   merge_copies_dev
 
-# A fix on the branch head: only the changed service is built (eshop-api's folder: eshop-api and the sync master);
-# the others come from the previous candidate. A service built in its own repository (`repository` in services.json)
-# is never built here, even when a leftover folder of it changes.
+# A patch on the branch head (rc.2, after rc.1): every service is in its own repository, so nothing is built here.
+# A service's newest release-0.x-<sha>-<ts> image made after the previous tag (<ts> later than the tag) is swapped
+# in; an older one belongs to an earlier minor's patches and is ignored; the others are copied from rc.1.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.1 "sha256:rc1-$svc"; done
 git -C "$clone" checkout -q -b fix origin/release/0.x
-mkdir -p "$clone/services/eshop-api" "$clone/services/eshop-web"
-echo fix >"$clone/services/eshop-api/fix.txt" && echo fix >"$clone/services/eshop-web/fix.txt"
-git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+git -C "$clone" commit -q --allow-empty -m "patch: eshop-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.2 -m "Release candidate 0.6.0-rc.2" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.2
-fix_builds_changed() {
-  candidate v0.6.0-rc.2 && builds_only eshop-api eshop-sync-master && ! copies eshop-api "sha256:rc1-eshop-api" \
-    && copies eshop-node-api sha256:rc1-eshop-node-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
-    && copies eshop-web sha256:rc1-eshop-web && ! copies eshop-sync-master sha256:rc1-eshop-sync-master
+put_image eshop-api release-0.x-1111111-100 sha256:old-patch-api            # before rc.1: an earlier minor's
+put_image eshop-api release-0.x-2222222-9999999998 sha256:patch-api
+put_image eshop-api release-0.x-3333333-9999999999 sha256:newer-patch-api   # the newest: this one
+put_image eshop-sync-master release-0.x-3333333-9999999999 sha256:patch-sync
+put_image eshop-web release-1.x-4444444-9999999999 sha256:other-line-web    # another release line: ignored
+put_image eshop-node-api release-0.x-5555555-100 sha256:old-patch-node      # only an old one: copied from rc.1
+patch_swaps_newest() {
+  candidate v0.6.0-rc.2 && builds_nothing \
+    && copies eshop-api sha256:newer-patch-api && copies eshop-sync-master sha256:patch-sync \
+    && copies eshop-web sha256:rc1-eshop-web && copies eshop-node-api sha256:rc1-eshop-node-api \
+    && copies thirdparty-mock sha256:rc1-thirdparty-mock \
+    && jq -e '.source | contains("patched with eshop-api:release-0.x-3333333-9999999999")' "$work/out" >/dev/null
 }
-check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it (a service in its own repository too)" \
-  fix_builds_changed
+check "candidate-images.sh: a patch candidate swaps in each service's newest release-N.x image made since the previous tag, and copies the rest from it" \
+  patch_swaps_newest
 
-# A change to the build itself rebuilds every service.
+# With no patch image since, a candidate on the branch head copies every image of the previous one.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.2 "sha256:rc2-$svc"; done
-jq . "$clone/.github/services.json" >"$clone/.github/services.json.new" && echo >>"$clone/.github/services.json.new" \
-  && mv "$clone/.github/services.json.new" "$clone/.github/services.json"
-git -C "$clone" commit -qam "services.json touched" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+rm -f "$REGISTRY"/docker.io/pkhamdee/*/release-*  # the patches above are in rc.2 now
+put_image eshop-api release-0.x-3333333-200 sha256:patch-before-rc2
+git -C "$clone" commit -q --allow-empty -m "docs only" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.3 -m "Release candidate 0.6.0-rc.3" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.3
-build_change_builds_all() {
-  candidate v0.6.0-rc.3 && builds_only eshop-api eshop-sync-master \
-    && [ "$(jq -r '.copy | map(.service) | join(" ")' "$work/out")" = "eshop-web thirdparty-mock eshop-node-api" ] \
-    && copies eshop-web sha256:rc2-eshop-web && copies thirdparty-mock sha256:rc2-thirdparty-mock \
-    && copies eshop-node-api sha256:rc2-eshop-node-api
+no_patch_copies_previous() { candidate v0.6.0-rc.3 && copies_all_from rc2; }
+check "candidate-images.sh: with no patch image made since the previous tag, a branch-head candidate copies all of its images" \
+  no_patch_copies_previous
+unreadable_registry_refused() {
+  ! FAKE_CRANE_LS_ERROR=1 candidate v0.6.0-rc.3 && grep -qF "could not list the tags of docker.io/pkhamdee/eshop-api" "$work/out"
 }
-check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service built here, and copies the rest" \
-  build_change_builds_all
+check "candidate-images.sh refuses a branch-head candidate when the registry's tags can't be read" unreadable_registry_refused
 
 # What it can't resolve, it refuses: nothing untested is filled in.
 git -C "$clone" checkout -q main && git -C "$clone" pull -q --ff-only origin main
@@ -1414,7 +1419,7 @@ jobs:
     steps:
       - run: true
 YAML
-for svc_repo in eshop-node-api thirdparty-mock; do # their CI: the same shape, their own lint job
+for svc_repo in eshop-api eshop-node-api thirdparty-mock; do # their CI: the same shape, their own lint job
   mkdir -p "$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows"
   sed "s/eshop-web/$svc_repo/g" "$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows/ci.yml" \
     >"$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows/ci.yml"
@@ -1427,7 +1432,6 @@ writes() { grep -c -- ' --method ' "$GH_LOG" || true; }
 required_checks='[
   "SAST (Semgrep, fail on ERROR)",
   "dependency scan (Trivy, fail on critical)",
-  "eshop-api (lint, test)",
   "repo rules (manifests, workflows, scripts, e2e)"
 ]'
 # The tag rulesets: v* tags never deleted, moved or force-pushed by anyone; created only by admins (repository role
@@ -1613,11 +1617,11 @@ put_image svc-a main-aaaaaaa-100 sha256:a-old && put_image svc-a main-aaaaaaa sh
 put_image svc-b main-0000000-50 sha256:b-old
 tags_file svc-a docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100
 tags_file svc-b docker.io/pkhamdee/svc-b:main-bbbbbbb docker.io/pkhamdee/svc-b:main-bbbbbbb-200
-tags_file svc-c docker.io/pkhamdee/svc-c:release-0.x-ccccccc
+tags_file svc-c docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300
 pushes_only_new() {
   to_push && [ "$(cat "$work/out")" = "docker.io/pkhamdee/svc-b:main-bbbbbbb
 docker.io/pkhamdee/svc-b:main-bbbbbbb-200
-docker.io/pkhamdee/svc-c:release-0.x-ccccccc" ] \
+docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300" ] \
     && grep -qF 'skipped docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100' "$work/err"
 }
 check "tags-to-push.sh: a commit's image already pushed is skipped; new ones (and a repository not created yet) are pushed" \
@@ -1631,6 +1635,21 @@ unreadable_registry_fails() {
   ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
 }
 check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
+# --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
+
+schema_check() { (cd "$root" && ENTERPRISE_SCHEMA_SOURCE="$1" scripts/check-enterprise-schema.sh) >"$work/out" 2>&1; }
+cp "$root/deploy/thirdparty/mssql/enterprise-schema.sql" "$work/schema-same.sql"
+{ cat "$work/schema-same.sql"; echo "ALTER TABLE hp_contract ADD note nvarchar(50);"; } >"$work/schema-changed.sql"
+schema_same() { schema_check "$work/schema-same.sql" && grep -qF 'is the schema eshop-sync-master is tested against' "$work/out"; }
+check "check-enterprise-schema.sh passes when the deployed schema is eshop-api's" schema_same
+schema_differs() {
+  ! schema_check "$work/schema-changed.sql" && grep -qF -- '-ALTER TABLE hp_contract' "$work/out" \
+    && grep -qF 'copy that one here' "$work/out"
+}
+check "check-enterprise-schema.sh fails with the difference when eshop-api's schema changed" schema_differs
+schema_unreadable() { ! schema_check "$work/no-such.sql" && grep -qF "can't read eshop-api's Enterprise schema" "$work/out"; }
+check "check-enterprise-schema.sh fails when eshop-api's schema can't be read" schema_unreadable
 
 [ "$failures" -eq 0 ] || { echo "$failures failed"; exit 1; }
 echo "all passed"
