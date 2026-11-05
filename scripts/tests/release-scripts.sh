@@ -1405,6 +1405,7 @@ jobs:
     uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
     with:
       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
+    secrets: inherit
   later:
     needs: [image]
     runs-on: ubuntu-latest
