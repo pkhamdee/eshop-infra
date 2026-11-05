@@ -169,8 +169,12 @@ fresh() {
 }
 origin() { git -C "$clone/../origin.git" "$@"; }
 
-# release.sh <args> in $clone, answering the confirmation with $answer (default y). Output in $work/out.
-release() { (cd "$clone" && printf '%s\n' "${answer:-y}" | scripts/release.sh "$@") >"$work/out" 2>&1; }
+# release.sh <args> in $clone, answering the confirmation with $answer (default y; answer=none gives no input at
+# all, stdin closed). Output in $work/out.
+release() {
+  if [ "${answer:-}" = none ]; then (cd "$clone" && scripts/release.sh "$@" </dev/null) >"$work/out" 2>&1
+  else (cd "$clone" && printf '%s\n' "${answer:-y}" | scripts/release.sh "$@") >"$work/out" 2>&1; fi
+}
 
 # --- scripts/release.sh ---
 
@@ -242,6 +246,8 @@ released_version_refused() {
 }
 check "release.sh refuses a candidate for a released version" released_version_refused
 answer=n check "release.sh pushes nothing when not confirmed" refused 'aborted' 0.3.1-rc.1
+answer=none check "release.sh with no input (stdin closed) says why and pushes nothing" \
+  refused 'no answer to "Push?" (no input): run scripts/release.sh in a terminal' 0.3.1-rc.1
 
 # The first candidate of a new minor (X.Y.0-rc.1) on an existing release/N.x must carry main's work: release.sh
 # merges origin/main in first (a merge commit whose tree is main's), as v0.2.0 was made by hand (f613dcb).

@@ -152,7 +152,13 @@ else
   echo "  commit  $(git log -1 --format='%h %s' "$commit")"
 fi
 if $new_branch; then echo "  branch  $branch (new, from origin/main)"; else echo "  branch  $branch"; fi
-read -r -p "Push? [y/N] " answer
+# No input at all (stdin closed, e.g. a command runner with no terminal) must say so: under set -e a failed read
+# would otherwise end the script silently.
+if ! read -r -p "Push? [y/N] " answer; then
+  echo >&2
+  echo "no answer to \"Push?\" (no input): run scripts/release.sh in a terminal to confirm; nothing was pushed" >&2
+  exit 1
+fi
 [ "$answer" = y ] || [ "$answer" = Y ] || { echo "aborted"; exit 1; }
 
 if $merge; then
