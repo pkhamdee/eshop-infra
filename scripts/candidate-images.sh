@@ -13,6 +13,8 @@
 #   - one on a release branch's head (a patch, or rc.N > 1 after a fix): each service whose `paths`
 #     (.github/services.json) changed since the previous v* tag on the branch is built at the tag; every other is
 #     copied from that previous version's image. A change to ci-release.yml or services.json builds every service.
+#     A service built in its own repository (`repository` in services.json) is never built here: it is copied from
+#     the previous version's image.
 #
 # Prints one JSON object: source (a sentence for logs), build (services.json entries to build) and copy
 # ({service, image} with image as repository@digest). Exits 1 naming what it can't resolve: a pin or an image that
@@ -29,6 +31,7 @@ is_candidate "${tag#v}" || { echo "$tag is not a release candidate tag vX.Y.Z-rc
 cd "$(git rev-parse --show-toplevel)"
 commit=$(git rev-parse "$tag^{commit}")
 services=$(jq -c . .github/services.json)
+local_services=$(jq -c 'map(select(.repository == null))' <<<"$services") # the ones built from this repository
 
 # The main commit the candidate brings in, if any.
 source_main=""
@@ -65,12 +68,12 @@ else
   source="$previous's images, rebuilding what changed since"
   changed=$(git diff --name-only "$previous" "$commit")
   if grep -qxE '\.github/workflows/ci-release\.yml|\.github/services\.json' <<<"$changed"; then
-    build=$services
+    build=$local_services
   else
     build=$(jq -c --arg changed "$changed" '
       ($changed | split("\n")) as $files
       | [ .[] | select(.paths as $p | any($files[]; . as $f | any($p[]; . as $prefix | $f | startswith($prefix)))) ]
-    ' <<<"$services")
+    ' <<<"$local_services")
   fi
   for svc in $(jq -r --argjson build "$build" '.[] | .service as $s | select($build | map(.service) | index($s) | not) | .service' <<<"$services"); do
     image=$(digest_of "$IMAGE_REGISTRY/$svc:${previous#v}")

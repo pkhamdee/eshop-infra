@@ -30,6 +30,15 @@
 # 4. Environment "smoke-test", deployable only from main. e2e.yml's notify job uses it (recording no deployment) for
 #    SMTP_PASSWORD, to email the smoke test's results; a run from any other branch can't read it. The secret and the
 #    repository variables SMTP_USERNAME and NOTIFY_EMAIL are a human step (docs/setup.md, "Smoke test email").
+# 5. Each service repository (ADR 0009: every `repository` in .github/services.json):
+#    - its own "Protect main" ruleset, as above but with no bypass at all (no Flux commits there), requiring the
+#      jobs its .github/workflows/ci.yml runs on a pull request: those with no `needs:` and no `if:`, and for a job
+#      calling service-image.yml (`uses:`; `needs:` allowed), that workflow's pull-request jobs as
+#      "<job name> / <its job name>". The workflow is read from the repository's main on GitHub (in a dry run, from
+#      its clone beside this one, ../<name>, until it is on GitHub);
+#    - environment "publish", deployable only from main and release/* branches: service-image.yml's push job uses
+#      it for DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a human step: docs/setup.md, "Service repositories");
+#    - issues off: the one issue tracker is this repository's.
 #
 # Needs gh signed in as a repo admin, and jq. scripts/tests/release-scripts.sh tests it against a fake gh.
 set -euo pipefail
@@ -42,6 +51,7 @@ ROLE_MAINTAIN=2
 ROLE_ADMIN=5
 ENVIRONMENT=release
 SMOKE_TEST_ENVIRONMENT=smoke-test
+PUBLISH_ENVIRONMENT=publish # in each service repository
 GITHUB_ACTIONS_APP_ID=15368 # required checks must come from GitHub Actions, not from any status a token can post
 
 usage() { echo "usage: scripts/protect-main.sh [--dry-run] [--approvals N]   (N from 0 to 10; default 0)" >&2; exit 2; }
@@ -61,27 +71,49 @@ cd "$(dirname "$0")/.."
 # shellcheck source=lib/repo.sh
 . scripts/lib/repo.sh
 
-# The checks: jobs of ci-release.yml with neither `needs:` nor `if:` run on every pull request.
-checks=$(awk '
-  function flush() { if (id != "" && !gated) print (name != "" ? name : id) }
-  /^jobs:/ { in_jobs = 1; next }
-  in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); id = $1; sub(/:$/, "", id); name = ""; gated = 0; next }
-  in_jobs && /^    name:/ { name = $0; sub(/^    name:[[:space:]]*/, "", name); gsub(/^"|"$/, "", name) }
-  in_jobs && /^    (needs|if):/ { gated = 1 }
-  END { flush() }
-' .github/workflows/ci-release.yml)
-if [ -z "$checks" ] || [[ "$checks" == *"\${{"* ]]; then
-  echo "can't read the pull-request jobs of .github/workflows/ci-release.yml:" >&2; echo "$checks" >&2; exit 1
-fi
+# pr_checks <workflow file> [<what> for errors]: the checks a pull request gets from it, one per line. A job with
+# neither `needs:` nor `if:` runs on every pull request; a job calling service-image.yml (`uses:`, no `if:`) runs
+# that workflow's pull-request jobs, whose checks GitHub names "<job name> / <its job name>".
+pr_checks() {
+  local checks
+  checks=$(REUSABLE_CHECKS=${reusable_checks:-} awk '
+    function flush(   n, c, i, label) {
+      if (id == "" || cond) return
+      label = (name != "" ? name : id)
+      if (uses ~ /service-image\.yml@/) {
+        n = split(ENVIRON["REUSABLE_CHECKS"], c, "\n")
+        for (i = 1; i <= n; i++) if (c[i] != "") print label " / " c[i]
+      } else if (!needs) print label
+    }
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      flush(); id = $1; sub(/:$/, "", id); name = ""; needs = 0; cond = 0; uses = ""; next
+    }
+    in_jobs && /^    name:/ { name = $0; sub(/^    name:[[:space:]]*/, "", name); gsub(/^"|"$/, "", name) }
+    in_jobs && /^    needs:/ { needs = 1 }
+    in_jobs && /^    if:/ { cond = 1 }
+    in_jobs && /^    uses:/ { uses = $0 }
+    END { flush() }
+  ' "$1")
+  if [ -z "$checks" ] || [[ "$checks" == *"\${{"* ]]; then
+    echo "can't read the pull-request jobs of ${2:-$1}:" >&2; echo "$checks" >&2; return 1
+  fi
+  echo "$checks"
+}
+reusable_checks=$(pr_checks .github/workflows/service-image.yml)
+checks=$(pr_checks .github/workflows/ci-release.yml)
+service_repos=$(jq -r '[.[].repository // empty] | unique | .[]' .github/services.json)
 
 if [ "$approvals" -gt 0 ]; then strict_reviews=true; else strict_reviews=false; fi
-ruleset=$(jq -n --arg name "$RULESET" --argjson approvals "$approvals" --argjson strict "$strict_reviews" \
-  --argjson app "$GITHUB_ACTIONS_APP_ID" --arg checks "$checks" '{
+# main_ruleset <checks> <bypass actors, JSON>
+main_ruleset() {
+  jq -n --arg name "$RULESET" --argjson approvals "$approvals" --argjson strict "$strict_reviews" \
+  --argjson app "$GITHUB_ACTIONS_APP_ID" --arg checks "$1" --argjson bypass "$2" '{
   name: $name,
   target: "branch",
   enforcement: "active",
   conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
-  bypass_actors: [ { actor_id: null, actor_type: "DeployKey", bypass_mode: "always" } ],
+  bypass_actors: $bypass,
   rules: [
     { type: "deletion" },
     { type: "non_fast_forward" },
@@ -94,7 +126,9 @@ ruleset=$(jq -n --arg name "$RULESET" --argjson approvals "$approvals" --argjson
     { type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: false,
         required_status_checks: [ $checks | split("\n")[] | { context: ., integration_id: $app } ] } }
-  ] }')
+  ] }'
+}
+ruleset=$(main_ruleset "$checks" '[ { "actor_id": null, "actor_type": "DeployKey", "bypass_mode": "always" } ]')
 
 tag_ruleset=$(jq -n --arg name "$TAG_RULESET" '{
   name: $name,
@@ -115,6 +149,29 @@ tag_creation_ruleset=$(jq -n --arg name "$TAG_CREATION_RULESET" --argjson admin 
     { actor_id: $maintain, actor_type: "RepositoryRole", bypass_mode: "always" } ],
   rules: [ { type: "creation" } ] }')
 
+# Each service repository's required checks, read before anything is sent: a repository that isn't ready stops the
+# whole run, not half of it.
+workflows=$(mktemp -d)
+trap 'rm -rf "$workflows"' EXIT
+service_checks=""
+for service_repo in $service_repos; do
+  workflow="$workflows/${service_repo//\//_}.yml"
+  from="$service_repo's .github/workflows/ci.yml on main"
+  if ! gh api "repos/$service_repo/contents/.github/workflows/ci.yml" -H "Accept: application/vnd.github.raw" \
+    >"$workflow" 2>/dev/null; then
+    sibling="../${service_repo#*/}/.github/workflows/ci.yml"
+    if $dry_run && [ -f "$sibling" ]; then
+      cp "$sibling" "$workflow"; from="$sibling (not on GitHub yet)"
+    else
+      echo "$service_repo has no .github/workflows/ci.yml on main: create the repository and push it first" \
+        "(docs/setup.md, \"Service repositories\"); nothing was sent" >&2
+      exit 1
+    fi
+  fi
+  pr_checks "$workflow" "$from" >"$workflows/${service_repo//\//_}.checks"
+  service_checks+="$service_repo ($from):"$'\n'"$(sed 's/^/  /' "$workflows/${service_repo//\//_}.checks")"$'\n'
+done
+
 # send <METHOD> <path> [json]: prints it on --dry-run, sends it otherwise.
 send() {
   if $dry_run; then
@@ -128,41 +185,57 @@ send() {
 }
 
 # 1. and 2. The rulesets, each found by name: updated in place, or created.
-existing_rulesets=$(gh api "repos/$REPO/rulesets")
-upsert_ruleset() { # upsert_ruleset <ruleset json>
-  local id
-  id=$(jq -r --arg name "$(jq -r .name <<<"$1")" 'map(select(.name == $name)) | first | .id // empty' \
-    <<<"$existing_rulesets")
-  if [ -n "$id" ]; then send PUT "repos/$REPO/rulesets/$id" "$1"; else send POST "repos/$REPO/rulesets" "$1"; fi
+upsert_ruleset() { # upsert_ruleset <repository> <ruleset json>
+  local id existing
+  if ! existing=$(gh api "repos/$1/rulesets" 2>/dev/null); then
+    $dry_run || { echo "can't read the rulesets of $1" >&2; exit 1; }
+    existing='[]' # the repository doesn't exist yet
+  fi
+  id=$(jq -r --arg name "$(jq -r .name <<<"$2")" 'map(select(.name == $name)) | first | .id // empty' <<<"$existing")
+  if [ -n "$id" ]; then send PUT "repos/$1/rulesets/$id" "$2"; else send POST "repos/$1/rulesets" "$2"; fi
 }
-upsert_ruleset "$ruleset"
-upsert_ruleset "$tag_ruleset"
-upsert_ruleset "$tag_creation_ruleset"
+upsert_ruleset "$REPO" "$ruleset"
+upsert_ruleset "$REPO" "$tag_ruleset"
+upsert_ruleset "$REPO" "$tag_creation_ruleset"
 
 # 3. and 4. Each environment and its deployment branch and tag policies: exactly the wanted ones.
-environment() { # environment <name> <wanted policies: a JSON array of {name, type}>
+environment() { # environment <repository> <name> <wanted policies: a JSON array of {name, type}>
   local policies_path existing
-  send PUT "repos/$REPO/environments/$1" \
+  send PUT "repos/$1/environments/$2" \
     '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
-  policies_path="repos/$REPO/environments/$1/deployment-branch-policies"
+  policies_path="repos/$1/environments/$2/deployment-branch-policies"
   if ! existing=$(gh api "$policies_path" 2>/dev/null); then
     $dry_run || { echo "can't read $policies_path" >&2; exit 1; }
     existing='{"branch_policies":[]}' # the environment doesn't exist yet
   fi
-  jq -c --argjson wanted "$2" '$wanted - [.branch_policies[] | {name, type}] | .[]' <<<"$existing" |
+  jq -c --argjson wanted "$3" '$wanted - [.branch_policies[] | {name, type}] | .[]' <<<"$existing" |
     while read -r policy; do send POST "$policies_path" "$policy"; done
-  jq -r --argjson wanted "$2" '.branch_policies[] | select({name, type} as $p | $wanted | index([$p]) | not) | .id' \
+  jq -r --argjson wanted "$3" '.branch_policies[] | select({name, type} as $p | $wanted | index([$p]) | not) | .id' \
     <<<"$existing" | while read -r extra; do send DELETE "$policies_path/$extra"; done
 }
-environment "$ENVIRONMENT" '[{"name":"main","type":"branch"},{"name":"v*","type":"tag"}]'
-environment "$SMOKE_TEST_ENVIRONMENT" '[{"name":"main","type":"branch"}]'
+environment "$REPO" "$ENVIRONMENT" '[{"name":"main","type":"branch"},{"name":"v*","type":"tag"}]'
+environment "$REPO" "$SMOKE_TEST_ENVIRONMENT" '[{"name":"main","type":"branch"}]'
+
+# 5. The service repositories: main's ruleset from their own CI, environment publish, issues off.
+for service_repo in $service_repos; do
+  upsert_ruleset "$service_repo" "$(main_ruleset "$(cat "$workflows/${service_repo//\//_}.checks")" '[]')"
+  environment "$service_repo" "$PUBLISH_ENVIRONMENT" '[{"name":"main","type":"branch"},{"name":"release/*","type":"branch"}]'
+  send PATCH "repos/$service_repo" '{"has_issues":false}'
+done
 
 if $dry_run; then
   echo "Dry run: nothing sent. Required checks:"; while read -r check; do echo "  $check"; done <<<"$checks"
   echo "v* tags: never deleted, moved or force-pushed; created only by repository admins and maintainers."
+  if [ -n "$service_checks" ]; then
+    echo "Service repositories (environment $PUBLISH_ENVIRONMENT from main and release/* only; issues off), required checks:"
+    printf '%s' "$service_checks" | sed 's/^/  /'
+  fi
 else
   echo "main is protected ($approvals approvals); v* tags are immutable and only admins and maintainers create them;"
   echo "environment $ENVIRONMENT deploys from main and v* tags only, environment $SMOKE_TEST_ENVIRONMENT from main only."
+  [ -z "$service_repos" ] || echo "Protected the same way, with environment $PUBLISH_ENVIRONMENT (main and release/*) and" \
+    "issues off: $(tr '\n' ' ' <<<"$service_repos")"
   echo "Next, if not done yet: the release secrets (docs/setup.md, \"Release secrets\") and the smoke test's email"
-  echo "settings (docs/setup.md, \"Smoke test email\")."
+  echo "settings (docs/setup.md, \"Smoke test email\"), and each service repository's publish secrets (docs/setup.md,"
+  echo "\"Service repositories\")."
 fi

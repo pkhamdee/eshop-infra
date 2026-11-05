@@ -10,8 +10,10 @@
 #                                  included), or a dispatch, tests where
 #   scripts/deployment.sh          the smoke test's Deployments: create, in progress, outcome, superseded, replaced
 #   scripts/notify.sh              the smoke test's email: who gets which result, the subject and body, the rollback
-#   scripts/protect-main.sh        main's ruleset, the tag rulesets and the release and smoke-test environments
-#                                  (dry run and apply)
+#   scripts/protect-main.sh        main's ruleset, the tag rulesets and the release and smoke-test environments,
+#                                  and each service repository's ruleset, publish environment and issues (dry run
+#                                  and apply)
+#   scripts/clone-all.sh           clones the service repositories beside this one
 # `gh`, `crane` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
@@ -38,6 +40,7 @@ export GITHUB_REF=refs/heads/main GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1
 #              $FAKE_ARTIFACTS (GitHub's JSON), --jq applied
 #   api .../actions/runs/<id>/attempts/<n>: {status} from $GH_STATE/run-<id>-<n> (default completed)
 #   api .../collaborators/<login>/permission: {role_name} from $FAKE_ROLES (login=role,...; 404 for anyone else)
+#   api repos/<owner>/<repo>/contents/<path>: the file $FAKE_CONTENTS/<owner>/<repo>/contents/<path> (404 without it)
 #   (only the calls these scripts make; gh's own --jq is not emulated beyond that)
 #   release view/create/edit, pr list/create/edit/close: against $GH_STATE (a Release's notes, an open PR's body as
 #              pr-<head with / as _>; pr list without --head lists them as {headRefName, url}, --jq applied; a closed
@@ -80,6 +83,8 @@ case "$1 $2" in
       role=$(tr ',' '\n' <<<"${FAKE_ROLES:-}" | sed -n "s/^${BASH_REMATCH[1]}=//p")
       [ -n "$role" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
       jq -n --arg r "$role" '{role_name: $r}' | jq -r "$jq_filter"
+    elif [[ "$path" == repos/*/contents/* ]]; then # a file of a repository's default branch, raw
+      cat "${FAKE_CONTENTS:-/nonexistent}/${path#repos/}" 2>/dev/null || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     elif [[ " $* " == *" --method "* ]]; then # a write: its JSON body (stdin) kept as $GH_STATE/api-<METHOD>-<path>
       method=$(arg --method "$@"); path=${2//\//_}
       if [[ " $* " == *" --input - "* ]]; then cat >"$GH_STATE/api-$method-$path"; else : >"$GH_STATE/api-$method-$path"; fi
@@ -462,18 +467,21 @@ merge_copies_dev() { candidate v0.6.0-rc.1 && copies_all_from dev2; }
 check "candidate-images.sh: release.sh's merge of main copies the images main's dev pins name (not the branch's)" \
   merge_copies_dev
 
-# A fix on the branch head: only the changed service is built; the others come from the previous candidate.
+# A fix on the branch head: only the changed service is built; the others come from the previous candidate. A
+# service built in its own repository (eshop-web: `repository` in services.json) is never built here, even when a
+# leftover folder of it changes.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.1 "sha256:rc1-$svc"; done
 git -C "$clone" checkout -q -b fix origin/release/0.x
-mkdir -p "$clone/services/eshop-web" && echo fix >"$clone/services/eshop-web/fix.txt"
-git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-web" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+mkdir -p "$clone/services/eshop-node-api" "$clone/services/eshop-web"
+echo fix >"$clone/services/eshop-node-api/fix.txt" && echo fix >"$clone/services/eshop-web/fix.txt"
+git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-node-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.2 -m "Release candidate 0.6.0-rc.2" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.2
 fix_builds_changed() {
-  candidate v0.6.0-rc.2 && builds_only eshop-web && ! copies eshop-web "sha256:rc1-eshop-web" \
+  candidate v0.6.0-rc.2 && builds_only eshop-node-api && ! copies eshop-node-api "sha256:rc1-eshop-node-api" \
     && copies eshop-api sha256:rc1-eshop-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
-    && copies eshop-node-api sha256:rc1-eshop-node-api && copies eshop-sync-master sha256:rc1-eshop-sync-master
+    && copies eshop-web sha256:rc1-eshop-web && copies eshop-sync-master sha256:rc1-eshop-sync-master
 }
-check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it" \
+check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it (a service in its own repository too)" \
   fix_builds_changed
 
 # A change to the build itself rebuilds every service.
@@ -483,10 +491,10 @@ jq . "$clone/.github/services.json" >"$clone/.github/services.json.new" && echo 
 git -C "$clone" commit -qam "services.json touched" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.3 -m "Release candidate 0.6.0-rc.3" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.3
 build_change_builds_all() {
-  candidate v0.6.0-rc.3 && builds_only eshop-api eshop-web thirdparty-mock eshop-node-api eshop-sync-master \
-    && [ "$(jq '.copy | length' "$work/out")" = 0 ]
+  candidate v0.6.0-rc.3 && builds_only eshop-api thirdparty-mock eshop-node-api eshop-sync-master \
+    && [ "$(jq -c '.copy' "$work/out")" = '[{"service":"eshop-web","image":"docker.io/pkhamdee/eshop-web@sha256:rc2-eshop-web"}]' ]
 }
-check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service" \
+check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service built here, and copies the rest" \
   build_change_builds_all
 
 # What it can't resolve, it refuses: nothing untested is filled in.
@@ -1378,6 +1386,31 @@ rm -rf "$GH_STATE/deployments"
 # --- scripts/protect-main.sh (main's ruleset and the release environment; applied by a maintainer) ---
 
 repo_api=repos/pkhamdee/modernapp
+web_api=repos/pkhamdee/eshop-web
+# eshop-web's CI on its main, as GitHub serves it: a lint job, and the shared gates (service-image.yml) after it.
+export FAKE_CONTENTS="$work/contents"
+mkdir -p "$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows"
+cat >"$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows/ci.yml" <<'YAML'
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    name: eshop-web (lint, build)
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run lint
+  image:
+    name: image
+    needs: [lint]
+    uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+    with:
+      images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
+  later:
+    needs: [image]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+YAML
 protect() { (cd "$root" && scripts/protect-main.sh "$@") >"$work/out" 2>&1; }
 # sent <METHOD path>: the JSON bodies printed under that request in a --dry-run's output, as a JSON array
 sent() { awk -v h="$1" '$0 == h { on = 1; next } /^[^ {}[\]]/ { on = 0 } on' "$work/out" | jq -s .; }
@@ -1388,7 +1421,6 @@ required_checks='[
   "dependency scan (Trivy, fail on critical)",
   "eshop-api (lint, test)",
   "eshop-node-api (lint, test)",
-  "eshop-web (lint, build)",
   "repo rules (manifests, workflows, scripts, e2e)",
   "thirdparty-mock (lint, type-check)"
 ]'
@@ -1492,6 +1524,60 @@ smoke_test_environment_applied() {
 }
 check "protect-main.sh leaves the smoke-test environment exactly main (keeps main, removes any other policy)" \
   smoke_test_environment_applied
+
+# --- scripts/protect-main.sh: the service repositories (ADR 0009) ---
+
+service_repo_dry_run() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  FAKE_NO_ENVIRONMENT=1 protect --dry-run || return 1
+  [ "$(writes)" = 0 ] \
+    && sent "POST $web_api/rulesets" | jq -e 'length == 1 and (.[0] | .name == "Protect main" and .bypass_actors == []
+         and .conditions.ref_name.include == ["refs/heads/main"]
+         and (.rules[] | select(.type == "required_status_checks") | [.parameters.required_status_checks[].context] | sort)
+             == ["eshop-web (lint, build)", "image / SAST (Semgrep, fail on ERROR)",
+                 "image / dependency scan (Trivy, fail on critical)"])' >/dev/null \
+    && sent "POST $web_api/environments/publish/deployment-branch-policies" \
+      | jq -e 'sort_by(.name) == [{"name": "main", "type": "branch"}, {"name": "release/*", "type": "branch"}]' >/dev/null \
+    && sent "PATCH $web_api" | jq -e '. == [{"has_issues": false}]' >/dev/null \
+    && grep -qF 'image / SAST (Semgrep, fail on ERROR)' "$work/out"
+}
+check "protect-main.sh --dry-run prints each service repository's main ruleset (its CI's PR jobs and the shared gates' as required checks, no bypass), its publish environment (main and release/* only) and issues off" \
+  service_repo_dry_run
+service_repo_applied() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  FAKE_BRANCH_POLICIES='{"total_count":2,"branch_policies":[{"id":1,"name":"main","type":"branch"},{"id":9,"name":"v*","type":"tag"}]}' \
+    protect || return 1
+  local s="$GH_STATE/api-" p=${web_api//\//_}
+  [ -e "${s}POST-${p}_rulesets" ] && [ -e "${s}PUT-${p}_environments_publish" ] \
+    && jq -e '. == {"name": "release/*", "type": "branch"}' "${s}POST-${p}_environments_publish_deployment-branch-policies" >/dev/null \
+    && [ -e "${s}DELETE-${p}_environments_publish_deployment-branch-policies_9" ] \
+    && jq -e '. == {"has_issues": false}' "${s}PATCH-$p" >/dev/null
+}
+check "protect-main.sh applies each service repository's ruleset, leaves its publish environment exactly main and release/*, and turns its issues off" \
+  service_repo_applied
+service_repo_missing_refused() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  ! FAKE_CONTENTS="$work/no-contents" protect \
+    && grep -qF 'pkhamdee/eshop-web has no .github/workflows/ci.yml on main' "$work/out" && [ "$(writes)" = 0 ]
+}
+check "protect-main.sh sends nothing at all while a service repository has no CI on GitHub yet" service_repo_missing_refused
+
+# --- scripts/clone-all.sh (the service repositories beside this one) ---
+
+clone_all() { (cd "$1" && CLONE_BASE_URL="$work/hosted" scripts/clone-all.sh) >"$work/out" 2>&1; }
+clones_service_repos() {
+  local parent="$work/side-by-side"
+  mkdir -p "$parent/infra/.github" && cp -R "$root/scripts" "$parent/infra/" && cp "$root/.github/services.json" "$parent/infra/.github/"
+  clone_all "$parent/infra" && grep -qF "eshop-web: skipped, $work/hosted/pkhamdee/eshop-web doesn't exist yet" "$work/out" \
+    && [ ! -e "$parent/eshop-web" ] || return 1
+  git init -q --bare -b main "$work/hosted/pkhamdee/eshop-web"
+  git clone -q "$work/hosted/pkhamdee/eshop-web" "$work/web-seed" 2>/dev/null
+  git -C "$work/web-seed" commit -q --allow-empty -m "eshop-web" && git -C "$work/web-seed" push -q origin HEAD:main
+  clone_all "$parent/infra" && [ "$(git -C "$parent/eshop-web" log -1 --format=%s)" = eshop-web ] \
+    && clone_all "$parent/infra" && grep -qF "eshop-web: already cloned at $parent/eshop-web" "$work/out"
+}
+check "clone-all.sh skips a service repository not created yet, clones it beside this one once it exists, and leaves the clone alone after" \
+  clones_service_repos
 
 [ "$failures" -eq 0 ] || { echo "$failures failed"; exit 1; }
 echo "all passed"

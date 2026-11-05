@@ -76,13 +76,15 @@ a maintainer (docs/setup.md, "Releasing"). Run it again after changing it; it up
 
 - **Pull requests only.** Nobody pushes to `main` directly, force-pushes or deletes it, admins included.
 - **Required checks**: every job `ci-release.yml` runs on a pull request, by its name, from GitHub Actions:
-  `eshop-api (lint, test)`, `eshop-web (lint, build)`, `thirdparty-mock (lint, type-check)`,
+  `eshop-api (lint, test)`, `thirdparty-mock (lint, type-check)`,
   `eshop-node-api (lint, test)`, `SAST (Semgrep, fail on ERROR)`, `dependency scan (Trivy, fail on critical)` and
   `repo rules (manifests, workflows, scripts, e2e)`. The script reads them from the workflow (jobs with no `needs:`
   and no `if:`). The temporary copy, gates, scan and push never run on a pull request, so they can't be required;
   they guard the push instead (a failure means no image). A PR doesn't have to be up to date with `main` first.
   **Renaming or adding a PR job changes the checks: run `scripts/protect-main.sh` again** after it merges, or PRs
   wait for a check that never comes (or skip the new one).
+- **Service repositories** get the same ruleset with no bypass, requiring the PR jobs of their own CI
+  ([Service repositories](#service-repositories)); the same script sets them.
 - **Who merges**: anyone with write access, which is only maintainers. With 0 required approvals, merging is the
   approval: GitHub doesn't let an author approve their own PR, and with one maintainer that is the only possible
   rule.
@@ -170,6 +172,37 @@ inactive, "superseded" (not failed). A code change is tested twice: at the merge
 images, and at Flux's image-update commit once CI has pushed the new ones, which supersedes the first run if it is
 still going. The run is named `E2E push <commit>`. What a push tests is decided by `scripts/smoke-targets.sh`.
 
+## Service repositories
+
+eShop's services are moving into repositories of their own (ADR 0009); so far **`pkhamdee/eshop-web`**. This
+repository keeps everything that describes and releases the whole system, and the one issue tracker: a service
+repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/modernapp#N`. Clone them beside this one
+with `scripts/clone-all.sh` (docs/setup.md, "Service repositories").
+
+A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tests, then calls this repository's
+**shared gates**, `.github/workflows/service-image.yml`:
+
+- on a pull request: SAST and the dependency scan of that repository. Its required checks are its lint job and
+  `image / SAST (Semgrep, fail on ERROR)`, `image / dependency scan (Trivy, fail on critical)` (`scripts/protect-main.sh`);
+- on a push to its `main`: the same pipeline as here: `build` → `gate` (the temporary copy, the new image beside the
+  other services' newest `main-<sha>-<ts>` images, then Locust and ZAP) → `scan` → `push` as
+  `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<ts>`, where `<sha>` is the service repository's commit
+  (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed;
+- on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>` (a patch's image, never deployed to dev).
+
+The push uses the repository's environment **`publish`** (`main` and `release/*` only), which holds
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`. From there it is the same road as every other image: Flux's image
+automation deploys the newest `main-<sha>-<ts>` to `eshop-dev` and commits the pin here, which starts
+[dev's smoke test](#devs-smoke-test) on that commit. So a service PR gets lint, tests and the gates, but no smoke test
+until it reaches dev. A release candidate copies every service's dev-tested digest, wherever it was built
+([1. Cut a release candidate](#1-cut-a-release-candidate)); `.github/services.json` names each service's
+`repository`, and this repository's CI never builds those.
+
+**Changes across services ship expand-then-contract.** Every merge to a service's `main` runs in the temporary copy
+beside the other services' `main`, and dev runs whatever was merged last: never write two PRs that only work
+together. First make the provider accept both the old and the new shape (expand), then move the consumers, then drop
+the old shape (contract), each step a merge that works on its own.
+
 ## Releasing
 
 A release goes **release candidate → QA promotion → QA test run → sign-off → prod promotion**, each a separate,
@@ -229,7 +262,8 @@ already passed rather than rebuilding it (`scripts/candidate-images.sh`,
 - **Any other candidate** (the branch head): the services whose files changed since the previous `v*` tag on the
   branch are built at the tag, through the same temporary copy, gates and scan as for `main` (unchanged services run
   in the copy as the images they will be); every other service is copied from that previous version's image. A change
-  to `ci-release.yml` or `services.json` builds every service.
+  to `ci-release.yml` or `services.json` builds every service. A service in its own repository
+  ([Service repositories](#service-repositories)) is never built here: it is always copied.
 
 A pin or an image it can't resolve fails the run: nothing untested is filled in. Every copy is checked against its
 source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
@@ -448,6 +482,11 @@ scripts/release.sh 0.3.1-rc.1                      # tags the head of release/0.
 fix ──► release/0.x ──► v0.3.1-rc.1 ──► CI ──► QA promotion ──► QA test ──► sign-off PR: v0.3.1 ──► prod promotion
           └── same fix ──► main
 ```
+
+**A service in its own repository** (eshop-web so far) isn't patched this way yet: its `release/N.x` CI builds a
+`release-N.x-<sha>` image, but a patch candidate still copies that service's image from the previous tag
+(`scripts/candidate-images.sh`). Until patch candidates take those images (ADR 0009), a fix to it reaches prod
+through `main` and the next minor release.
 
 A **new major** (`1.0.0-rc.1`) forks `release/1.x` from `main`; older `release/N.x` branches stay for patches while
 supported.
