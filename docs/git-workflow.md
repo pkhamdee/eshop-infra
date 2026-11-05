@@ -191,7 +191,8 @@ A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tes
 - on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>` (a patch's image, never deployed to dev).
 
 The push uses the repository's environment **`publish`** (`main` and `release/*` only), which holds
-`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`. From there it is the same road as every other image: Flux's image
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`; the calling job must pass `secrets: inherit`, or the called workflow
+sees them empty (its Semgrep finding is accepted in the service repository's `sast-accepted.txt`). From there it is the same road as every other image: Flux's image
 automation deploys the newest `main-<sha>-<ts>` to `eshop-dev` and commits the pin here, which starts
 [dev's smoke test](#devs-smoke-test) on that commit. So a service PR gets lint, tests and the gates, but no smoke test
 until it reaches dev. A release candidate copies every service's dev-tested digest, wherever it was built

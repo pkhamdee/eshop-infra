@@ -7,6 +7,8 @@
 #     uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
 #     with:
 #       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
+#     secrets: inherit   # the only way this workflow sees the caller's `publish` environment secrets; accept
+#                        # Semgrep's secrets-inherit finding in the caller's sast-accepted.txt, with the reason
 #
 #   - pull request    -> SAST and dependency scan of the calling repository (its PR checks: "image / SAST …",
 #                        "image / dependency scan …"; scripts/protect-main.sh requires them)
