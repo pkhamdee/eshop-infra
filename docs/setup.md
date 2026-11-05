@@ -605,6 +605,40 @@ repository secret of the same name, so the order above never leaves CI without a
 that reaches one of these jobs fails with "Branch ... is not allowed to deploy to release"; so a release dry run
 pushes only from `main` (from another branch `plan` skips the push, with a notice).
 
+### Service repositories
+
+eShop's services are moving into their own repositories (ADR 0009, #101), cloned beside this one:
+`scripts/clone-all.sh` clones every one that exists into this repository's parent folder (here
+`/Users/pongsak/repos/modernapp/`), so their agent docs find `../modernapp` and the temporary copy builds them from
+`../<service>`. So far: **`pkhamdee/eshop-web`**. `.github/services.json` names each one's `repository`; this
+repository's CI never builds it. Each service repository's CI lints and tests, then calls this repository's shared gates,
+`.github/workflows/service-image.yml` (git-workflow.md, "Service repositories").
+
+**Human**, once per service repository, in this order (shown for eshop-web; the agent prepares `../eshop-web` with
+its history and CI, and the PR that removes it here):
+
+```sh
+# 1. Create the repository, empty and public (issues are turned off in step 2), and push the prepared clone:
+gh repo create pkhamdee/eshop-web --public --description "eShop's web app (see pkhamdee/modernapp)"
+git -C ../eshop-web remote add origin https://github.com/pkhamdee/eshop-web.git
+git -C ../eshop-web push -u origin main
+#    Its first CI run fails until this repository's main has service-image.yml (step 4).
+# 2. Protection, from the branch of the PR that moves the service (its ci-release.yml no longer has the service's
+#    job, so the PR's required checks must drop it before the PR can merge):
+scripts/protect-main.sh --dry-run    # this repository's settings, and eshop-web's ruleset, `publish` and issues
+scripts/protect-main.sh
+# 3. eshop-web's publish secrets (gh prompts for each value; the token: a Docker Hub access token, Read & Write):
+gh secret set DOCKERHUB_USERNAME --env publish --repo pkhamdee/eshop-web
+gh secret set DOCKERHUB_TOKEN --env publish --repo pkhamdee/eshop-web
+# 4. Merge the PR here, then run eshop-web's CI on main: its image goes through the gates to Docker Hub, Flux
+#    deploys it to dev, and dev's smoke test runs on the Flux commit.
+gh workflow run ci.yml --repo pkhamdee/eshop-web --ref main
+```
+
+Check: pkhamdee/eshop-web → Settings → Rules → Rulesets → **Protect main** (no bypass; required checks
+`eshop-web (lint, build)`, `image / SAST (Semgrep, fail on ERROR)`, `image / dependency scan (Trivy, fail on
+critical)`), Environments → **publish** (`main` and `release/*` only), and no Issues tab.
+
 ## Temporary copy (release gate)
 
 Before CI pushes any image (`main` pushes, release-candidate tags, dry runs; never pull requests), it starts a **temporary
@@ -621,7 +655,8 @@ part's status and last log lines, writes them to `reports/temporary-copy/`, remo
 
 ```sh
 export DOCKER_HOST=unix://$HOME/.rd/docker.sock
-scripts/gates/temporary-copy.sh build    # the four images from this checkout, as temporary-copy/<service>:local
+scripts/gates/temporary-copy.sh build    # the four images, as temporary-copy/<service>:local: from this checkout,
+                                         # and a service in its own repository from its clone, ../<service>
 scripts/gates/temporary-copy.sh up       # ~10 s; then http://localhost:8090 (Staff: staff / temporary-copy-staff)
 scripts/gates/temporary-copy.sh down     # stop it and throw its data away
 
@@ -656,14 +691,15 @@ Enterprise sync steps can't pass there.
 | `deploy/apps/qa/` | `eshop-qa` overlay (a copy of prod's), applied as it is in the pinned release-candidate tag, served at `qa.eshop.localhost` | `apps-qa` (after configs; source `eshop-qa`) |
 | `deploy/thirdparty/` | Shared mocks in the `thirdparty` namespace, one folder per component (`thirdparty-mock/`, `samba/`: image share with one share per environment, `mssql/`: mock Enterprise System, ...); thirdparty-mock follows `main` via its own image automation | `thirdparty` (after configs) |
 | `services/eshop-api/` | .NET solution: `src/Eshop.Domain`, `src/Eshop.Data` (EF Core, migrations), `src/Eshop.Api`, `src/Eshop.SyncMaster` (eshop-sync-master), `tests/Eshop.Api.Tests` (Seam 1), `tests/Eshop.SyncMaster.Tests` (Seam 2) | – |
-| `services/eshop-web/` | React + Vite + TypeScript, served by Caddy | – |
 | `services/thirdparty-mock/` | Node 24 + Express (TypeScript run directly): mock SMS (+ inbox page), ID Verification and Credit Check; adjustable delay; mock Enterprise System admin tool | – |
 | `services/eshop-node-api/` | Image service: Node 24 + Express + TypeScript (run directly by Node), SMB share via `smbclient` | – |
 | `e2e/` | Seam 4: Playwright smoke test of the whole demo against a deployed environment (`npm run e2e`) | – |
-| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments (admin-run; [Protecting main](#protecting-main)); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
+| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments, and each service repository's ruleset, `publish` environment and issues (admin-run; [Protecting main](#protecting-main)); `clone-all.sh` clones the service repositories beside this one ([Service repositories](#service-repositories)); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
 | `releases/` | One record per release, `X.Y.Z.md`: the signed-off candidate, its image digests, QA's passing run and Deployment. Added by the sign-off PR (`scripts/sign-off-pr.sh`); merging it signs off (git-workflow.md, "Sign-off") | – |
 | `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `image-scan.sh` (Trivy on built images), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
-| `.github/services.json` | Container images CI builds (context, Dockerfile, source paths): changed ones on `main`, all of them on a release-candidate tag | – |
+| `.github/services.json` | Every eShop image a release takes. CI builds the ones from this repository (context, Dockerfile, source paths): changed ones on `main`; one with a `repository` is built in that repository ([Service repositories](#service-repositories)) | – |
+| `.github/workflows/service-image.yml` | The shared gates the service repositories' CI calls: build, SAST, dependency scan, temporary copy, Trivy, push (git-workflow.md, "Service repositories") | – |
+| `../eshop-web/` (`pkhamdee/eshop-web`) | React + Vite + TypeScript, served by Caddy; its own repository ([Service repositories](#service-repositories)) | – |
 
 Every Kustomization decrypts SOPS (`*.sops.yaml`) with `flux-system/sops-age` where needed and prunes only what it applied, so other workloads in the cluster are untouched.
 
@@ -687,8 +723,8 @@ docker run -d --name enterprise-sql --platform linux/amd64 -p 1433:1433 -e ACCEP
 #   then create enterprise_dev and run ../../deploy/thirdparty/mssql/enterprise-schema.sql in it (sqlcmd -d enterprise_dev -i ...)
 dotnet run --project src/Eshop.SyncMaster                           # pushes every 30 s; probes on http://localhost:5090/healthz/ready
 
-# eshop-web (Node 24)
-cd services/eshop-web
+# eshop-web (Node 24), in its own repository: scripts/clone-all.sh puts it at ../eshop-web
+cd ../eshop-web
 npm ci && npm run dev                                               # proxies /api to localhost:5080
 npm run lint && npm run build                                       # as CI runs it
 

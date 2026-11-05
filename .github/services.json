@@ -7,9 +7,7 @@
   },
   {
     "service": "eshop-web",
-    "context": "services/eshop-web",
-    "dockerfile": "services/eshop-web/Dockerfile",
-    "paths": ["services/eshop-web/"]
+    "repository": "pkhamdee/eshop-web"
   },
   {
     "service": "thirdparty-mock",
