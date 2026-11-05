@@ -243,7 +243,7 @@ jobs:
           if-no-files-found: ignore
 
   # Only when every build, the temporary copy and its gates, and every scan passed (needs: a skipped or failed job
-  # skips this one). Environment `publish` deploys only from main and release/*, so its Docker Hub token is out of
+  # skips this one). A tag that already exists is never pushed again (scripts/gates/tags-to-push.sh). Environment `publish` deploys only from main and release/*, so its Docker Hub token is out of
   # reach of a run from any other branch.
   push:
     name: push images
@@ -269,8 +269,15 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.1
+      # Never overwrite a tag (#116): a second run of a commit pushes nothing, and the image already there (the one
+      # Flux deployed and dev tested) stays.
       - name: Push
         run: |
-          for tags in "$RUNNER_TEMP"/images/image-*/tags.txt; do
-            while read -r tag; do docker push "$tag"; done < "$tags"
-          done
+          scripts/gates/tags-to-push.sh "$RUNNER_TEMP"/images/image-*/tags.txt > "$RUNNER_TEMP/to-push.txt"
+          if [ ! -s "$RUNNER_TEMP/to-push.txt" ]; then
+            echo "::notice::Every image of this commit is already pushed: nothing to push"
+          fi
+          while read -r tag; do docker push "$tag"; done < "$RUNNER_TEMP/to-push.txt"
