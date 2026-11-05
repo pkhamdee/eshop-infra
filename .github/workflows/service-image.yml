@@ -1,0 +1,284 @@
+# The shared gates for a service in its own repository (ADR 0009; docs/git-workflow.md, "Service repositories").
+# Each service repository's CI calls it after its own lint and test:
+#
+#   image:
+#     name: image
+#     needs: [lint]
+#     uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+#     with:
+#       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
+#     secrets: inherit   # the only way this workflow sees the caller's `publish` environment secrets; accept
+#                        # Semgrep's secrets-inherit finding in the caller's sast-accepted.txt, with the reason
+#
+#   - pull request    -> SAST and dependency scan of the calling repository (its PR checks: "image / SAST …",
+#                        "image / dependency scan …"; scripts/protect-main.sh requires them)
+#   - push to main (or workflow_dispatch on main: a rebuild)
+#                     -> also build each image for arm64, start the temporary copy with it beside the other
+#                        services' newest main images, ZAP and Locust against it, Trivy, then push
+#                        <registry>/<service>:main-<sha> and :main-<sha>-<commit-ts> (Flux deploys the newest to dev)
+#   - push to release/N.x -> the same, pushed as <registry>/<service>:release-N.x-<sha>-<commit-ts> (a patch's
+#                        image; never deployed to dev, swapped into the next patch candidate)
+# Same pipeline as ci-release.yml (ADR 0007): build -> gate -> scan -> push, and a failure anywhere before `push`
+# means no image is pushed. Every image carries the org.opencontainers.image.revision label: the calling
+# repository's commit, which releases/X.Y.Z.md records (scripts/sign-off-pr.sh).
+#
+# The gate scripts come from this repository (inputs infra-repository and infra-ref). The push job uses the calling
+# repository's environment `publish` (deployable from main and release/* only, scripts/protect-main.sh), whose
+# secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are a human step (docs/setup.md, "Service repositories").
+name: Service image
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: 'The images to build: a JSON array of {"service", "context", "dockerfile"}, paths relative to the calling repository''s root'
+        required: true
+        type: string
+      registry:
+        description: "Registry and namespace of the eShop images"
+        required: false
+        type: string
+        default: docker.io/pkhamdee
+      infra-repository:
+        description: "The repository holding the gate scripts (this one)"
+        required: false
+        type: string
+        default: pkhamdee/modernapp
+      infra-ref:
+        description: "Its ref"
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  # The calling repository's code, scanned with this repository's pinned Semgrep rules and .semgrepignore.
+  sast:
+    name: SAST (Semgrep, fail on ERROR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
+          path: infra
+      - name: SAST
+        run: |
+          [ -e src/.semgrepignore ] || cp infra/.semgrepignore src/.semgrepignore
+          GATES_SOURCE="$PWD/src" REPORT_DIR="$PWD/reports/sast" infra/scripts/gates/sast.sh
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: sast-report
+          path: reports/sast/
+          if-no-files-found: ignore
+
+  deps:
+    name: dependency scan (Trivy, fail on critical)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
+          path: infra
+      - name: Dependency scan
+        run: GATES_SOURCE="$PWD/src" REPORT_DIR="$PWD/reports/deps" infra/scripts/gates/deps.sh
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: deps-report
+          path: reports/deps/
+          if-no-files-found: ignore
+
+  # Builds each image natively for arm64 (the Apple Silicon cluster) and hands it on as an artifact; pushes nothing.
+  build:
+    name: build ${{ matrix.service }}
+    needs: [sast, deps]
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.images) }}
+    env:
+      IMAGE: ${{ inputs.registry }}/${{ matrix.service }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: tags
+        run: |
+          sha=$(git rev-parse --short=7 HEAD)
+          ts=$(git show -s --format=%ct HEAD)
+          if [ "$BRANCH" = main ]; then
+            # main-<sha> for humans; main-<sha>-<commit-ts> is what Flux's eshop-dev ImagePolicy orders by.
+            echo "list=${IMAGE}:main-${sha},${IMAGE}:main-${sha}-${ts}" >> "$GITHUB_OUTPUT"
+          else
+            # release/N.x -> release-N.x-<sha>-<commit-ts>: a patch's image. A patch candidate swaps in the newest one
+            # made after the previous tag (scripts/candidate-images.sh, ADR 0009).
+            echo "list=${IMAGE}:${BRANCH//\//-}-${sha}-${ts}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/arm64
+          outputs: type=docker,dest=${{ runner.temp }}/image/image.tar
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+      - name: Record the image's tags
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: tr , '\n' <<<"$TAGS" > "$RUNNER_TEMP/image/tags.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.service }}
+          path: ${{ runner.temp }}/image/
+          retention-days: 1
+          if-no-files-found: error
+
+  # The temporary copy: the images just built beside the other services' newest main builds, as eshop-dev runs
+  # them. So every merge must work with the other services' main (expand-then-contract, ADR 0009).
+  gate:
+    name: temporary copy and gates
+    needs: [build]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+      - name: Load the images just built
+        # A single artifact downloads flat: scripts/gates/artifact-dirs.sh gives it its image-<service> folder.
+        run: |
+          scripts/gates/artifact-dirs.sh "$RUNNER_TEMP/images"
+          for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
+      - name: Choose the copy's images
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          for service in eshop-web eshop-api eshop-node-api thirdparty-mock; do
+            tags="$RUNNER_TEMP/images/image-$service/tags.txt"
+            if [ -f "$tags" ]; then image=$(head -n 1 "$tags"); else image=$(scripts/gates/latest-main-image.sh "$REGISTRY/$service"); fi
+            variable=$(tr 'a-z-' 'A-Z_' <<<"$service")_IMAGE
+            echo "$variable=$image" >> "$GITHUB_ENV"
+            echo "$service: $image"
+          done
+      - name: Start the temporary copy (healthy, seeded)
+        run: scripts/gates/temporary-copy.sh up
+      - name: Performance gate (Locust)
+        run: scripts/gates/perf.sh
+      - name: Keep the performance report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-report
+          path: reports/perf/
+          if-no-files-found: ignore
+      - name: ZAP baseline and API scans, signed out and signed in (fail on High)
+        run: scripts/gates/dast.sh
+      - name: Keep the ZAP reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dast-report
+          path: reports/dast/
+          if-no-files-found: ignore
+      - name: Stop the temporary copy
+        if: always()
+        run: scripts/gates/temporary-copy.sh down
+      - name: Keep the copy's status and logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: temporary-copy-report
+          path: reports/temporary-copy/
+          if-no-files-found: ignore
+
+  scan:
+    name: scan ${{ matrix.service }}
+    needs: [gate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.images) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.service }}
+          path: ${{ runner.temp }}/image-${{ matrix.service }}
+      - name: Scan (fail on critical)
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: scripts/gates/image-scan.sh "$RUNNER_TEMP/image-$SERVICE/image.tar"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: image-scan-report-${{ matrix.service }}
+          path: reports/image-scan/
+          if-no-files-found: ignore
+
+  # Only when every build, the temporary copy and its gates, and every scan passed (needs: a skipped or failed job
+  # skips this one). A tag that already exists is never pushed again (scripts/gates/tags-to-push.sh). Environment `publish` deploys only from main and release/*, so its Docker Hub token is out of
+  # reach of a run from any other branch.
+  push:
+    name: push images
+    needs: [scan]
+    runs-on: ubuntu-24.04-arm
+    environment: publish
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-*
+          path: ${{ runner.temp }}/images
+      - name: Load the images
+        # A single artifact downloads flat: scripts/gates/artifact-dirs.sh gives it its image-<service> folder.
+        run: |
+          scripts/gates/artifact-dirs.sh "$RUNNER_TEMP/images"
+          for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
+      - uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.1
+      # Never overwrite a tag (#116): a second run of a commit pushes nothing, and the image already there (the one
+      # Flux deployed and dev tested) stays.
+      - name: Push
+        run: |
+          scripts/gates/tags-to-push.sh "$RUNNER_TEMP"/images/image-*/tags.txt > "$RUNNER_TEMP/to-push.txt"
+          if [ ! -s "$RUNNER_TEMP/to-push.txt" ]; then
+            echo "::notice::Every image of this commit is already pushed: nothing to push"
+          fi
+          while read -r tag; do docker push "$tag"; done < "$RUNNER_TEMP/to-push.txt"

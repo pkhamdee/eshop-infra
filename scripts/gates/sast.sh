@@ -2,8 +2,10 @@
 # SAST gate: Semgrep CE over the repo's own code, with a pinned engine and a pinned ruleset.
 #
 #   scripts/gates/sast.sh          # needs docker and git; CI runs it in the `sast` job (ci-release.yml)
+#   GATES_SOURCE=../eshop-web scripts/gates/sast.sh   # a service repository's code (service-image.yml)
 #
-# Fails (exit 1) on any ERROR-severity finding that is not accepted in scripts/gates/sast-accepted.txt.
+# Fails (exit 1) on any ERROR-severity finding that is not accepted in scripts/gates/sast-accepted.txt (with
+# GATES_SOURCE: that repository's own sast-accepted.txt at its root, if it has one; paths relative to its root).
 # WARNING and INFO findings are reported but never fail. Inline `nosemgrep` comments are ignored on purpose:
 # the accepted file, where every entry needs a reason, is the only way to accept a finding.
 #
@@ -16,14 +18,21 @@ RULES_REPO=https://github.com/semgrep/semgrep-rules.git
 RULES_COMMIT=9bbf021d0acffa3095fcffd17b2bc7787eb4796d # 2026-10-08
 # Rule folders of semgrep-rules that match what this repo contains.
 RULE_SETS=(csharp typescript javascript dockerfile bash yaml/github-actions html)
-# The repo's own code and configuration; .agents/.claude hold third-party agent skills.
-TARGETS=(services e2e scripts .github deploy clusters)
+# The repo's own code and configuration; .agents/.claude hold third-party agent skills. A service repository
+# (GATES_SOURCE) is scanned whole, but for those, through its .semgrepignore (service-image.yml copies this one's).
+TARGETS=(e2e scripts .github deploy clusters)
 
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
 report_dir=$(gate_report_dir sast)
 cache=$(gate_cache "") # the cache itself: the rules are one folder per commit in it
-repo=$GATES_ROOT
+repo=$GATES_SOURCE
+accepted=/gates/scripts/gates/sast-accepted.txt
+if [ "$repo" != "$GATES_ROOT" ]; then
+  TARGETS=(.)
+  accepted=/dev/null
+  [ ! -f "$repo/sast-accepted.txt" ] || accepted=/src/sast-accepted.txt
+fi
 cd "$repo"
 rules="$cache/semgrep-rules-$RULES_COMMIT"
 
@@ -49,6 +58,6 @@ docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e SEMGREP_SEND_METRICS=
   "${TARGETS[@]}" >/dev/null
 
 docker run --rm --user "$(id -u):$(id -g)" \
-  -v "$repo:/src:ro" -v "$report_dir:/reports" -w /src \
-  --entrypoint python3 "$SEMGREP_IMAGE" -I scripts/gates/sast-verdict.py \
-  /reports/semgrep.json scripts/gates/sast-accepted.txt /reports/summary.txt
+  -v "$repo:/src:ro" -v "$GATES_ROOT:/gates:ro" -v "$report_dir:/reports" -w /src \
+  --entrypoint python3 "$SEMGREP_IMAGE" -I /gates/scripts/gates/sast-verdict.py \
+  /reports/semgrep.json "$accepted" /reports/summary.txt

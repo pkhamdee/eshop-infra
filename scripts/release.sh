@@ -159,7 +159,7 @@ if $new_branch || $merge; then
   echo "  images  copied by digest from dev's pins at main $(git rev-parse --short "$main_commit") (what its smoke test passed)"
 else
   previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$commit" 2>/dev/null || echo "none")
-  echo "  images  copied by digest from $previous's; services changed since are built at the tag"
+  echo "  images  copied by digest from $previous's, swapping in each service's newest release/N.x patch image made since"
 fi
 # No input at all (stdin closed, e.g. a command runner with no terminal) must say so: under set -e a failed read
 # would otherwise end the script silently.

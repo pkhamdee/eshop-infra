@@ -14,7 +14,7 @@ Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/ag
 
 ### Conventions
 
-Before any step touching secrets or `*.sops.yaml`, release tags, repo settings or a PR merge, read "Human-only steps" in `docs/agents/conventions.md`: many of these are the user's to run, from the exact command you give them. The same file holds the local gotchas: Rancher Docker socket, test harness, adding an endpoint/service, deploy layout.
+Before any step touching secrets or `*.sops.yaml`, release tags, repo settings or a PR merge, read "Human-only steps" in `docs/agents/conventions.md`: many of these are the user's to run, from the exact command you give them. The same file holds the local gotchas (Rancher Docker socket, deploy layout) and where each service's repository and conventions are.
 
 ## Git workflow
 

@@ -4,6 +4,7 @@
 # packages.lock.json (eshop-api / eshop-sync-master; kept by RestorePackagesWithLockFile).
 #
 #   scripts/gates/deps.sh          # needs docker; CI runs it in the `deps` job (ci-release.yml)
+#   GATES_SOURCE=../eshop-web scripts/gates/deps.sh   # a service repository's lockfiles (service-image.yml)
 #
 # Fails (exit 1) on any CRITICAL vulnerability, fixed or not, as the image scan does. Other severities are
 # reported but never fail. Reports go to $REPORT_DIR (default: reports/deps): trivy.json (every severity),
@@ -18,7 +19,7 @@ SKIP_DIRS=(.git .agents .claude "**/node_modules" "**/bin" "**/obj")
 . "$(dirname "$0")/lib.sh"
 report_dir=$(gate_report_dir deps)
 cache=$(gate_cache trivy)
-repo=$GATES_ROOT
+repo=$GATES_SOURCE
 
 skips=()
 for dir in "${SKIP_DIRS[@]}"; do skips+=(--skip-dirs "$dir"); done

@@ -13,6 +13,10 @@
 #   - one on a release branch's head (a patch, or rc.N > 1 after a fix): each service whose `paths`
 #     (.github/services.json) changed since the previous v* tag on the branch is built at the tag; every other is
 #     copied from that previous version's image. A change to ci-release.yml or services.json builds every service.
+#     A service built in its own repository (`repository` in services.json) is never built here. Its patch is built
+#     there, on its release/N.x, as release-N.x-<sha>-<ts> (service-image.yml): the newest such image made after the
+#     previous tag (<ts>, its commit's time, later than the tag's) is swapped in; with none, the previous version's
+#     image is copied. An older one belongs to an earlier minor's patches, never to this one.
 #
 # Prints one JSON object: source (a sentence for logs), build (services.json entries to build) and copy
 # ({service, image} with image as repository@digest). Exits 1 naming what it can't resolve: a pin or an image that
@@ -29,6 +33,7 @@ is_candidate "${tag#v}" || { echo "$tag is not a release candidate tag vX.Y.Z-rc
 cd "$(git rev-parse --show-toplevel)"
 commit=$(git rev-parse "$tag^{commit}")
 services=$(jq -c . .github/services.json)
+local_services=$(jq -c 'map(select(.repository == null))' <<<"$services") # the ones built from this repository
 
 # The main commit the candidate brings in, if any.
 source_main=""
@@ -47,6 +52,23 @@ digest_of() {
   echo "${1%:*}@$digest"
 }
 
+# newest_patch <repository>: the newest release-N.x-<sha>-<ts> tag of this candidate's release line made after the
+# previous tag (<ts> later than $since), or nothing. A repository that doesn't exist has none; an unreadable registry
+# stops the run.
+newest_patch() {
+  local listed err
+  err=$(mktemp)
+  if ! listed=$(crane ls "$1" 2>"$err"); then
+    if grep -q NAME_UNKNOWN "$err"; then rm -f "$err"; return 0; fi
+    cat "$err" >&2; rm -f "$err"
+    echo "could not list the tags of $1, so can't tell whether $tag patches it" >&2
+    exit 1
+  fi
+  rm -f "$err"
+  grep -E "^${line//./\\.}[0-9a-f]+-[0-9]+$" <<<"$listed" \
+    | awk -F- -v since="$since" '$NF > since' | sort -t- -k4,4n | tail -n 1 || true
+}
+
 copy="[]" build="[]"
 if [ -n "$source_main" ]; then
   short=$(git rev-parse --short "$source_main")
@@ -62,20 +84,35 @@ else
   previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$commit^" 2>/dev/null) \
     || { echo "$tag is on a release branch's head, but no earlier v* tag is reachable from it to copy images from" >&2; exit 1; }
   is_pinnable "${previous#v}" || { echo "the previous tag $previous is not a release or a candidate" >&2; exit 1; }
-  source="$previous's images, rebuilding what changed since"
+  since=$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/$previous")
+  version=${tag#v}
+  line="release-${version%%.*}.x-" # service repositories' patch images for this release/N.x
+  patched=()
   changed=$(git diff --name-only "$previous" "$commit")
   if grep -qxE '\.github/workflows/ci-release\.yml|\.github/services\.json' <<<"$changed"; then
-    build=$services
+    build=$local_services
   else
     build=$(jq -c --arg changed "$changed" '
       ($changed | split("\n")) as $files
       | [ .[] | select(.paths as $p | any($files[]; . as $f | any($p[]; . as $prefix | $f | startswith($prefix)))) ]
-    ' <<<"$services")
+    ' <<<"$local_services")
   fi
   for svc in $(jq -r --argjson build "$build" '.[] | .service as $s | select($build | map(.service) | index($s) | not) | .service' <<<"$services"); do
-    image=$(digest_of "$IMAGE_REGISTRY/$svc:${previous#v}")
+    patch=""
+    if [ "$(jq -r --arg s "$svc" '.[] | select(.service == $s) | .repository // empty' <<<"$services")" != "" ]; then
+      patch=$(newest_patch "$IMAGE_REGISTRY/$svc")
+    fi
+    if [ -n "$patch" ]; then
+      image=$(digest_of "$IMAGE_REGISTRY/$svc:$patch")
+      patched+=("$svc:$patch")
+    else
+      image=$(digest_of "$IMAGE_REGISTRY/$svc:${previous#v}")
+    fi
     copy=$(jq -c --arg s "$svc" --arg i "$image" '. + [{service: $s, image: $i}]' <<<"$copy")
   done
+  source="$previous's images"
+  [ ${#patched[@]} -eq 0 ] || source+=", patched with ${patched[*]}"
+  [ "$build" = "[]" ] || source+=", rebuilding what changed here since"
 fi
 
 jq -cn --arg source "$source" --argjson build "$build" --argjson copy "$copy" '{source: $source, build: $build, copy: $copy}'

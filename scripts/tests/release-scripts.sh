@@ -10,8 +10,10 @@
 #                                  included), or a dispatch, tests where
 #   scripts/deployment.sh          the smoke test's Deployments: create, in progress, outcome, superseded, replaced
 #   scripts/notify.sh              the smoke test's email: who gets which result, the subject and body, the rollback
-#   scripts/protect-main.sh        main's ruleset, the tag rulesets and the release and smoke-test environments
-#                                  (dry run and apply)
+#   scripts/protect-main.sh        main's ruleset, the tag rulesets and the release and smoke-test environments,
+#                                  and each service repository's ruleset, publish environment and issues (dry run
+#                                  and apply)
+#   scripts/clone-all.sh           clones the service repositories beside this one
 # `gh`, `crane` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
@@ -38,6 +40,7 @@ export GITHUB_REF=refs/heads/main GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1
 #              $FAKE_ARTIFACTS (GitHub's JSON), --jq applied
 #   api .../actions/runs/<id>/attempts/<n>: {status} from $GH_STATE/run-<id>-<n> (default completed)
 #   api .../collaborators/<login>/permission: {role_name} from $FAKE_ROLES (login=role,...; 404 for anyone else)
+#   api repos/<owner>/<repo>/contents/<path>: the file $FAKE_CONTENTS/<owner>/<repo>/contents/<path> (404 without it)
 #   (only the calls these scripts make; gh's own --jq is not emulated beyond that)
 #   release view/create/edit, pr list/create/edit/close: against $GH_STATE (a Release's notes, an open PR's body as
 #              pr-<head with / as _>; pr list without --head lists them as {headRefName, url}, --jq applied; a closed
@@ -80,6 +83,8 @@ case "$1 $2" in
       role=$(tr ',' '\n' <<<"${FAKE_ROLES:-}" | sed -n "s/^${BASH_REMATCH[1]}=//p")
       [ -n "$role" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
       jq -n --arg r "$role" '{role_name: $r}' | jq -r "$jq_filter"
+    elif [[ "$path" == repos/*/contents/* ]]; then # a file of a repository's default branch, raw
+      cat "${FAKE_CONTENTS:-/nonexistent}/${path#repos/}" 2>/dev/null || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     elif [[ " $* " == *" --method "* ]]; then # a write: its JSON body (stdin) kept as $GH_STATE/api-<METHOD>-<path>
       method=$(arg --method "$@"); path=${2//\//_}
       if [[ " $* " == *" --input - "* ]]; then cat >"$GH_STATE/api-$method-$path"; else : >"$GH_STATE/api-$method-$path"; fi
@@ -437,10 +442,10 @@ candidate() { (cd "$clone" && git fetch -q --tags origin && scripts/candidate-im
 copies() { # copies <service> <digest>: the candidate copies <service> from that digest
   jq -e --arg s "$1" --arg i "docker.io/pkhamdee/$1@$2" '.copy | any(.service == $s and .image == $i)' "$work/out" >/dev/null
 }
-builds_only() { [ "$(jq -r '.build | map(.service) | join(" ")' "$work/out")" = "$*" ]; }
+builds_nothing() { [ "$(jq '.build | length' "$work/out")" = 0 ]; } # every service is built in its own repository
 copies_all_from() { # copies_all_from <digest prefix>: builds nothing and copies every service from <prefix>-<service>
   local svc
-  builds_only && for svc in $cand_services; do copies "$svc" "sha256:$1-$svc" || return 1; done
+  builds_nothing && for svc in $cand_services; do copies "$svc" "sha256:$1-$svc" || return 1; done
 }
 
 for svc in $cand_services; do put_image "$svc" main-aaaaaaa-100 "sha256:dev1-$svc"; done
@@ -462,32 +467,42 @@ merge_copies_dev() { candidate v0.6.0-rc.1 && copies_all_from dev2; }
 check "candidate-images.sh: release.sh's merge of main copies the images main's dev pins name (not the branch's)" \
   merge_copies_dev
 
-# A fix on the branch head: only the changed service is built; the others come from the previous candidate.
+# A patch on the branch head (rc.2, after rc.1): every service is in its own repository, so nothing is built here.
+# A service's newest release-0.x-<sha>-<ts> image made after the previous tag (<ts> later than the tag) is swapped
+# in; an older one belongs to an earlier minor's patches and is ignored; the others are copied from rc.1.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.1 "sha256:rc1-$svc"; done
 git -C "$clone" checkout -q -b fix origin/release/0.x
-mkdir -p "$clone/services/eshop-web" && echo fix >"$clone/services/eshop-web/fix.txt"
-git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-web" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+git -C "$clone" commit -q --allow-empty -m "patch: eshop-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.2 -m "Release candidate 0.6.0-rc.2" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.2
-fix_builds_changed() {
-  candidate v0.6.0-rc.2 && builds_only eshop-web && ! copies eshop-web "sha256:rc1-eshop-web" \
-    && copies eshop-api sha256:rc1-eshop-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
-    && copies eshop-node-api sha256:rc1-eshop-node-api && copies eshop-sync-master sha256:rc1-eshop-sync-master
+put_image eshop-api release-0.x-1111111-100 sha256:old-patch-api            # before rc.1: an earlier minor's
+put_image eshop-api release-0.x-2222222-9999999998 sha256:patch-api
+put_image eshop-api release-0.x-3333333-9999999999 sha256:newer-patch-api   # the newest: this one
+put_image eshop-sync-master release-0.x-3333333-9999999999 sha256:patch-sync
+put_image eshop-web release-1.x-4444444-9999999999 sha256:other-line-web    # another release line: ignored
+put_image eshop-node-api release-0.x-5555555-100 sha256:old-patch-node      # only an old one: copied from rc.1
+patch_swaps_newest() {
+  candidate v0.6.0-rc.2 && builds_nothing \
+    && copies eshop-api sha256:newer-patch-api && copies eshop-sync-master sha256:patch-sync \
+    && copies eshop-web sha256:rc1-eshop-web && copies eshop-node-api sha256:rc1-eshop-node-api \
+    && copies thirdparty-mock sha256:rc1-thirdparty-mock \
+    && jq -e '.source | contains("patched with eshop-api:release-0.x-3333333-9999999999")' "$work/out" >/dev/null
 }
-check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it" \
-  fix_builds_changed
+check "candidate-images.sh: a patch candidate swaps in each service's newest release-N.x image made since the previous tag, and copies the rest from it" \
+  patch_swaps_newest
 
-# A change to the build itself rebuilds every service.
+# With no patch image since, a candidate on the branch head copies every image of the previous one.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.2 "sha256:rc2-$svc"; done
-jq . "$clone/.github/services.json" >"$clone/.github/services.json.new" && echo >>"$clone/.github/services.json.new" \
-  && mv "$clone/.github/services.json.new" "$clone/.github/services.json"
-git -C "$clone" commit -qam "services.json touched" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+rm -f "$REGISTRY"/docker.io/pkhamdee/*/release-*  # the patches above are in rc.2 now
+put_image eshop-api release-0.x-3333333-200 sha256:patch-before-rc2
+git -C "$clone" commit -q --allow-empty -m "docs only" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.3 -m "Release candidate 0.6.0-rc.3" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.3
-build_change_builds_all() {
-  candidate v0.6.0-rc.3 && builds_only eshop-api eshop-web thirdparty-mock eshop-node-api eshop-sync-master \
-    && [ "$(jq '.copy | length' "$work/out")" = 0 ]
+no_patch_copies_previous() { candidate v0.6.0-rc.3 && copies_all_from rc2; }
+check "candidate-images.sh: with no patch image made since the previous tag, a branch-head candidate copies all of its images" \
+  no_patch_copies_previous
+unreadable_registry_refused() {
+  ! FAKE_CRANE_LS_ERROR=1 candidate v0.6.0-rc.3 && grep -qF "could not list the tags of docker.io/pkhamdee/eshop-api" "$work/out"
 }
-check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service" \
-  build_change_builds_all
+check "candidate-images.sh refuses a branch-head candidate when the registry's tags can't be read" unreadable_registry_refused
 
 # What it can't resolve, it refuses: nothing untested is filled in.
 git -C "$clone" checkout -q main && git -C "$clone" pull -q --ff-only origin main
@@ -1378,6 +1393,37 @@ rm -rf "$GH_STATE/deployments"
 # --- scripts/protect-main.sh (main's ruleset and the release environment; applied by a maintainer) ---
 
 repo_api=repos/pkhamdee/modernapp
+web_api=repos/pkhamdee/eshop-web
+# eshop-web's CI on its main, as GitHub serves it: a lint job, and the shared gates (service-image.yml) after it.
+export FAKE_CONTENTS="$work/contents"
+mkdir -p "$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows"
+cat >"$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows/ci.yml" <<'YAML'
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    name: eshop-web (lint, build)
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run lint
+  image:
+    name: image
+    needs: [lint]
+    uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+    with:
+      images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
+    secrets: inherit
+  later:
+    needs: [image]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+YAML
+for svc_repo in eshop-api eshop-node-api thirdparty-mock; do # their CI: the same shape, their own lint job
+  mkdir -p "$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows"
+  sed "s/eshop-web/$svc_repo/g" "$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows/ci.yml" \
+    >"$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows/ci.yml"
+done
 protect() { (cd "$root" && scripts/protect-main.sh "$@") >"$work/out" 2>&1; }
 # sent <METHOD path>: the JSON bodies printed under that request in a --dry-run's output, as a JSON array
 sent() { awk -v h="$1" '$0 == h { on = 1; next } /^[^ {}[\]]/ { on = 0 } on' "$work/out" | jq -s .; }
@@ -1386,11 +1432,7 @@ writes() { grep -c -- ' --method ' "$GH_LOG" || true; }
 required_checks='[
   "SAST (Semgrep, fail on ERROR)",
   "dependency scan (Trivy, fail on critical)",
-  "eshop-api (lint, test)",
-  "eshop-node-api (lint, test)",
-  "eshop-web (lint, build)",
-  "repo rules (manifests, workflows, scripts, e2e)",
-  "thirdparty-mock (lint, type-check)"
+  "repo rules (manifests, workflows, scripts, e2e)"
 ]'
 # The tag rulesets: v* tags never deleted, moved or force-pushed by anyone; created only by admins (repository role
 # 5) and maintainers (2). Separate, since a bypass actor bypasses every rule of its ruleset.
@@ -1492,6 +1534,122 @@ smoke_test_environment_applied() {
 }
 check "protect-main.sh leaves the smoke-test environment exactly main (keeps main, removes any other policy)" \
   smoke_test_environment_applied
+
+# --- scripts/protect-main.sh: the service repositories (ADR 0009) ---
+
+service_repo_dry_run() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  FAKE_NO_ENVIRONMENT=1 protect --dry-run || return 1
+  [ "$(writes)" = 0 ] \
+    && sent "POST $web_api/rulesets" | jq -e 'length == 1 and (.[0] | .name == "Protect main" and .bypass_actors == []
+         and .conditions.ref_name.include == ["refs/heads/main"]
+         and (.rules[] | select(.type == "required_status_checks") | [.parameters.required_status_checks[].context] | sort)
+             == ["eshop-web (lint, build)", "image / SAST (Semgrep, fail on ERROR)",
+                 "image / dependency scan (Trivy, fail on critical)"])' >/dev/null \
+    && sent "POST $web_api/environments/publish/deployment-branch-policies" \
+      | jq -e 'sort_by(.name) == [{"name": "main", "type": "branch"}, {"name": "release/*", "type": "branch"}]' >/dev/null \
+    && sent "PATCH $web_api" | jq -e '. == [{"has_issues": false}]' >/dev/null \
+    && grep -qF 'image / SAST (Semgrep, fail on ERROR)' "$work/out"
+}
+check "protect-main.sh --dry-run prints each service repository's main ruleset (its CI's PR jobs and the shared gates' as required checks, no bypass), its publish environment (main and release/* only) and issues off" \
+  service_repo_dry_run
+service_repo_applied() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  FAKE_BRANCH_POLICIES='{"total_count":2,"branch_policies":[{"id":1,"name":"main","type":"branch"},{"id":9,"name":"v*","type":"tag"}]}' \
+    protect || return 1
+  local s="$GH_STATE/api-" p=${web_api//\//_}
+  [ -e "${s}POST-${p}_rulesets" ] && [ -e "${s}PUT-${p}_environments_publish" ] \
+    && jq -e '. == {"name": "release/*", "type": "branch"}' "${s}POST-${p}_environments_publish_deployment-branch-policies" >/dev/null \
+    && [ -e "${s}DELETE-${p}_environments_publish_deployment-branch-policies_9" ] \
+    && jq -e '. == {"has_issues": false}' "${s}PATCH-$p" >/dev/null
+}
+check "protect-main.sh applies each service repository's ruleset, leaves its publish environment exactly main and release/*, and turns its issues off" \
+  service_repo_applied
+service_repo_missing_refused() {
+  rm -f "$GH_STATE"/*; : >"$GH_LOG"
+  rm -rf "$work/some-contents" && cp -R "$FAKE_CONTENTS" "$work/some-contents" \
+    && rm -rf "$work/some-contents/pkhamdee/thirdparty-mock" || return 1
+  ! FAKE_CONTENTS="$work/some-contents" protect \
+    && grep -qF 'pkhamdee/thirdparty-mock has no .github/workflows/ci.yml on main' "$work/out" && [ "$(writes)" = 0 ]
+}
+check "protect-main.sh sends nothing at all while any service repository has no CI on GitHub yet (the others ready)" service_repo_missing_refused
+
+# --- scripts/clone-all.sh (the service repositories beside this one) ---
+
+clone_all() { (cd "$1" && CLONE_BASE_URL="$work/hosted" scripts/clone-all.sh) >"$work/out" 2>&1; }
+clones_service_repos() {
+  local parent="$work/side-by-side"
+  mkdir -p "$parent/infra/.github" && cp -R "$root/scripts" "$parent/infra/" && cp "$root/.github/services.json" "$parent/infra/.github/"
+  clone_all "$parent/infra" && grep -qF "eshop-web: skipped, $work/hosted/pkhamdee/eshop-web doesn't exist yet" "$work/out" \
+    && [ ! -e "$parent/eshop-web" ] || return 1
+  git init -q --bare -b main "$work/hosted/pkhamdee/eshop-web"
+  git clone -q "$work/hosted/pkhamdee/eshop-web" "$work/web-seed" 2>/dev/null
+  git -C "$work/web-seed" commit -q --allow-empty -m "eshop-web" && git -C "$work/web-seed" push -q origin HEAD:main
+  clone_all "$parent/infra" && [ "$(git -C "$parent/eshop-web" log -1 --format=%s)" = eshop-web ] \
+    && clone_all "$parent/infra" && grep -qF "eshop-web: already cloned at $parent/eshop-web" "$work/out"
+}
+check "clone-all.sh skips a service repository not created yet, clones it beside this one once it exists, and leaves the clone alone after" \
+  clones_service_repos
+
+# --- scripts/gates/artifact-dirs.sh (the image pipeline's downloads: one folder per artifact) ---
+
+artifact_dirs_normalizes() {
+  local d="$work/artifacts"
+  rm -rf "$d" && mkdir -p "$d/flat" "$d/many/image-eshop-api"
+  printf 'docker.io/pkhamdee/eshop-web:main-abc1234\ndocker.io/pkhamdee/eshop-web:main-abc1234-100\n' >"$d/flat/tags.txt"
+  echo tar >"$d/flat/image.tar"
+  echo tags >"$d/many/image-eshop-api/tags.txt"
+  "$root/scripts/gates/artifact-dirs.sh" "$d/flat" >"$work/out" 2>&1 \
+    && "$root/scripts/gates/artifact-dirs.sh" "$d/many" >>"$work/out" 2>&1 \
+    && [ -f "$d/flat/image-eshop-web/image.tar" ] && [ -f "$d/flat/image-eshop-web/tags.txt" ] \
+    && [ ! -e "$d/flat/tags.txt" ] && [ "$(ls "$d/many")" = image-eshop-api ]
+}
+check "artifact-dirs.sh moves a single flat image artifact into image-<service> and leaves per-artifact folders alone" \
+  artifact_dirs_normalizes
+
+# --- scripts/gates/tags-to-push.sh (service-image.yml's push: never overwrite a tag) ---
+
+tags_dir="$work/tags-to-push"
+tags_file() { mkdir -p "$tags_dir/$1" && printf '%s\n' "${@:2}" >"$tags_dir/$1/tags.txt"; }
+to_push() { "$root/scripts/gates/tags-to-push.sh" "$tags_dir"/*/tags.txt >"$work/out" 2>"$work/err"; }
+rm -rf "$REGISTRY/docker.io/pkhamdee/svc-a" "$REGISTRY/docker.io/pkhamdee/svc-b" "$REGISTRY/docker.io/pkhamdee/svc-c"
+put_image svc-a main-aaaaaaa-100 sha256:a-old && put_image svc-a main-aaaaaaa sha256:a-old
+put_image svc-b main-0000000-50 sha256:b-old
+tags_file svc-a docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100
+tags_file svc-b docker.io/pkhamdee/svc-b:main-bbbbbbb docker.io/pkhamdee/svc-b:main-bbbbbbb-200
+tags_file svc-c docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300
+pushes_only_new() {
+  to_push && [ "$(cat "$work/out")" = "docker.io/pkhamdee/svc-b:main-bbbbbbb
+docker.io/pkhamdee/svc-b:main-bbbbbbb-200
+docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300" ] \
+    && grep -qF 'skipped docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100' "$work/err"
+}
+check "tags-to-push.sh: a commit's image already pushed is skipped; new ones (and a repository not created yet) are pushed" \
+  pushes_only_new
+one_tag_existing_skips_image() {
+  rm -rf "$REGISTRY/docker.io/pkhamdee/svc-a" && put_image svc-a main-aaaaaaa-100 sha256:a-old
+  to_push && ! grep -q svc-a "$work/out" && grep -qF 'main-aaaaaaa-100 already exists' "$work/err"
+}
+check "tags-to-push.sh: when any tag of an image exists, none of its tags is pushed" one_tag_existing_skips_image
+unreadable_registry_fails() {
+  ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
+}
+check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
+# --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
+
+schema_check() { (cd "$root" && ENTERPRISE_SCHEMA_SOURCE="$1" scripts/check-enterprise-schema.sh) >"$work/out" 2>&1; }
+cp "$root/deploy/thirdparty/mssql/enterprise-schema.sql" "$work/schema-same.sql"
+{ cat "$work/schema-same.sql"; echo "ALTER TABLE hp_contract ADD note nvarchar(50);"; } >"$work/schema-changed.sql"
+schema_same() { schema_check "$work/schema-same.sql" && grep -qF 'is the schema eshop-sync-master is tested against' "$work/out"; }
+check "check-enterprise-schema.sh passes when the deployed schema is eshop-api's" schema_same
+schema_differs() {
+  ! schema_check "$work/schema-changed.sql" && grep -qF -- '-ALTER TABLE hp_contract' "$work/out" \
+    && grep -qF 'copy that one here' "$work/out"
+}
+check "check-enterprise-schema.sh fails with the difference when eshop-api's schema changed" schema_differs
+schema_unreadable() { ! schema_check "$work/no-such.sql" && grep -qF "can't read eshop-api's Enterprise schema" "$work/out"; }
+check "check-enterprise-schema.sh fails when eshop-api's schema can't be read" schema_unreadable
 
 [ "$failures" -eq 0 ] || { echo "$failures failed"; exit 1; }
 echo "all passed"

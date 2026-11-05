@@ -76,13 +76,14 @@ a maintainer (docs/setup.md, "Releasing"). Run it again after changing it; it up
 
 - **Pull requests only.** Nobody pushes to `main` directly, force-pushes or deletes it, admins included.
 - **Required checks**: every job `ci-release.yml` runs on a pull request, by its name, from GitHub Actions:
-  `eshop-api (lint, test)`, `eshop-web (lint, build)`, `thirdparty-mock (lint, type-check)`,
-  `eshop-node-api (lint, test)`, `SAST (Semgrep, fail on ERROR)`, `dependency scan (Trivy, fail on critical)` and
+  `SAST (Semgrep, fail on ERROR)`, `dependency scan (Trivy, fail on critical)` and
   `repo rules (manifests, workflows, scripts, e2e)`. The script reads them from the workflow (jobs with no `needs:`
   and no `if:`). The temporary copy, gates, scan and push never run on a pull request, so they can't be required;
   they guard the push instead (a failure means no image). A PR doesn't have to be up to date with `main` first.
   **Renaming or adding a PR job changes the checks: run `scripts/protect-main.sh` again** after it merges, or PRs
   wait for a check that never comes (or skip the new one).
+- **Service repositories** get the same ruleset with no bypass, requiring the PR jobs of their own CI
+  ([Service repositories](#service-repositories)); the same script sets them.
 - **Who merges**: anyone with write access, which is only maintainers. With 0 required approvals, merging is the
   approval: GitHub doesn't let an author approve their own PR, and with one maintainer that is the only possible
   rule.
@@ -128,27 +129,22 @@ git checkout -b issue/<n>-<name> origin/main
 # work, commit, push, open a PR into main; merge once every required check is green
 ```
 
-`ci-release.yml` on a pull request (to `main` or `release/*`) runs each service's lint, tests and build, the SAST gate
-(Semgrep, fails on ERROR) and the dependency scan (Trivy over the lockfiles, fails on critical), and the repo rules
-(manifests, workflows, ShellCheck, the release-script tests). Reports are kept as artifacts; each gate also runs
-locally (docs/setup.md, "Running the gates locally").
+This repository holds no application code: every service is built in its own repository
+([Service repositories](#service-repositories)). `ci-release.yml` on a pull request (to `main` or `release/*`) runs
+the SAST gate (Semgrep, fails on ERROR) and the dependency scan (Trivy over the lockfiles, fails on critical) over
+this repository, and the repo rules (manifests, workflows, ShellCheck, the release-script tests, the Enterprise
+schema). Reports are kept as artifacts; each gate also runs locally (docs/setup.md, "Running the gates locally").
 
-On the push to `main`, CI runs the same and then the **release gates** before any image exists (ADR 0007):
-`build` (the changed services, one arm64 job each, handed on as artifacts) → `gate`: a **temporary copy** of eShop
-started from those images (services not rebuilt run their newest `main-<sha>-<ts>` build, as `eshop-dev` does) must
-become healthy and seeded, then Locust and ZAP run against it → `scan`: Trivy on every image (fails on critical) →
-`push` as `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<unix-ts>`. A failure anywhere means nothing is
-pushed. Flux's image automation (`deploy/apps/dev/image-automation.yaml`) then picks the newest `main-<sha>-<ts>` tag,
-commits it to `main` and deploys it to `eshop-dev` (`https://eshop.localhost`). It never takes release-candidate or
-release tags. Pushes to `release/*` lint and test only.
+A service's images come from its repository's `main`: the shared gates build them, run them in a **temporary copy**
+of eShop, scan and push them as `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<unix-ts>` (ADR 0007, ADR
+0009). Flux's image automation (`deploy/apps/dev/image-automation.yaml`) then picks the newest `main-<sha>-<ts>` tag,
+commits it to `main` here and deploys it to `eshop-dev` (`https://eshop.localhost`). It never takes release-candidate
+or release tags. A version's images are pushed once: the push job refuses when any `<service>:<version>` already
+exists (`scripts/check-new-images.sh`), so a re-run of an old candidate's CI can't replace images QA tested.
 
-Manual runs: Actions → CI / Release → Run workflow on `main` without input rebuilds, gates and pushes every service as
-`main-<sha>`; with `version` = `0.0.0-test.N` it is a **release dry run**: every service built, gated, scanned and
-pushed as that tag, exactly as for a candidate, but no promotion PR and never deployable. It pushes only from `main`
-([The release environment](#the-release-environment)): from another branch it builds, gates and scans, then skips
-the push with a notice. A version's images are pushed once: the push job refuses
-when any `<service>:<version>` already exists (`scripts/check-new-images.sh`), so a re-run of an old candidate's CI
-can't replace images QA tested, and a dry run needs a new `N` each time.
+`ci-release.yml`'s build, gate and scan jobs remain for a service built here (an entry of `.github/services.json`
+with no `repository`); there is none, so on `main` they don't run, and its manual runs (a rebuild, or a release dry
+run with `version` = `0.0.0-test.N`) build nothing.
 
 ### Dev's smoke test
 
@@ -169,6 +165,43 @@ Only the newest dev deploy is tested: a newer push cancels a run still waiting o
 inactive, "superseded" (not failed). A code change is tested twice: at the merge commit, still on the previous
 images, and at Flux's image-update commit once CI has pushed the new ones, which supersedes the first run if it is
 still going. The run is named `E2E push <commit>`. What a push tests is decided by `scripts/smoke-targets.sh`.
+
+## Service repositories
+
+eShop's services are moving into repositories of their own (ADR 0009): **`pkhamdee/eshop-api`**
+(eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**, **`pkhamdee/eshop-node-api`** and
+**`pkhamdee/thirdparty-mock`**. This
+repository keeps everything that describes and releases the whole system, and the one issue tracker: a service
+repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/modernapp#N`. Clone them beside this one
+with `scripts/clone-all.sh` (docs/setup.md, "Service repositories").
+
+A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tests, then calls this repository's
+**shared gates**, `.github/workflows/service-image.yml`:
+
+- on a pull request: SAST and the dependency scan of that repository. Its required checks are its lint job and
+  `image / SAST (Semgrep, fail on ERROR)`, `image / dependency scan (Trivy, fail on critical)` (`scripts/protect-main.sh`);
+- on a push to its `main`: the same pipeline as here: `build` → `gate` (the temporary copy, the new image beside the
+  other services' newest `main-<sha>-<ts>` images, then Locust and ZAP) → `scan` → `push` as
+  `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<ts>`, where `<sha>` is the service repository's commit
+  (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed, and
+  a tag that already exists is never pushed again (`scripts/gates/tags-to-push.sh`): a second run of the same commit
+  leaves the image dev tested in place;
+- on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>-<ts>` (a patch's image, never deployed to
+  dev; the next patch candidate takes it, [Patch release](#patch-release-also-hotfixes)).
+
+The push uses the repository's environment **`publish`** (`main` and `release/*` only), which holds
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`; the calling job must pass `secrets: inherit`, or the called workflow
+sees them empty (its Semgrep finding is accepted in the service repository's `sast-accepted.txt`). From there it is the same road as every other image: Flux's image
+automation deploys the newest `main-<sha>-<ts>` to `eshop-dev` and commits the pin here, which starts
+[dev's smoke test](#devs-smoke-test) on that commit. So a service PR gets lint, tests and the gates, but no smoke test
+until it reaches dev. A release candidate copies every service's dev-tested digest, wherever it was built
+([1. Cut a release candidate](#1-cut-a-release-candidate)); `.github/services.json` names each service's
+`repository`, and this repository's CI never builds those.
+
+**Changes across services ship expand-then-contract.** Every merge to a service's `main` runs in the temporary copy
+beside the other services' `main`, and dev runs whatever was merged last: never write two PRs that only work
+together. First make the provider accept both the old and the new shape (expand), then move the consumers, then drop
+the old shape (contract), each step a merge that works on its own.
 
 ## Releasing
 
@@ -226,10 +259,11 @@ already passed rather than rebuilding it (`scripts/candidate-images.sh`,
   commit's dev pins name (`deploy/apps/dev`, and `deploy/thirdparty` for thirdparty-mock), which is what dev's smoke
   test passed. Nothing is built, so the gates and the image scan don't run again: each image passed them when it was
   built on `main`. QA gets the exact bytes dev tested.
-- **Any other candidate** (the branch head): the services whose files changed since the previous `v*` tag on the
-  branch are built at the tag, through the same temporary copy, gates and scan as for `main` (unchanged services run
-  in the copy as the images they will be); every other service is copied from that previous version's image. A change
-  to `ci-release.yml` or `services.json` builds every service.
+- **Any other candidate** (the branch head: a patch): each service takes the newest patch image its repository
+  built on `release/N.x`, `release-N.x-<sha>-<ts>`, made after the previous `v*` tag on the branch (`<ts>`, its
+  commit's time, later than the tag's); a service with none is copied from that previous version's image. An older
+  patch image belongs to an earlier minor's patches and is never taken. Each patch image passed the shared gates when
+  its repository built it ([Patch release](#patch-release-also-hotfixes)).
 
 A pin or an image it can't resolve fails the run: nothing untested is filled in. Every copy is checked against its
 source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
@@ -415,7 +449,8 @@ release's Deployment inactive.
 It moves manifests and images back but **never the data**: eshop-api migrates the database forwards on start-up and
 nothing migrates it back. A rollback is safe only when the earlier release works with the schema the later one left:
 no migration between them removed, renamed or retyped anything the earlier release uses
-(`git diff vEARLIER..vLATER -- services/eshop-api/src/Eshop.Data/Migrations`). Otherwise roll forward: fix on the
+(in `../eshop-api`, between the commits `releases/EARLIER.md` and `releases/LATER.md` name as eshop-api's "built
+from": `git diff <earlier> <later> -- src/Eshop.Data/Migrations`). Otherwise roll forward: fix on the
 release branch, cut the next patch's candidate and promote it.
 
 A tag carries **its own overlay**: an environment can be pinned only to a version whose tag contains that
@@ -438,16 +473,27 @@ environment with the next release that contains it.
 
 There is no separate hotfix process: an urgent fix takes this route.
 
+A fix to a service lands in **that service's repository**, first on its `main` (the one rule), then on its
+`release/N.x`, cut from the commit that built the released image (`releases/X.Y.Z.md` names it: "built from
+`<sha>`"):
+
 ```bash
-git checkout -b issue/<n>-fix origin/release/0.x   # fix, PR into release/0.x (or cherry-pick onto it)
-git checkout -b issue/<n>-fix-main origin/main     # the same fix, PR into main (the one rule)
-scripts/release.sh 0.3.1-rc.1                      # tags the head of release/0.x; then QA, sign-off, promotion
+# in ../eshop-api (any service repository); the first patch of the line creates its release/0.x:
+git push origin <sha from releases/0.5.0.md>:refs/heads/release/0.x   # a maintainer, once per release line
+git checkout -b fix-<n> origin/release/0.x   # fix, PR into release/0.x; the same fix, PR into main
+#   the merge into release/0.x runs the shared gates and pushes eshop-api:release-0.x-<sha>-<ts>
+# then here: the candidate tags this repository's release/0.x head (as it is, or with a manifest fix on it)
+scripts/release.sh 0.5.1-rc.1                # CI swaps in each service's newest release-0.x image since v0.5.0
 ```
 
 ```
-fix ──► release/0.x ──► v0.3.1-rc.1 ──► CI ──► QA promotion ──► QA test ──► sign-off PR: v0.3.1 ──► prod promotion
-          └── same fix ──► main
+service fix ──► <service> release/0.x ──► release-0.x-<sha>-<ts> image
+                 └── same fix ──► <service> main
+scripts/release.sh 0.5.1-rc.1 ──► CI copies v0.5.0's images, swapping in the patch ──► QA ──► sign-off ──► prod
 ```
+
+A fix to this repository (a manifest, a release script) goes the same way here: a PR into `release/0.x` and one into
+`main`. The candidate's sign-off record lists every image with the commit it was built from.
 
 A **new major** (`1.0.0-rc.1`) forks `release/1.x` from `main`; older `release/N.x` branches stay for patches while
 supported.

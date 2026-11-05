@@ -1,32 +1,22 @@
 [
   {
     "service": "eshop-api",
-    "context": "services/eshop-api",
-    "dockerfile": "services/eshop-api/src/Eshop.Api/Dockerfile",
-    "paths": ["services/eshop-api/"]
+    "repository": "pkhamdee/eshop-api"
   },
   {
     "service": "eshop-web",
-    "context": "services/eshop-web",
-    "dockerfile": "services/eshop-web/Dockerfile",
-    "paths": ["services/eshop-web/"]
+    "repository": "pkhamdee/eshop-web"
   },
   {
     "service": "thirdparty-mock",
-    "context": "services/thirdparty-mock",
-    "dockerfile": "services/thirdparty-mock/Dockerfile",
-    "paths": ["services/thirdparty-mock/"]
+    "repository": "pkhamdee/thirdparty-mock"
   },
   {
     "service": "eshop-node-api",
-    "context": "services/eshop-node-api",
-    "dockerfile": "services/eshop-node-api/Dockerfile",
-    "paths": ["services/eshop-node-api/"]
+    "repository": "pkhamdee/eshop-node-api"
   },
   {
     "service": "eshop-sync-master",
-    "context": "services/eshop-api",
-    "dockerfile": "services/eshop-api/src/Eshop.SyncMaster/Dockerfile",
-    "paths": ["services/eshop-api/"]
+    "repository": "pkhamdee/eshop-api"
   }
 ]

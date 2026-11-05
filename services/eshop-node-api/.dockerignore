@@ -1,4 +1,0 @@
-node_modules
-.local-share
-Dockerfile
-.dockerignore

@@ -257,7 +257,9 @@ starting price, then at least ฿100 above the current highest; Bids before open
 The Enterprise System is a real SQL Server 2022 (`mcr.microsoft.com/mssql/server`, amd64 only, so it runs under Rosetta;
 about 2 GB of memory and a slow first start) in the `thirdparty` namespace, shared by every environment:
 databases `enterprise_dev`, `enterprise_qa` and `enterprise_prod`, fake schema `hp.contract` / `hp.payment`
-(`deploy/thirdparty/mssql/enterprise-schema.sql`). The pod's `schema` container creates the databases, applies the
+(`deploy/thirdparty/mssql/enterprise-schema.sql`, a copy of the one eshop-sync-master's tests apply,
+`../eshop-api/tests/Eshop.SyncMaster.Tests/enterprise-schema.sql`: change that one first; CI's
+`scripts/check-enterprise-schema.sh` fails while they differ). The pod's `schema` container creates the databases, applies the
 schema and (re)sets the logins on every start. Passwords are in the SOPS Secret
 `deploy/thirdparty/mssql/mssql-credentials.sops.yaml` (`sa`, `enterprise_admin` for the admin tool, `eshop_sync_dev` /
 `eshop_sync_qa` / `eshop_sync_prod` for eshop-sync-master). Each environment's copy of its sync login is in
@@ -605,6 +607,44 @@ repository secret of the same name, so the order above never leaves CI without a
 that reaches one of these jobs fails with "Branch ... is not allowed to deploy to release"; so a release dry run
 pushes only from `main` (from another branch `plan` skips the push, with a notice).
 
+### Service repositories
+
+eShop's services each have their own repository (ADR 0009, #101), cloned beside this one:
+`scripts/clone-all.sh` clones every one that exists into this repository's parent folder (here
+`/Users/pongsak/repos/modernapp/`), so their agent docs find `../modernapp` and the temporary copy builds them from
+`../<service>`: **`pkhamdee/eshop-api`** (eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**,
+**`pkhamdee/eshop-node-api`** and **`pkhamdee/thirdparty-mock`**.
+`.github/services.json` names each one's `repository`; this repository's CI never builds them. Each service
+repository's CI runs its own checks, then calls this repository's shared gates, `.github/workflows/service-image.yml`
+(git-workflow.md, "Service repositories").
+
+**Human**, once per service repository, in this order (the agent prepares `../<service>` with its history and CI, and
+the PR that removes it here). Shown for `svc=eshop-node-api`:
+
+```sh
+svc=eshop-node-api
+# 1. Create the repository, empty and public (issues are turned off in step 2), and push the prepared clone. Its
+#    first CI run passes the gates but fails at the push's Docker Hub login until step 3: nothing is pushed.
+gh repo create "pkhamdee/$svc" --public --description "eShop's $svc (see pkhamdee/modernapp)"
+git -C "../$svc" remote add origin "https://github.com/pkhamdee/$svc.git"
+git -C "../$svc" push -u origin main
+# 2. Protection, from the branch of the PR that moves the service (its ci-release.yml no longer has the service's
+#    job, so the PR's required checks must drop it before the PR can merge):
+scripts/protect-main.sh --dry-run    # this repository's settings, and each service repository's ruleset, publish, issues
+scripts/protect-main.sh
+# 3. The publish secrets. Give the value with --body: under Claude Code's `!`, gh can't prompt and would store an
+#    empty value. Copy a Docker Hub access token (Read & Write) first; the command line then holds no token:
+gh secret set DOCKERHUB_USERNAME --env publish --repo "pkhamdee/$svc" --body pkhamdee
+gh secret set DOCKERHUB_TOKEN --env publish --repo "pkhamdee/$svc" --body "$(pbpaste)"
+# 4. Merge the PR here, then run the service's CI on main: its image goes through the gates to Docker Hub, Flux
+#    deploys it (dev, or `thirdparty` for thirdparty-mock), and dev's smoke test runs on Flux's commit.
+gh workflow run ci.yml --repo "pkhamdee/$svc" --ref main
+```
+
+Check: pkhamdee/<service> → Settings → Rules → Rulesets → **Protect main** (no bypass; required checks: its lint
+job, e.g. `eshop-node-api (lint, test)`, and `image / SAST (Semgrep, fail on ERROR)`, `image / dependency scan
+(Trivy, fail on critical)`), Environments → **publish** (`main` and `release/*` only), and no Issues tab.
+
 ## Temporary copy (release gate)
 
 Before CI pushes any image (`main` pushes, release-candidate tags, dry runs; never pull requests), it starts a **temporary
@@ -621,7 +661,8 @@ part's status and last log lines, writes them to `reports/temporary-copy/`, remo
 
 ```sh
 export DOCKER_HOST=unix://$HOME/.rd/docker.sock
-scripts/gates/temporary-copy.sh build    # the four images from this checkout, as temporary-copy/<service>:local
+scripts/gates/temporary-copy.sh build    # the four images, as temporary-copy/<service>:local: from this checkout,
+                                         # and a service in its own repository from its clone, ../<service>
 scripts/gates/temporary-copy.sh up       # ~10 s; then http://localhost:8090 (Staff: staff / temporary-copy-staff)
 scripts/gates/temporary-copy.sh down     # stop it and throw its data away
 
@@ -655,26 +696,31 @@ Enterprise sync steps can't pass there.
 | `deploy/apps/prod/` | `eshop-prod` overlay, applied as it is in the pinned release tag, served at `prod.eshop.localhost` | `apps-prod` (after configs; source `eshop-release`) |
 | `deploy/apps/qa/` | `eshop-qa` overlay (a copy of prod's), applied as it is in the pinned release-candidate tag, served at `qa.eshop.localhost` | `apps-qa` (after configs; source `eshop-qa`) |
 | `deploy/thirdparty/` | Shared mocks in the `thirdparty` namespace, one folder per component (`thirdparty-mock/`, `samba/`: image share with one share per environment, `mssql/`: mock Enterprise System, ...); thirdparty-mock follows `main` via its own image automation | `thirdparty` (after configs) |
-| `services/eshop-api/` | .NET solution: `src/Eshop.Domain`, `src/Eshop.Data` (EF Core, migrations), `src/Eshop.Api`, `src/Eshop.SyncMaster` (eshop-sync-master), `tests/Eshop.Api.Tests` (Seam 1), `tests/Eshop.SyncMaster.Tests` (Seam 2) | – |
-| `services/eshop-web/` | React + Vite + TypeScript, served by Caddy | – |
-| `services/thirdparty-mock/` | Node 24 + Express (TypeScript run directly): mock SMS (+ inbox page), ID Verification and Credit Check; adjustable delay; mock Enterprise System admin tool | – |
-| `services/eshop-node-api/` | Image service: Node 24 + Express + TypeScript (run directly by Node), SMB share via `smbclient` | – |
+| `../eshop-api/` (`pkhamdee/eshop-api`) | Its own repository. .NET solution: `src/Eshop.Domain`, `src/Eshop.Data` (EF Core, migrations), `src/Eshop.Api`, `src/Eshop.SyncMaster` (eshop-sync-master), `tests/Eshop.Api.Tests` (Seam 1), `tests/Eshop.SyncMaster.Tests` (Seam 2) | – |
 | `e2e/` | Seam 4: Playwright smoke test of the whole demo against a deployed environment (`npm run e2e`) | – |
-| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments (admin-run; [Protecting main](#protecting-main)); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
+| `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments, and each service repository's ruleset, `publish` environment and issues (admin-run; [Protecting main](#protecting-main)); `clone-all.sh` clones the service repositories beside this one ([Service repositories](#service-repositories)); `check-enterprise-schema.sh` checks that the deployed mock Enterprise schema is the one eshop-sync-master's tests apply (CI's `repo rules` job); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
 | `releases/` | One record per release, `X.Y.Z.md`: the signed-off candidate, its image digests, QA's passing run and Deployment. Added by the sign-off PR (`scripts/sign-off-pr.sh`); merging it signs off (git-workflow.md, "Sign-off") | – |
-| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `image-scan.sh` (Trivy on built images), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
-| `.github/services.json` | Container images CI builds (context, Dockerfile, source paths): changed ones on `main`, all of them on a release-candidate tag | – |
+| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `artifact-dirs.sh` (puts a downloaded image artifact in its `image-<service>` folder), `tags-to-push.sh` (the service repositories' push: never an existing tag), `image-scan.sh` (Trivy on built images), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
+| `.github/services.json` | Every eShop image a release takes, with the `repository` that builds it ([Service repositories](#service-repositories)); a release candidate copies each one by digest (`scripts/candidate-images.sh`) | – |
+| `.github/workflows/service-image.yml` | The shared gates the service repositories' CI calls: build, SAST, dependency scan, temporary copy, Trivy, push (git-workflow.md, "Service repositories") | – |
+| `../eshop-web/` (`pkhamdee/eshop-web`) | React + Vite + TypeScript, served by Caddy; its own repository ([Service repositories](#service-repositories)) | – |
+| `../eshop-node-api/` (`pkhamdee/eshop-node-api`) | Image service: Node 24 + Express + TypeScript (run directly by Node), SMB share via `smbclient`; its own repository | – |
+| `../thirdparty-mock/` (`pkhamdee/thirdparty-mock`) | Node 24 + Express (TypeScript run directly): mock SMS (+ inbox page), ID Verification and Credit Check; adjustable delay; mock Enterprise System admin tool; its own repository, its manifests in `deploy/thirdparty/thirdparty-mock/` here | – |
 
 Every Kustomization decrypts SOPS (`*.sops.yaml`) with `flux-system/sops-age` where needed and prunes only what it applied, so other workloads in the cluster are untouched.
 
 ## Developing
 
 ```sh
-# eshop-api + eshop-sync-master (.NET 10). Tests start PostgreSQL (and, for sync-master's Seam-2 tests, SQL Server
-# amd64 under Rosetta: enable Rosetta in Rancher Desktop) with Testcontainers.
+# Every service is in its own repository, cloned beside this one by scripts/clone-all.sh; each one's CLAUDE.md and
+# docs/conventions.md hold its commands and rules. Run from this repository's folder:
+scripts/clone-all.sh
+
+# eshop-api + eshop-sync-master (.NET 10), ../eshop-api. Tests start PostgreSQL (and, for sync-master's Seam-2 tests,
+# SQL Server amd64 under Rosetta: enable Rosetta in Rancher Desktop) with Testcontainers.
 export DOCKER_HOST=unix://$HOME/.rd/docker.sock
 export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock   # Rancher Desktop: socket path inside the VM
-cd services/eshop-api
+cd ../eshop-api
 dotnet test
 dotnet format --verify-no-changes                                   # lint, as CI runs it
 dotnet tool restore && dotnet ef migrations add <Name> --project src/Eshop.Data
@@ -684,21 +730,23 @@ docker run -d --name eshop-pg -p 5432:5432 -e POSTGRES_USER=eshop -e POSTGRES_PA
 dotnet run --project src/Eshop.Api                                  # http://localhost:5080, migrates and seeds
 # eshop-sync-master needs a SQL Server on localhost:1433 with enterprise_dev and the schema (appsettings.Development.json):
 docker run -d --name enterprise-sql --platform linux/amd64 -p 1433:1433 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=Local_Dev_Passw0rd mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04
-#   then create enterprise_dev and run ../../deploy/thirdparty/mssql/enterprise-schema.sql in it (sqlcmd -d enterprise_dev -i ...)
+#   then create enterprise_dev and run tests/Eshop.SyncMaster.Tests/enterprise-schema.sql in it (sqlcmd -d enterprise_dev -i ...)
 dotnet run --project src/Eshop.SyncMaster                           # pushes every 30 s; probes on http://localhost:5090/healthz/ready
 
-# eshop-web (Node 24)
-cd services/eshop-web
+# eshop-web (Node 24), in its own repository: scripts/clone-all.sh puts it at ../eshop-web
+cd ../eshop-web
 npm ci && npm run dev                                               # proxies /api to localhost:5080
 npm run lint && npm run build                                       # as CI runs it
 
-# thirdparty-mock (Node 24). eshop-api's Development settings point ThirdParty:BaseUrl at localhost:4000.
-cd services/thirdparty-mock
+# thirdparty-mock (Node 24), in its own repository (../thirdparty-mock). eshop-api's Development settings point
+# ThirdParty:BaseUrl at localhost:4000.
+cd ../thirdparty-mock
 npm ci && npm run dev                                               # http://localhost:4000/sms/inbox
 # Enterprise admin tool locally: ENTERPRISE_SQL_SERVER=localhost ENTERPRISE_SQL_USER=sa ENTERPRISE_SQL_PASSWORD=... npm run dev
 npm run lint && npm run typecheck
-# eshop-node-api (Node 24). Tests use a temporary folder instead of the SMB share.
-cd services/eshop-node-api
+# eshop-node-api (Node 24), in its own repository (../eshop-node-api). Tests use a temporary folder instead of the
+# SMB share.
+cd ../eshop-node-api
 npm ci && npm run lint && npm test                                  # as CI runs it
 npm run dev                                                         # http://localhost:8081, images in ./.local-share
 ```
@@ -716,10 +764,12 @@ scripts/gates/sast.sh     # Semgrep CE: fails on an ERROR finding; reports/sast/
 scripts/gates/deps.sh     # Trivy over every lockfile: fails on a CRITICAL vulnerability; reports/deps/trivy.txt
 ```
 
-- **SAST** scans `services`, `e2e`, `scripts`, `.github`, `deploy` and `clusters` (test code included) with the
-  semgrep-rules repository at a pinned commit (`RULES_COMMIT` in `sast.sh`). WARNING and INFO findings are reported,
-  never blocking. To accept a false positive, add `rule-id | path-glob | reason` to
-  `scripts/gates/sast-accepted.txt`; the reason is required, and inline `nosemgrep` comments are ignored. Paths
+- **SAST** scans `e2e`, `scripts`, `.github`, `deploy` and `clusters` here, and with `GATES_SOURCE` a service
+  repository's whole checkout (test code included; service-image.yml does that for each service's PRs and
+  builds), with the semgrep-rules repository at a pinned commit (`RULES_COMMIT` in `sast.sh`). WARNING and INFO
+  findings are reported, never blocking. To accept a false positive, add `rule-id | path-glob | reason` to
+  `scripts/gates/sast-accepted.txt` here, or to a service repository's own `sast-accepted.txt` at its root (paths
+  relative to it); the reason is required, and inline `nosemgrep` comments are ignored. Paths
   skipped inside those folders are in `.semgrepignore`.
 - **Dependency scan** reads the npm `package-lock.json` files (dev dependencies included) and eshop-api's NuGet
   `packages.lock.json` files. Those exist because `Directory.Build.props` sets `RestorePackagesWithLockFile`: after
