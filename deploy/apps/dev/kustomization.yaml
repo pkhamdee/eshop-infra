@@ -23,4 +23,4 @@ images:
   - name: docker.io/pkhamdee/eshop-node-api
     newTag: main-72c27c2-1793873264 # {"$imagepolicy": "eshop-dev:eshop-node-api:tag"}
   - name: docker.io/pkhamdee/eshop-sync-master
-    newTag: main-5878a9c-1793853166 # {"$imagepolicy": "eshop-dev:eshop-sync-master:tag"}
+    newTag: main-c26726e-1793876722 # {"$imagepolicy": "eshop-dev:eshop-sync-master:tag"}
