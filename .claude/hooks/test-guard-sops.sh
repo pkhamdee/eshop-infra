@@ -35,4 +35,4 @@ run 0 "allows a commit message that mentions SOPS files and sops" Bash command "
   (e.g. sops --encrypt $f); reading stays allowed\" 2>/dev/null"
 run 0 "allows a PR body that mentions a SOPS file" Bash command "gh pr create --body \"rm, cp or sops on *.sops.yaml is blocked\""
 
-[ "$failures" = 0 ] && echo "all passed" || { echo "$failures failed"; exit 1; }
+if [ "$failures" = 0 ]; then echo "all passed"; else echo "$failures failed"; exit 1; fi
