@@ -5,6 +5,5 @@ resources:
   - eshop-e2e.yaml
   - runner-rbac.yaml
   - image-automation.yaml
-  # The scale set's GitHub token, a SOPS file a maintainer creates (docs/setup.md, "Cluster runner"). A listed file
-  # that does not exist breaks the whole Kustomization, so this line is uncommented in the same commit that adds it:
-  # - eshop-e2e-github.sops.yaml
+  # The scale set's GitHub token (docs/setup.md, "Cluster runner"). Renew it with sops; the token is never in plain text.
+  - eshop-e2e-github.sops.yaml
