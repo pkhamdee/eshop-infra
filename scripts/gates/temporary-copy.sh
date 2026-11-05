@@ -3,8 +3,8 @@
 # healthy and the demo data is seeded, and throws it away. CI runs it before any image is pushed; it runs the same
 # way on this Mac. The copy itself is scripts/gates/temporary-copy/compose.yaml.
 #
-#   scripts/gates/temporary-copy.sh build   # build the four images from this checkout (temporary-copy/<svc>:local);
-#                                           # a service in its own repository from its clone beside this one (../<svc>)
+#   scripts/gates/temporary-copy.sh build   # build the four images (temporary-copy/<svc>:local) from the service
+#                                           # repositories' clones beside this one (../<svc>, scripts/clone-all.sh)
 #   scripts/gates/temporary-copy.sh up      # start the copy and wait until it is ready: exit 0, or exit 1 and remove it
 #   scripts/gates/temporary-copy.sh down    # stop it and throw its data away
 #
@@ -35,10 +35,10 @@ compose() {
 }
 
 build() {
-  # Same contexts and Dockerfiles as CI (.github/services.json, and the service repositories' own CI); the copy
-  # has no sync master.
+  # Same contexts and Dockerfiles as the service repositories' CI; the copy has no sync master.
   docker build -t temporary-copy/eshop-web:local "$(gate_service_dir eshop-web)"
-  docker build -t temporary-copy/eshop-api:local -f "$root/services/eshop-api/src/Eshop.Api/Dockerfile" "$root/services/eshop-api"
+  api=$(gate_service_dir eshop-api)
+  docker build -t temporary-copy/eshop-api:local -f "$api/src/Eshop.Api/Dockerfile" "$api"
   docker build -t temporary-copy/eshop-node-api:local "$(gate_service_dir eshop-node-api)"
   docker build -t temporary-copy/thirdparty-mock:local "$(gate_service_dir thirdparty-mock)"
 }

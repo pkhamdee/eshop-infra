@@ -4,7 +4,7 @@
 #   GATES_ROOT                       the repo root, from this file's place (no git needed, worktrees included)
 #   GATES_SOURCE                     what SAST and the dependency scan read: $GATES_SOURCE when set (a service
 #                                    repository's checkout, for service-image.yml), else GATES_ROOT
-#   gate_service_dir <service>       the source folder of a service: services/<service> here, else the sibling clone
+#   gate_service_dir <service>       the source folder of a service: its repository's clone beside this one,
 #                                    ../<service> (ADR 0009; scripts/clone-all.sh puts it there)
 #   gate_report_dir <gate> [dir]     creates and prints the gate's report folder as an absolute path: [dir], else
 #                                    $REPORT_DIR, else reports/<gate> under the repo root
@@ -15,12 +15,10 @@ GATES_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 GATES_SOURCE=$(cd "${GATES_SOURCE:-$GATES_ROOT}" && pwd)
 
 gate_service_dir() {
-  if [ -d "$GATES_ROOT/services/$1" ]; then
-    echo "$GATES_ROOT/services/$1"
-  elif [ -d "$GATES_ROOT/../$1" ]; then
+  if [ -d "$GATES_ROOT/../$1" ]; then
     (cd "$GATES_ROOT/../$1" && pwd)
   else
-    echo "no source for $1: neither services/$1 nor ../$1 (scripts/clone-all.sh clones it there)" >&2
+    echo "no source for $1: no ../$1 (scripts/clone-all.sh clones it there)" >&2
     return 1
   fi
 }

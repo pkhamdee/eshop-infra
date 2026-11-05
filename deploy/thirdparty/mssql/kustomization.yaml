@@ -5,7 +5,8 @@ resources:
   - mssql.yaml
   - network-policy.yaml
 # The schema container runs these on every pod start; a change renames the ConfigMap and so restarts the pod.
-# enterprise-schema.sql is also what eshop-sync-master's Seam-2 tests apply to their SQL Server container.
+# enterprise-schema.sql is a copy of pkhamdee/eshop-api's tests/Eshop.SyncMaster.Tests/enterprise-schema.sql, what
+# eshop-sync-master's Seam-2 tests apply: change it there first; CI (scripts/check-enterprise-schema.sh) keeps them equal.
 configMapGenerator:
   - name: mssql-init
     files:

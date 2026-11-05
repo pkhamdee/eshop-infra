@@ -20,7 +20,7 @@ RULES_COMMIT=9bbf021d0acffa3095fcffd17b2bc7787eb4796d # 2026-10-08
 RULE_SETS=(csharp typescript javascript dockerfile bash yaml/github-actions html)
 # The repo's own code and configuration; .agents/.claude hold third-party agent skills. A service repository
 # (GATES_SOURCE) is scanned whole, but for those, through its .semgrepignore (service-image.yml copies this one's).
-TARGETS=(services e2e scripts .github deploy clusters)
+TARGETS=(e2e scripts .github deploy clusters)
 
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
