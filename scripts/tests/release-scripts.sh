@@ -467,19 +467,19 @@ merge_copies_dev() { candidate v0.6.0-rc.1 && copies_all_from dev2; }
 check "candidate-images.sh: release.sh's merge of main copies the images main's dev pins name (not the branch's)" \
   merge_copies_dev
 
-# A fix on the branch head: only the changed service is built; the others come from the previous candidate. A
-# service built in its own repository (eshop-web: `repository` in services.json) is never built here, even when a
-# leftover folder of it changes.
+# A fix on the branch head: only the changed service is built (eshop-api's folder: eshop-api and the sync master);
+# the others come from the previous candidate. A service built in its own repository (`repository` in services.json)
+# is never built here, even when a leftover folder of it changes.
 for svc in $cand_services; do put_image "$svc" 0.6.0-rc.1 "sha256:rc1-$svc"; done
 git -C "$clone" checkout -q -b fix origin/release/0.x
-mkdir -p "$clone/services/eshop-node-api" "$clone/services/eshop-web"
-echo fix >"$clone/services/eshop-node-api/fix.txt" && echo fix >"$clone/services/eshop-web/fix.txt"
-git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-node-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+mkdir -p "$clone/services/eshop-api" "$clone/services/eshop-web"
+echo fix >"$clone/services/eshop-api/fix.txt" && echo fix >"$clone/services/eshop-web/fix.txt"
+git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-api" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.2 -m "Release candidate 0.6.0-rc.2" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.2
 fix_builds_changed() {
-  candidate v0.6.0-rc.2 && builds_only eshop-node-api && ! copies eshop-node-api "sha256:rc1-eshop-node-api" \
-    && copies eshop-api sha256:rc1-eshop-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
-    && copies eshop-web sha256:rc1-eshop-web && copies eshop-sync-master sha256:rc1-eshop-sync-master
+  candidate v0.6.0-rc.2 && builds_only eshop-api eshop-sync-master && ! copies eshop-api "sha256:rc1-eshop-api" \
+    && copies eshop-node-api sha256:rc1-eshop-node-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
+    && copies eshop-web sha256:rc1-eshop-web && ! copies eshop-sync-master sha256:rc1-eshop-sync-master
 }
 check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it (a service in its own repository too)" \
   fix_builds_changed
@@ -491,8 +491,10 @@ jq . "$clone/.github/services.json" >"$clone/.github/services.json.new" && echo 
 git -C "$clone" commit -qam "services.json touched" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
 git -C "$clone" tag -a v0.6.0-rc.3 -m "Release candidate 0.6.0-rc.3" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.3
 build_change_builds_all() {
-  candidate v0.6.0-rc.3 && builds_only eshop-api thirdparty-mock eshop-node-api eshop-sync-master \
-    && [ "$(jq -c '.copy' "$work/out")" = '[{"service":"eshop-web","image":"docker.io/pkhamdee/eshop-web@sha256:rc2-eshop-web"}]' ]
+  candidate v0.6.0-rc.3 && builds_only eshop-api eshop-sync-master \
+    && [ "$(jq -r '.copy | map(.service) | join(" ")' "$work/out")" = "eshop-web thirdparty-mock eshop-node-api" ] \
+    && copies eshop-web sha256:rc2-eshop-web && copies thirdparty-mock sha256:rc2-thirdparty-mock \
+    && copies eshop-node-api sha256:rc2-eshop-node-api
 }
 check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service built here, and copies the rest" \
   build_change_builds_all
@@ -1412,6 +1414,11 @@ jobs:
     steps:
       - run: true
 YAML
+for svc_repo in eshop-node-api thirdparty-mock; do # their CI: the same shape, their own lint job
+  mkdir -p "$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows"
+  sed "s/eshop-web/$svc_repo/g" "$FAKE_CONTENTS/pkhamdee/eshop-web/contents/.github/workflows/ci.yml" \
+    >"$FAKE_CONTENTS/pkhamdee/$svc_repo/contents/.github/workflows/ci.yml"
+done
 protect() { (cd "$root" && scripts/protect-main.sh "$@") >"$work/out" 2>&1; }
 # sent <METHOD path>: the JSON bodies printed under that request in a --dry-run's output, as a JSON array
 sent() { awk -v h="$1" '$0 == h { on = 1; next } /^[^ {}[\]]/ { on = 0 } on' "$work/out" | jq -s .; }
@@ -1421,9 +1428,7 @@ required_checks='[
   "SAST (Semgrep, fail on ERROR)",
   "dependency scan (Trivy, fail on critical)",
   "eshop-api (lint, test)",
-  "eshop-node-api (lint, test)",
-  "repo rules (manifests, workflows, scripts, e2e)",
-  "thirdparty-mock (lint, type-check)"
+  "repo rules (manifests, workflows, scripts, e2e)"
 ]'
 # The tag rulesets: v* tags never deleted, moved or force-pushed by anyone; created only by admins (repository role
 # 5) and maintainers (2). Separate, since a bypass actor bypasses every rule of its ruleset.
@@ -1558,10 +1563,12 @@ check "protect-main.sh applies each service repository's ruleset, leaves its pub
   service_repo_applied
 service_repo_missing_refused() {
   rm -f "$GH_STATE"/*; : >"$GH_LOG"
-  ! FAKE_CONTENTS="$work/no-contents" protect \
-    && grep -qF 'pkhamdee/eshop-web has no .github/workflows/ci.yml on main' "$work/out" && [ "$(writes)" = 0 ]
+  rm -rf "$work/some-contents" && cp -R "$FAKE_CONTENTS" "$work/some-contents" \
+    && rm -rf "$work/some-contents/pkhamdee/thirdparty-mock" || return 1
+  ! FAKE_CONTENTS="$work/some-contents" protect \
+    && grep -qF 'pkhamdee/thirdparty-mock has no .github/workflows/ci.yml on main' "$work/out" && [ "$(writes)" = 0 ]
 }
-check "protect-main.sh sends nothing at all while a service repository has no CI on GitHub yet" service_repo_missing_refused
+check "protect-main.sh sends nothing at all while any service repository has no CI on GitHub yet (the others ready)" service_repo_missing_refused
 
 # --- scripts/clone-all.sh (the service repositories beside this one) ---
 

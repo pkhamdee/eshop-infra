@@ -28,9 +28,10 @@
 # Image pipeline (ADR 0007): plan -> build (matrix) -> gate (temporary copy + gates) -> scan (matrix) -> push.
 # A failure anywhere before `push` means no image is pushed.
 #
-# Services in their own repository (ADR 0009; eshop-web so far) are built, gated and pushed there by the reusable
-# service-image.yml; .github/services.json names their `repository`, and this workflow never builds them. Releases
-# still take every service's image: candidates copy them by digest (scripts/candidate-images.sh).
+# Services in their own repository (ADR 0009: eshop-web, eshop-node-api, thirdparty-mock) are built, gated and
+# pushed there by the reusable service-image.yml; .github/services.json names their `repository`, and this workflow
+# never builds them. Releases still take every service's image: candidates copy them by digest
+# (scripts/candidate-images.sh).
 #
 # Adding a service: add a lint/test job below and to `plan.needs`, and an entry in
 # .github/services.json (build context, Dockerfile, source paths). Release builds pick it up automatically.
@@ -87,47 +88,6 @@ jobs:
       # must stay on an x86 runner (ubuntu-latest).
       - name: Test
         run: dotnet test --no-build -c Release
-
-  # Test equipment (no tests of its own, per the spec): lint and type-check only.
-  thirdparty-mock:
-    name: thirdparty-mock (lint, type-check)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: services/thirdparty-mock
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: services/thirdparty-mock/package-lock.json
-      - run: npm ci
-      - name: Lint
-        run: npm run lint
-      - name: Type-check
-        run: npm run typecheck
-
-
-  eshop-node-api:
-    name: eshop-node-api (lint, test)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: services/eshop-node-api
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: services/eshop-node-api/package-lock.json
-      - run: npm ci
-      - name: Lint and type-check
-        run: npm run lint
-      # Seam-3 tests: real HTTP against a temporary folder standing in for the SMB share.
-      - name: Test
-        run: npm test
 
   # Security gates (ADR 0007): scripts in scripts/gates run their tool from a pinned image, the same way locally
   # (docs/setup.md, "Developing"). They run on every PR, push and tag; the reports are kept as artifacts.
@@ -213,7 +173,7 @@ jobs:
   #     rebuilt when the push has no usable base (first push, force push), when this workflow or services.json
   #     changes, or on workflow_dispatch without `version`.
   plan:
-    needs: [eshop-api, thirdparty-mock, eshop-node-api, sast, deps]
+    needs: [eshop-api, sast, deps]
     if: >-
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
       || github.event_name == 'workflow_dispatch'
