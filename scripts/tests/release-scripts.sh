@@ -1607,6 +1607,35 @@ artifact_dirs_normalizes() {
 check "artifact-dirs.sh moves a single flat image artifact into image-<service> and leaves per-artifact folders alone" \
   artifact_dirs_normalizes
 
+# --- scripts/gates/tags-to-push.sh (service-image.yml's push: never overwrite a tag) ---
+
+tags_dir="$work/tags-to-push"
+tags_file() { mkdir -p "$tags_dir/$1" && printf '%s\n' "${@:2}" >"$tags_dir/$1/tags.txt"; }
+to_push() { "$root/scripts/gates/tags-to-push.sh" "$tags_dir"/*/tags.txt >"$work/out" 2>"$work/err"; }
+rm -rf "$REGISTRY/docker.io/pkhamdee/svc-a" "$REGISTRY/docker.io/pkhamdee/svc-b" "$REGISTRY/docker.io/pkhamdee/svc-c"
+put_image svc-a main-aaaaaaa-100 sha256:a-old && put_image svc-a main-aaaaaaa sha256:a-old
+put_image svc-b main-0000000-50 sha256:b-old
+tags_file svc-a docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100
+tags_file svc-b docker.io/pkhamdee/svc-b:main-bbbbbbb docker.io/pkhamdee/svc-b:main-bbbbbbb-200
+tags_file svc-c docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300
+pushes_only_new() {
+  to_push && [ "$(cat "$work/out")" = "docker.io/pkhamdee/svc-b:main-bbbbbbb
+docker.io/pkhamdee/svc-b:main-bbbbbbb-200
+docker.io/pkhamdee/svc-c:release-0.x-ccccccc-300" ] \
+    && grep -qF 'skipped docker.io/pkhamdee/svc-a:main-aaaaaaa docker.io/pkhamdee/svc-a:main-aaaaaaa-100' "$work/err"
+}
+check "tags-to-push.sh: a commit's image already pushed is skipped; new ones (and a repository not created yet) are pushed" \
+  pushes_only_new
+one_tag_existing_skips_image() {
+  rm -rf "$REGISTRY/docker.io/pkhamdee/svc-a" && put_image svc-a main-aaaaaaa-100 sha256:a-old
+  to_push && ! grep -q svc-a "$work/out" && grep -qF 'main-aaaaaaa-100 already exists' "$work/err"
+}
+check "tags-to-push.sh: when any tag of an image exists, none of its tags is pushed" one_tag_existing_skips_image
+unreadable_registry_fails() {
+  ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
+}
+check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 
 schema_check() { (cd "$root" && ENTERPRISE_SCHEMA_SOURCE="$1" scripts/check-enterprise-schema.sh) >"$work/out" 2>&1; }

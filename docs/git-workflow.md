@@ -183,7 +183,9 @@ A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tes
 - on a push to its `main`: the same pipeline as here: `build` → `gate` (the temporary copy, the new image beside the
   other services' newest `main-<sha>-<ts>` images, then Locust and ZAP) → `scan` → `push` as
   `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<ts>`, where `<sha>` is the service repository's commit
-  (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed;
+  (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed, and
+  a tag that already exists is never pushed again (`scripts/gates/tags-to-push.sh`): a second run of the same commit
+  leaves the image dev tested in place;
 - on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>-<ts>` (a patch's image, never deployed to
   dev; the next patch candidate takes it, [Patch release](#patch-release-also-hotfixes)).
 
