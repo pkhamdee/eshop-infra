@@ -125,6 +125,9 @@ case "$1" in
   digest) resolve "$2" ;;
   ls) [ -z "${FAKE_CRANE_LS_ERROR:-}" ] || { echo "GET https://index.docker.io/v2/: TOOMANYREQUESTS" >&2; exit 1; }
     [ -d "$REGISTRY/$2" ] || { echo "NAME_UNKNOWN: $2" >&2; exit 1; }; ls "$REGISTRY/$2" ;;
+  config) digest=$(resolve "$2") || exit 1 # labels: the revision in $REGISTRY/.revision/<digest>, when there is one
+    revision=$(cat "$REGISTRY/.revision/$digest" 2>/dev/null || true)
+    jq -n --arg r "$revision" 'if $r == "" then {config: {}} else {config: {Labels: {"org.opencontainers.image.revision": $r}}} end' ;;
   copy) digest=$(resolve "$2") || exit 1
     [ "${3%:*}" != "${FAKE_CRANE_FAIL_COPY:-}" ] || { echo "copy to $3 failed" >&2; exit 1; }
     mkdir -p "$REGISTRY/${3%:*}" && echo "$digest" >"$REGISTRY/${3%:*}/${3##*:}" ;;
@@ -407,6 +410,97 @@ check "check-release-tag.sh rejects a lightweight candidate" rejected v0.3.0-rc.
 check "check-release-tag.sh rejects a tag that is neither" rejected v0.3.0-beta.1 'not vX.Y.Z-rc.N'
 check "check-release-tag.sh rejects a candidate on no release/N.x branch" rejected v0.4.0-rc.1 'release/N.x'
 
+# --- scripts/candidate-images.sh (CI's plan job: copy each candidate image by digest, or build it at the tag) ---
+
+clone=$(fresh candidates)
+export REGISTRY="$work/candidates/registry"
+cand_services="eshop-api eshop-web thirdparty-mock eshop-node-api eshop-sync-master"
+put_image() { mkdir -p "$REGISTRY/docker.io/pkhamdee/$1" && echo "$3" >"$REGISTRY/docker.io/pkhamdee/$1/$2"; }
+dev_pins() { # dev_pins <tag> [service to leave out]: dev's and thirdparty's pins as Flux image automation writes them
+  local svc
+  mkdir -p "$clone/deploy/apps/dev" "$clone/deploy/thirdparty"
+  : >"$clone/deploy/apps/dev/kustomization.yaml"
+  : >"$clone/deploy/thirdparty/kustomization.yaml"
+  for svc in $cand_services; do
+    [ "$svc" != "${2:-}" ] || continue
+    if [ "$svc" = thirdparty-mock ]; then
+      printf "  - name: docker.io/pkhamdee/%s\n    newTag: %s # {\"\$imagepolicy\": \"thirdparty:%s:tag\"}\n" "$svc" "$1" "$svc" \
+        >>"$clone/deploy/thirdparty/kustomization.yaml"
+    else
+      printf "  - name: docker.io/pkhamdee/%s\n    newTag: %s # {\"\$imagepolicy\": \"eshop-dev:%s:tag\"}\n" "$svc" "$1" "$svc" \
+        >>"$clone/deploy/apps/dev/kustomization.yaml"
+    fi
+  done
+  git -C "$clone" add deploy && git -C "$clone" commit -qm "dev: images $1" && git -C "$clone" push -q origin HEAD:main
+}
+candidate() { (cd "$clone" && git fetch -q --tags origin && scripts/candidate-images.sh "$1") >"$work/out" 2>&1; }
+copies() { # copies <service> <digest>: the candidate copies <service> from that digest
+  jq -e --arg s "$1" --arg i "docker.io/pkhamdee/$1@$2" '.copy | any(.service == $s and .image == $i)' "$work/out" >/dev/null
+}
+builds_only() { [ "$(jq -r '.build | map(.service) | join(" ")' "$work/out")" = "$*" ]; }
+copies_all_from() { # copies_all_from <digest prefix>: builds nothing and copies every service from <prefix>-<service>
+  local svc
+  builds_only && for svc in $cand_services; do copies "$svc" "sha256:$1-$svc" || return 1; done
+}
+
+for svc in $cand_services; do put_image "$svc" main-aaaaaaa-100 "sha256:dev1-$svc"; done
+dev_pins main-aaaaaaa-100
+git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+git -C "$clone" tag -a v0.5.0-rc.1 -m "Release candidate 0.5.0-rc.1" && git -C "$clone" push -q origin refs/tags/v0.5.0-rc.1
+new_branch_copies_dev() { candidate v0.5.0-rc.1 && copies_all_from dev1 && grep -qF 'dev pins of main' "$work/out"; }
+check "candidate-images.sh: a candidate on a main commit (new release/N.x) copies every image dev's pins name" \
+  new_branch_copies_dev
+
+# main moves on; X.Y.0-rc.1 on the existing branch is release.sh's merge (main's tree, parents: branch head, main).
+for svc in $cand_services; do put_image "$svc" main-bbbbbbb-200 "sha256:dev2-$svc"; done
+dev_pins main-bbbbbbb-200
+main_commit=$(git -C "$clone" rev-parse HEAD)
+merge=$(git -C "$clone" commit-tree "$main_commit^{tree}" -p origin/release/0.x -p "$main_commit" -m "Merge main into release/0.x for v0.6.0-rc.1")
+git -C "$clone" push -q origin "$merge:refs/heads/release/0.x"
+git -C "$clone" tag -a v0.6.0-rc.1 -m "Release candidate 0.6.0-rc.1" "$merge" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.1
+merge_copies_dev() { candidate v0.6.0-rc.1 && copies_all_from dev2; }
+check "candidate-images.sh: release.sh's merge of main copies the images main's dev pins name (not the branch's)" \
+  merge_copies_dev
+
+# A fix on the branch head: only the changed service is built; the others come from the previous candidate.
+for svc in $cand_services; do put_image "$svc" 0.6.0-rc.1 "sha256:rc1-$svc"; done
+git -C "$clone" checkout -q -b fix origin/release/0.x
+mkdir -p "$clone/services/eshop-web" && echo fix >"$clone/services/eshop-web/fix.txt"
+git -C "$clone" add services && git -C "$clone" commit -qm "fix eshop-web" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+git -C "$clone" tag -a v0.6.0-rc.2 -m "Release candidate 0.6.0-rc.2" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.2
+fix_builds_changed() {
+  candidate v0.6.0-rc.2 && builds_only eshop-web && ! copies eshop-web "sha256:rc1-eshop-web" \
+    && copies eshop-api sha256:rc1-eshop-api && copies thirdparty-mock sha256:rc1-thirdparty-mock \
+    && copies eshop-node-api sha256:rc1-eshop-node-api && copies eshop-sync-master sha256:rc1-eshop-sync-master
+}
+check "candidate-images.sh: on a branch head, builds what changed since the previous tag and copies the rest from it" \
+  fix_builds_changed
+
+# A change to the build itself rebuilds every service.
+for svc in $cand_services; do put_image "$svc" 0.6.0-rc.2 "sha256:rc2-$svc"; done
+jq . "$clone/.github/services.json" >"$clone/.github/services.json.new" && echo >>"$clone/.github/services.json.new" \
+  && mv "$clone/.github/services.json.new" "$clone/.github/services.json"
+git -C "$clone" commit -qam "services.json touched" && git -C "$clone" push -q origin HEAD:refs/heads/release/0.x
+git -C "$clone" tag -a v0.6.0-rc.3 -m "Release candidate 0.6.0-rc.3" && git -C "$clone" push -q origin refs/tags/v0.6.0-rc.3
+build_change_builds_all() {
+  candidate v0.6.0-rc.3 && builds_only eshop-api eshop-web thirdparty-mock eshop-node-api eshop-sync-master \
+    && [ "$(jq '.copy | length' "$work/out")" = 0 ]
+}
+check "candidate-images.sh: a change to services.json or ci-release.yml on the branch builds every service" \
+  build_change_builds_all
+
+# What it can't resolve, it refuses: nothing untested is filled in.
+git -C "$clone" checkout -q main && git -C "$clone" pull -q --ff-only origin main
+dev_pins main-bbbbbbb-200 thirdparty-mock
+git -C "$clone" tag -a v0.7.0-rc.1 -m "Release candidate 0.7.0-rc.1" && git -C "$clone" push -q origin refs/tags/v0.7.0-rc.1
+missing_pin_refused() { ! candidate v0.7.0-rc.1 && grep -qF 'pins no image of thirdparty-mock' "$work/out"; }
+check "candidate-images.sh refuses when main pins no image of a service" missing_pin_refused
+dev_pins main-ccccccc-300
+git -C "$clone" tag -a v0.8.0-rc.1 -m "Release candidate 0.8.0-rc.1" && git -C "$clone" push -q origin refs/tags/v0.8.0-rc.1
+# shellcheck disable=SC2317 # run through check, which ShellCheck can't follow here
+missing_image_refused() { ! candidate v0.8.0-rc.1 && grep -qF 'eshop-api:main-ccccccc-300 is missing' "$work/out"; }
+check "candidate-images.sh refuses when a pinned image is missing from the registry" missing_image_refused
+
 # --- scripts/pin-release.sh (the pins in clusters/local) ---
 
 mkdir -p "$work/pins" && cp "$clusters"/*.yaml "$work/pins/"
@@ -514,6 +608,9 @@ sign_off_setup() {
   git -C "$clone" push -q origin HEAD:main
   export REGISTRY="$work/$1/registry"
   for svc in $services; do mkdir -p "$(dirname "$(image "$svc" x)")"; fake_digest "$svc" >"$(image "$svc" 0.3.0-rc.1)"; done
+  # Every image but thirdparty-mock's carries its source commit (CI's revision label).
+  mkdir -p "$REGISTRY/.revision"
+  for svc in $services; do [ "$svc" = thirdparty-mock ] || echo "rev-$svc" >"$REGISTRY/.revision/$(fake_digest "$svc")"; done
   qa_tested success
 }
 sign_off_pr() { (cd "$clone" && scripts/sign-off-pr.sh) >"$work/out" 2>&1; }
@@ -541,6 +638,8 @@ opens_sign_off_pr() {
     && [ "$(origin diff --name-only "$branch~1" "$branch")" = releases/0.3.0.md ] \
     && grep -qxF "Candidate: \`v0.3.0-rc.1\`" "$record" && grep -qF "$rc_commit" "$record" \
     && lists_images "$record" 0.3.0-rc.1 \
+    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`" "$record" \
+    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`$" "$record" \
     && grep -qF "$qa_run" "$record" && grep -qF "$qa_run/artifacts/99" "$record" && grep -qF 'Deployment 1 ' "$record" \
     && grep -qF 'gh pr create --repo pkhamdee/modernapp --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
     && grep -qF "$qa_run/artifacts/99" "$GH_STATE/pr-sign-off_0.3.0-rc.1" \
@@ -705,6 +804,7 @@ check "sign-off.sh refuses unless QA's latest Deployment of the candidate succee
 no_deployments
 qa_tested success
 
+# shellcheck disable=SC2317 # run through check, which ShellCheck can't follow here
 missing_image_refused() {
   mv "$(image eshop-sync-master 0.3.0-rc.1)" "$work/held"
   sign_off_refused 'candidate image docker.io/pkhamdee/eshop-sync-master:0.3.0-rc.1 is missing'

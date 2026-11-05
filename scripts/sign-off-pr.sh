@@ -25,8 +25,6 @@ set -euo pipefail
 . "$(dirname "$0")/lib/versions.sh"
 # shellcheck source=lib/repo.sh
 . "$(dirname "$0")/lib/repo.sh"
-# shellcheck source=lib/images.sh
-. "$(dirname "$0")/lib/images.sh"
 # shellcheck source=lib/qa.sh
 . "$(dirname "$0")/lib/qa.sh"
 
@@ -93,7 +91,11 @@ images=""
 for svc in $(jq -r '.[].service' .github/services.json); do
   digest=$(crane digest "$IMAGE_REGISTRY/$svc:$candidate") \
     || { echo "candidate image $IMAGE_REGISTRY/$svc:$candidate is missing" >&2; exit 1; }
-  images+="$IMAGE_REGISTRY/$svc:$candidate@$digest"$'\n'
+  # The commit the image was built from (CI's org.opencontainers.image.revision label): where a patch of this
+  # release branches from (ADR 0009). An image without the label is listed without it.
+  revision=$(crane config "$IMAGE_REGISTRY/$svc@$digest" 2>/dev/null \
+    | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null) || revision=""
+  images+="$IMAGE_REGISTRY/$svc:$candidate@$digest${revision:+ $revision}"$'\n'
 done
 read -r id created log_url < <(jq -r '"\(.id) \(.created_at) \(.log_url)"' <<<"$deployment")
 # The run's Playwright report: e2e.yml uploads it as artifact playwright-report-qa.
@@ -116,9 +118,11 @@ trap 'rm -f "$record" "$body"' EXIT
   echo
   echo "## Images"
   echo
-  echo "The candidate's, copied to \`$version\` by digest at sign-off, never rebuilt:"
+  echo "The candidate's, copied to \`$version\` by digest at sign-off, never rebuilt, each with the commit it was built from:"
   echo
-  image_list <<<"$images"
+  while read -r image revision; do
+    [ -z "$image" ] || echo "- \`$image\`${revision:+, built from \`$revision\`}"
+  done <<<"$images"
   echo
   echo "## QA"
   echo
