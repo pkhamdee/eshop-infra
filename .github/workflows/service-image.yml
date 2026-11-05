@@ -166,7 +166,10 @@ jobs:
           pattern: image-*
           path: ${{ runner.temp }}/images
       - name: Load the images just built
-        run: for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
+        # A single artifact downloads flat: scripts/gates/artifact-dirs.sh gives it its image-<service> folder.
+        run: |
+          scripts/gates/artifact-dirs.sh "$RUNNER_TEMP/images"
+          for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
       - name: Choose the copy's images
         env:
           REGISTRY: ${{ inputs.registry }}
@@ -246,12 +249,19 @@ jobs:
     runs-on: ubuntu-24.04-arm
     environment: publish
     steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.infra-repository }}
+          ref: ${{ inputs.infra-ref }}
       - uses: actions/download-artifact@v8
         with:
           pattern: image-*
           path: ${{ runner.temp }}/images
       - name: Load the images
-        run: for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
+        # A single artifact downloads flat: scripts/gates/artifact-dirs.sh gives it its image-<service> folder.
+        run: |
+          scripts/gates/artifact-dirs.sh "$RUNNER_TEMP/images"
+          for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
       - uses: docker/login-action@v4
         with:
           registry: docker.io
