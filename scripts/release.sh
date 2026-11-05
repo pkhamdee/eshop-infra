@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Cut a release candidate per docs/git-workflow.md: annotated tag vX.Y.Z-rc.N on release/<MAJOR>.x, pushed, CI run
-# confirmed. CI gates the candidate, pushes its X.Y.Z-rc.N images and opens the QA promotion PR.
+# confirmed. CI copies the images that already passed to X.Y.Z-rc.N by digest (scripts/candidate-images.sh,
+# ADR 0009): for a candidate bringing in main, the ones dev tested; on a branch head, the previous tag's, building
+# only what changed since. Then it opens the QA promotion PR.
 #
 #   scripts/release.sh 0.3.0-rc.1   # a new minor's first candidate: creates release/0.x from origin/main, or, when
 #                                   # release/0.x exists, first merges origin/main into it (below)
@@ -152,7 +154,20 @@ else
   echo "  commit  $(git log -1 --format='%h %s' "$commit")"
 fi
 if $new_branch; then echo "  branch  $branch (new, from origin/main)"; else echo "  branch  $branch"; fi
-read -r -p "Push? [y/N] " answer
+# Where CI takes the candidate's images from (scripts/candidate-images.sh decides it again from the pushed tag).
+if $new_branch || $merge; then
+  echo "  images  copied by digest from dev's pins at main $(git rev-parse --short "$main_commit") (what its smoke test passed)"
+else
+  previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$commit" 2>/dev/null || echo "none")
+  echo "  images  copied by digest from $previous's; services changed since are built at the tag"
+fi
+# No input at all (stdin closed, e.g. a command runner with no terminal) must say so: under set -e a failed read
+# would otherwise end the script silently.
+if ! read -r -p "Push? [y/N] " answer; then
+  echo >&2
+  echo "no answer to \"Push?\" (no input): run scripts/release.sh in a terminal to confirm; nothing was pushed" >&2
+  exit 1
+fi
 [ "$answer" = y ] || [ "$answer" = Y ] || { echo "aborted"; exit 1; }
 
 if $merge; then
