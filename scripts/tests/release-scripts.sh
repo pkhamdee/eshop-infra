@@ -204,9 +204,9 @@ recorded_off_main() {
   local id
   id=$(jq -n --arg env "$1" --arg ref "$2" '{ref: $ref, environment: $env, auto_merge: false, required_contexts: [],
         payload: {workflow_ref: "refs/heads/feature", run_url: "https://github.com/test/actions/runs/66"}}' \
-    | gh api repos/pkhamdee/modernapp/deployments --method POST --input - --jq .id)
+    | gh api repos/pkhamdee/eshop-infra/deployments --method POST --input - --jq .id)
   jq -n --arg state "$3" '{state: $state, log_url: "https://github.com/test/actions/runs/66"}' \
-    | gh api "repos/pkhamdee/modernapp/deployments/$id/statuses" --method POST --input - >/dev/null
+    | gh api "repos/pkhamdee/eshop-infra/deployments/$id/statuses" --method POST --input - >/dev/null
 }
 
 rc_on_new_series() {
@@ -656,7 +656,7 @@ opens_sign_off_pr() {
     && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`" "$record" \
     && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`$" "$record" \
     && grep -qF "$qa_run" "$record" && grep -qF "$qa_run/artifacts/99" "$record" && grep -qF 'Deployment 1 ' "$record" \
-    && grep -qF 'gh pr create --repo pkhamdee/modernapp --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
+    && grep -qF 'gh pr create --repo pkhamdee/eshop-infra --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
     && grep -qF "$qa_run/artifacts/99" "$GH_STATE/pr-sign-off_0.3.0-rc.1" \
     && grep -qF 'Sign-off PR: https://github.com/test/pull/1' "$work/out"
 }
@@ -708,7 +708,7 @@ closes_on_pin_move() {
   : >"$GH_LOG"
   sign_off_pr && [ -f "$GH_STATE/closed-pr-sign-off_0.3.0-rc.1" ] \
     && grep -qF 'eshop-qa is pinned to 0.3.0-rc.2 on main' "$GH_STATE/comment-sign-off_0.3.0-rc.1" \
-    && grep -qF 'gh pr close sign-off/0.3.0-rc.1 --repo pkhamdee/modernapp' "$GH_LOG" \
+    && grep -qF 'gh pr close sign-off/0.3.0-rc.1 --repo pkhamdee/eshop-infra' "$GH_LOG" \
     && ! grep -q '^gh pr create' "$GH_LOG"
 }
 check "sign-off-pr.sh closes another candidate's sign-off PR, with a comment, once QA's pin moves" closes_on_pin_move
@@ -768,10 +768,10 @@ FAKE_COMMIT_PULLS='[]' check "sign-off.sh refuses a record that no merged PR bro
   sign_off_refused "no merged pull request brought in $after"
 FAKE_PULL='{"number":5,"html_url":"https://github.com/test/pull/5","merged_by":{"login":"tester"}}' \
   check "sign-off.sh refuses a sign-off PR merged by someone who is not a maintainer (role write)" \
-  sign_off_refused "tester merged https://github.com/test/pull/5 but is not a maintainer of pkhamdee/modernapp (role: write)"
+  sign_off_refused "tester merged https://github.com/test/pull/5 but is not a maintainer of pkhamdee/eshop-infra (role: write)"
 FAKE_PULL='{"number":5,"html_url":"https://github.com/test/pull/5","merged_by":{"login":"stranger"}}' \
   check "sign-off.sh refuses when the merger's role can't be read" \
-  sign_off_refused "could not read stranger's role in pkhamdee/modernapp"
+  sign_off_refused "could not read stranger's role in pkhamdee/eshop-infra"
 
 qa_moved_refused() {
   pin_qa 0.3.0-rc.2
@@ -795,7 +795,7 @@ check "sign-off.sh refuses while apps-qa is suspended on main" qa_suspended_refu
 no_qa_deployment_refused() {
   no_deployments
   sign_off_refused "no Deployment of v0.3.0-rc.1 to qa since eshop-qa was pinned to it ($pinned_at)" \
-    && grep -qF 'gh api repos/pkhamdee/modernapp/deployments?environment=qa&ref=v0.3.0-rc.1' "$GH_LOG" || return 1
+    && grep -qF 'gh api repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=v0.3.0-rc.1' "$GH_LOG" || return 1
   FAKE_NOW=2026-10-29T23:00:00Z qa_tested success # before the pin change: an earlier deployment
   sign_off_refused "no Deployment of v0.3.0-rc.1 to qa since eshop-qa was pinned to it ($pinned_at)"
 }
@@ -872,7 +872,7 @@ signs_off() {
     && grep -qE '^crane copy docker.io/pkhamdee/eshop-api@sha256:[0-9a-f]+ docker.io/pkhamdee/eshop-api:0.3.0$' "$CRANE_LOG" \
     && lists_images "$release" 0.3.0 \
     && grep -qF "$qa_run" "$release" && grep -qF '@qa-lead' "$release" && grep -qF 'https://github.com/test/pull/5' "$release" \
-    && grep -qF 'gh release create v0.3.0 --repo pkhamdee/modernapp --verify-tag' "$GH_LOG" \
+    && grep -qF 'gh release create v0.3.0 --repo pkhamdee/eshop-infra --verify-tag' "$GH_LOG" \
     && [ "$(origin log -1 --format=%s refs/heads/promote/prod-0.3.0)" = "eshop-prod: deploy v0.3.0" ] \
     && [ "$(origin show refs/heads/promote/prod-0.3.0:clusters/local/prod-release.yaml | grep -c '"0.3.0" # release-pin: prod$')" -ge 2 ] \
     && lists_images "$pr" 0.3.0 && grep -qF "$qa_run" "$pr" && grep -qF '@qa-lead' "$pr" \
@@ -1392,7 +1392,7 @@ rm -rf "$GH_STATE/deployments"
 
 # --- scripts/protect-main.sh (main's ruleset and the release environment; applied by a maintainer) ---
 
-repo_api=repos/pkhamdee/modernapp
+repo_api=repos/pkhamdee/eshop-infra
 web_api=repos/pkhamdee/eshop-web
 # eshop-web's CI on its main, as GitHub serves it: a lint job, and the shared gates (service-image.yml) after it.
 export FAKE_CONTENTS="$work/contents"
@@ -1409,7 +1409,7 @@ jobs:
   image:
     name: image
     needs: [lint]
-    uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+    uses: pkhamdee/eshop-infra/.github/workflows/service-image.yml@main
     with:
       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
     secrets: inherit

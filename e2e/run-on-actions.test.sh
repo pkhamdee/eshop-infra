@@ -67,9 +67,9 @@ dispatches_to_the_cluster_runner_and_follows_the_run() {
   fresh; runs "42=E2E prod"
   run
   if [ "$status" -ne 0 ]; then fail "exit $status: $out"
-  elif ! called "gh workflow run e2e.yml --repo pkhamdee/modernapp --ref main -f environment=prod -f version="; then fail "no dispatch"
+  elif ! called "gh workflow run e2e.yml --repo pkhamdee/eshop-infra --ref main -f environment=prod -f version="; then fail "no dispatch"
   elif called "runner="; then fail "chose a runner; the workflow runs on eshop-e2e"
-  elif ! called "gh run watch 42 --repo pkhamdee/modernapp"; then fail "did not follow run 42"
+  elif ! called "gh run watch 42 --repo pkhamdee/eshop-infra"; then fail "did not follow run 42"
   else ok; fi
 }
 

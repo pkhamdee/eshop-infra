@@ -153,7 +153,7 @@ Every push to `main`, Flux's image-update commits included, starts the **E2E smo
 runner inside the cluster; nobody dispatches it. The run:
 
 1. records a GitHub **Deployment** of that commit to `dev`, in progress (`scripts/deployment.sh`; Code → Deployments,
-   or `gh api repos/pkhamdee/modernapp/deployments?environment=dev`);
+   or `gh api repos/pkhamdee/eshop-infra/deployments?environment=dev`);
 2. waits until `eshop-dev` serves the commit (`e2e/check-serving.sh --wait dev <commit>`: `apps-dev` applied
    `main@sha1:<commit>` and every Deployment rolled out from it), for up to 15 minutes, else fails as "not deployed";
 3. runs Playwright against `https://eshop.localhost`, retrying a failed test once (a pass on the retry passes, and the
@@ -172,7 +172,7 @@ eShop's services are moving into repositories of their own (ADR 0009): **`pkhamd
 (eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**, **`pkhamdee/eshop-node-api`** and
 **`pkhamdee/thirdparty-mock`**. This
 repository keeps everything that describes and releases the whole system, and the one issue tracker: a service
-repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/modernapp#N`. Clone them beside this one
+repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/eshop-infra#N`. Clone them beside this one
 with `scripts/clone-all.sh` (docs/setup.md, "Service repositories").
 
 A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tests, then calls this repository's
@@ -295,7 +295,7 @@ cluster serves it), `flux get kustomization apps-qa`, `kubectl -n eshop-qa get d
 **Merging the QA promotion PR starts QA's smoke test automatically**: the push to `main` changes the
 `# release-pin: qa` lines, so the E2E smoke test (`.github/workflows/e2e.yml`, run `E2E push <commit>`) tests
 `eshop-qa` at the newly pinned candidate instead of dev, as [Dev's smoke test](#devs-smoke-test) describes. It records
-a Deployment of **`vX.Y.Z-rc.N`** to `qa` (`gh api 'repos/pkhamdee/modernapp/deployments?environment=qa'`) that ends
+a Deployment of **`vX.Y.Z-rc.N`** to `qa` (`gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa'`) that ends
 success or failure; a success marks QA's previous successful Deployment inactive ("replaced by vX.Y.Z-rc.N"), so the
 active one is what QA runs. A push changing only pins doesn't test dev; a push moving both pins tests both
 environments.
@@ -344,8 +344,8 @@ An older one tested an earlier deployment: rc.1 → rc.2 → rc.1 needs a new te
 merge starts anyway.
 
 ```bash
-gh api 'repos/pkhamdee/modernapp/deployments?environment=qa&ref=vX.Y.Z-rc.N' --jq '.[] | "\(.id) \(.created_at)"'
-gh api repos/pkhamdee/modernapp/deployments/<id>/statuses --jq '.[0] | "\(.state) \(.description) \(.log_url)"'
+gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=vX.Y.Z-rc.N' --jq '.[] | "\(.id) \(.created_at)"'
+gh api repos/pkhamdee/eshop-infra/deployments/<id>/statuses --jq '.[0] | "\(.state) \(.description) \(.log_url)"'
 ```
 
 ### 5. Sign-off

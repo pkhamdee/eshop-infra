@@ -38,7 +38,7 @@ spec:
     remediation:
       retries: 3
   values:
-    githubConfigUrl: https://github.com/pkhamdee/modernapp
+    githubConfigUrl: https://github.com/pkhamdee/eshop-infra
     githubConfigSecret: eshop-e2e-github
     runnerScaleSetName: eshop-e2e
     minRunners: 0

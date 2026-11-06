@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs live in GitHub Issues for pkhamdee/modernapp (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+Issues and specs live in GitHub Issues for pkhamdee/eshop-infra (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

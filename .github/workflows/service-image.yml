@@ -4,7 +4,7 @@
 #   image:
 #     name: image
 #     needs: [lint]
-#     uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+#     uses: pkhamdee/eshop-infra/.github/workflows/service-image.yml@main
 #     with:
 #       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
 #     secrets: inherit   # the only way this workflow sees the caller's `publish` environment secrets; accept
@@ -43,7 +43,7 @@ on:
         description: "The repository holding the gate scripts (this one)"
         required: false
         type: string
-        default: pkhamdee/modernapp
+        default: pkhamdee/eshop-infra
       infra-ref:
         description: "Its ref"
         required: false

@@ -72,7 +72,7 @@ grep '^AGE-SECRET-KEY' ~/.config/sops/age/keys.txt |
 ```sh
 export GITHUB_TOKEN=$(gh auth token)
 flux bootstrap github \
-  --owner=pkhamdee --repository=modernapp --branch=main --personal \
+  --owner=pkhamdee --repository=eshop-infra --branch=main --personal \
   --path=clusters/local \
   --components-extra=image-reflector-controller,image-automation-controller \
   --read-write-key
@@ -132,7 +132,7 @@ access tokens), then give it to CI. `gh secret set` prompts for the token, so it
 
 ```sh
 gh variable set DOCKERHUB_USERNAME --body pkhamdee
-gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/modernapp   # since #78 a secret of environment release
+gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/eshop-infra   # since #78 a secret of environment release
 ```
 
 (Since #78 the token is a secret of the `release` environment, not of the repository: [Release
@@ -390,10 +390,10 @@ recording a deployment. **Human**, once, in this order:
 4. **The secret and the variables** (`gh secret set` prompts for the value, so it never lands in shell history):
 
 ```sh
-gh secret set SMTP_PASSWORD --env smoke-test --repo pkhamdee/modernapp           # the app password (step 2)
-gh variable set SMTP_USERNAME --body eshop.smoke.test@gmail.com --repo pkhamdee/modernapp   # the sending account
-gh variable set NOTIFY_EMAIL --body you@example.com --repo pkhamdee/modernapp    # who gets them (comma-separated)
-gh secret list --env smoke-test --repo pkhamdee/modernapp && gh variable list --repo pkhamdee/modernapp
+gh secret set SMTP_PASSWORD --env smoke-test --repo pkhamdee/eshop-infra           # the app password (step 2)
+gh variable set SMTP_USERNAME --body eshop.smoke.test@gmail.com --repo pkhamdee/eshop-infra   # the sending account
+gh variable set NOTIFY_EMAIL --body you@example.com --repo pkhamdee/eshop-infra    # who gets them (comma-separated)
+gh secret list --env smoke-test --repo pkhamdee/eshop-infra && gh variable list --repo pkhamdee/eshop-infra
 ```
 
 Until all three are set, the `notify` job fails on every run, naming what is missing; the smoke test's own job and
@@ -422,7 +422,7 @@ so the apps deploy as usual meanwhile.
 
 1. github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
    Name `modernapp eshop-e2e runner`; resource owner `pkhamdee`; expiration 90 days (or what you accept);
-   **Repository access**: Only select repositories → `pkhamdee/modernapp`; **Repository permissions**:
+   **Repository access**: Only select repositories → `pkhamdee/eshop-infra`; **Repository permissions**:
    Administration **Read and write** (Metadata read-only is added by itself). Nothing else.
 2. Put it in a SOPS Secret without it ever touching the disk in plain text: write the file with a placeholder,
    encrypt it, then replace the placeholder in `sops`' editor:
@@ -430,7 +430,7 @@ so the apps deploy as usual meanwhile.
    ```sh
    cat >deploy/infrastructure/runners/eshop-e2e-github.sops.yaml <<'EOF'
    # GitHub token of the eshop-e2e runner scale set (docs/setup.md, "Cluster runner"): a fine-grained token for
-   # pkhamdee/modernapp only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+   # pkhamdee/eshop-infra only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
    apiVersion: v1
    kind: Secret
    metadata:
@@ -452,7 +452,7 @@ so the apps deploy as usual meanwhile.
    on it: `e2e/run-on-actions.sh prod X.Y.Z` (the release prod serves) passes.
 5. Keep Settings → Actions → General → "Approval for running fork pull request workflows from contributors" at
    **Require approval for all external contributors** (it is set; check with
-   `gh api repos/pkhamdee/modernapp/actions/permissions/fork-pr-contributor-approval`, `all_external_contributors`).
+   `gh api repos/pkhamdee/eshop-infra/actions/permissions/fork-pr-contributor-approval`, `all_external_contributors`).
    The repository is public, and on a personal account a runner can't be limited to chosen workflows: a fork PR
    whose workflow says `runs-on: eshop-e2e` would run in the cluster. Approve a fork's workflow run only after
    reading what it runs.
@@ -496,8 +496,8 @@ flux get kustomization apps-qa                        # Applied revision: v0.3.0
 kubectl -n eshop-qa get deploy -o wide               # images :0.3.0-rc.1, all READY
 
 #    That merge also starts QA's smoke test (e2e.yml, run "E2E push <commit>"): a Deployment of v0.3.0-rc.1 to qa
-gh api 'repos/pkhamdee/modernapp/deployments?environment=qa&ref=v0.3.0-rc.1' --jq '.[0].id'
-gh api "repos/pkhamdee/modernapp/deployments/<id>/statuses" --jq '.[0].state'   # success
+gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=v0.3.0-rc.1' --jq '.[0].id'
+gh api "repos/pkhamdee/eshop-infra/deployments/<id>/statuses" --jq '.[0].state'   # success
 #    (to test it again: e2e/run-on-actions.sh qa 0.3.0-rc.1)
 
 # 4. Its pass opens the sign-off PR "Sign off v0.3.0-rc.1", adding releases/0.3.0.md (candidate, digests, the run and
@@ -542,7 +542,7 @@ you as the actor (the commits themselves are authored by `github-actions[bot]`).
 
 1. github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
 2. Name `modernapp PROMOTION_TOKEN`; resource owner `pkhamdee`; **expiration** 90 days (or what you accept; a calendar
-   reminder a week before helps); **Repository access**: Only select repositories → `pkhamdee/modernapp`.
+   reminder a week before helps); **Repository access**: Only select repositories → `pkhamdee/eshop-infra`.
 3. **Repository permissions**: Contents **Read and write**, Pull requests **Read and write** (Metadata read-only is
    added by itself). Nothing else; add Workflows read and write only if a promotion ever has to change
    `.github/workflows/`.
@@ -550,7 +550,7 @@ you as the actor (the commits themselves are authored by `github-actions[bot]`).
    created by `scripts/protect-main.sh`).
 
 **Renewal**: regenerate the token on the same page (or create a new one with the same settings) and run the same
-`gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/modernapp`. An expired or revoked token makes the promotion job fail at `git push` or `gh pr create` with an
+`gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/eshop-infra`. An expired or revoked token makes the promotion job fail at `git push` or `gh pr create` with an
 authentication error; the images are already pushed, so re-run just that job once the secret is updated. The
 token must belong to a repository admin or maintainer: only they may create `v*` tags (ruleset "Create release
 tags"; git-workflow.md, "Tags"). It pushes only `promote/*` and `sign-off/*` branches and `vX.Y.Z` tags, never
@@ -593,13 +593,13 @@ The two release secrets belong to the `release` environment, so only `main` and 
 created the environment (`gh secret set` prompts for each value, so it never lands in shell history):
 
 ```sh
-gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/modernapp   # a Docker Hub access token, Read & Write
-gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/modernapp   # the fine-grained token (Promotion token)
-gh secret list --env release --repo pkhamdee/modernapp                  # both listed
+gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/eshop-infra   # a Docker Hub access token, Read & Write
+gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/eshop-infra   # the fine-grained token (Promotion token)
+gh secret list --env release --repo pkhamdee/eshop-infra                  # both listed
 # then remove the repository-level copies, which any workflow on any branch could read:
-gh secret delete DOCKERHUB_TOKEN --repo pkhamdee/modernapp
-gh secret delete PROMOTION_TOKEN --repo pkhamdee/modernapp              # if it was ever set there
-gh secret list --repo pkhamdee/modernapp                                # neither listed
+gh secret delete DOCKERHUB_TOKEN --repo pkhamdee/eshop-infra
+gh secret delete PROMOTION_TOKEN --repo pkhamdee/eshop-infra              # if it was ever set there
+gh secret list --repo pkhamdee/eshop-infra                                # neither listed
 ```
 
 The variable `DOCKERHUB_USERNAME` stays a repository variable (not secret). An environment secret overrides a
@@ -611,7 +611,7 @@ pushes only from `main` (from another branch `plan` skips the push, with a notic
 
 eShop's services each have their own repository (ADR 0009, #101), cloned beside this one:
 `scripts/clone-all.sh` clones every one that exists into this repository's parent folder (here
-`/Users/pongsak/repos/modernapp/`), so their agent docs find `../modernapp` and the temporary copy builds them from
+`/Users/pongsak/repos/modernapp/`), so their agent docs find `../eshop-infra` and the temporary copy builds them from
 `../<service>`: **`pkhamdee/eshop-api`** (eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**,
 **`pkhamdee/eshop-node-api`** and **`pkhamdee/thirdparty-mock`**.
 `.github/services.json` names each one's `repository`; this repository's CI never builds them. Each service
@@ -625,7 +625,7 @@ the PR that removes it here). Shown for `svc=eshop-node-api`:
 svc=eshop-node-api
 # 1. Create the repository, empty and public (issues are turned off in step 2), and push the prepared clone. Its
 #    first CI run passes the gates but fails at the push's Docker Hub login until step 3: nothing is pushed.
-gh repo create "pkhamdee/$svc" --public --description "eShop's $svc (see pkhamdee/modernapp)"
+gh repo create "pkhamdee/$svc" --public --description "eShop's $svc (see pkhamdee/eshop-infra)"
 git -C "../$svc" remote add origin "https://github.com/pkhamdee/$svc.git"
 git -C "../$svc" push -u origin main
 # 2. Protection, from the branch of the PR that moves the service (its ci-release.yml no longer has the service's
