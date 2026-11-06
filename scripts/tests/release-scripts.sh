@@ -15,8 +15,9 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
-#   scripts/gates/tags-to-push.sh, attach-sbom.sh   the image push jobs: never an existing tag; each image's SBOM
-# `gh`, `crane`, `oras` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
+#   scripts/gates/tags-to-push.sh, attach-sbom.sh, sign-images.sh   the image push jobs: never an existing tag;
+#                                  each image's SBOM; signing only what was pushed
+# `gh`, `crane`, `oras`, `cosign` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
 
@@ -180,8 +181,19 @@ case "$1" in
   *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
 esac
 ORAS
-chmod +x "$work/bin/gh" "$work/bin/crane" "$work/bin/oras"
+# Fake cosign: `sign` logs its call; FAKE_COSIGN_FAIL=<ref>: signing that ref fails.
+cat >"$work/bin/cosign" <<'COSIGN'
+#!/usr/bin/env bash
+echo "cosign $*" >>"$COSIGN_LOG"
+ref=${*: -1}
+case "$1" in
+  sign) [ "$ref" != "${FAKE_COSIGN_FAIL:-}" ] || { echo "Error: signing $ref: fulcio unavailable" >&2; exit 1; } ;;
+  *) echo "fake cosign: unexpected $*" >&2; exit 1 ;;
+esac
+COSIGN
+chmod +x "$work/bin/gh" "$work/bin/crane" "$work/bin/oras" "$work/bin/cosign"
 export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log" ORAS_LOG="$work/oras.log"
+export COSIGN_LOG="$work/cosign.log"
 
 # This checkout's clusters/local with the pins as they were before QA's first release candidate (prod on 0.2.0,
 # apps-qa suspended), whatever main pins now: promotions change the live pins, and the tests must not change with them.
@@ -1853,6 +1865,34 @@ missing_image_fails() {
     && ! grep -q 'oras attach' "$ORAS_LOG"
 }
 check "attach-sbom.sh fails when the tag doesn't exist" missing_image_fails
+
+# --- scripts/gates/sign-images.sh (service-image.yml's push job: sign only the digests this run pushed, ADR 0011) ---
+
+pushed="$work/sign-images/pushed.txt"
+mkdir -p "$work/sign-images"
+da=sha256:$(printf 'a%.0s' $(seq 64)) db=sha256:$(printf 'b%.0s' $(seq 64))
+sign() { : >"$COSIGN_LOG"; "$root/scripts/gates/sign-images.sh" "$pushed" >"$work/out" 2>&1; }
+signs_each_digest_once() {
+  printf '%s\n' "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  sign && [ "$(cat "$COSIGN_LOG")" = "cosign sign --yes docker.io/pkhamdee/svc-a@$da
+cosign sign --yes docker.io/pkhamdee/svc-b@$db" ]
+}
+check "sign-images.sh signs each pushed digest once (an image's two tags share it), by digest" signs_each_digest_once
+nothing_pushed_signs_nothing() { : >"$pushed"; sign && [ ! -s "$COSIGN_LOG" ] && grep -qF 'nothing to sign' "$work/out"; }
+check "sign-images.sh signs nothing when the run pushed nothing (a re-run never signs an existing image)" \
+  nothing_pushed_signs_nothing
+tag_refused() {
+  printf '%s\n' docker.io/pkhamdee/svc-a:main-aaaaaaa-100 "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  ! sign && ! grep -qF 'svc-a' "$COSIGN_LOG" && grep -qF "svc-b@$db" "$COSIGN_LOG" \
+    && grep -qF 'not a digest reference, not signed: docker.io/pkhamdee/svc-a:main-aaaaaaa-100' "$work/out"
+}
+check "sign-images.sh never signs a tag (it can move), signs the rest, and fails" tag_refused
+failure_tries_all() {
+  printf '%s\n' "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  ! FAKE_COSIGN_FAIL="docker.io/pkhamdee/svc-a@$da" sign && grep -qF "svc-b@$db" "$COSIGN_LOG" \
+    && grep -qF 'the fix is a new commit' "$work/out"
+}
+check "sign-images.sh tries every image when one fails, then fails saying a new commit is the fix" failure_tries_all
 
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 

@@ -187,7 +187,10 @@ A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tes
   a tag that already exists is never pushed again (`scripts/gates/tags-to-push.sh`): a second run of the same commit
   leaves the image dev tested in place. Each pushed digest then gets its CycloneDX SBOM as a registry referrer
   (`scripts/gates/attach-sbom.sh`, [ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)); a second run
-  only fills in one that is missing;
+  only fills in one that is missing. Each digest the run pushed is also **signed**, keyless, with the run's GitHub
+  identity (`scripts/gates/sign-images.sh`, [ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md));
+  a second run signs nothing, so an image whose signing failed stays unsigned and the fix is a new commit. The
+  calling `image` job grants `permissions: {contents: read, id-token: write}`;
 - on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>-<ts>` (a patch's image, never deployed to
   dev; the next patch candidate takes it, [Patch release](#patch-release-also-hotfixes)).
 
