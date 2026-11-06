@@ -185,7 +185,9 @@ A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tes
   `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<ts>`, where `<sha>` is the service repository's commit
   (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed, and
   a tag that already exists is never pushed again (`scripts/gates/tags-to-push.sh`): a second run of the same commit
-  leaves the image dev tested in place;
+  leaves the image dev tested in place. Each pushed digest then gets its CycloneDX SBOM as a registry referrer
+  (`scripts/gates/attach-sbom.sh`, [ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)); a second run
+  only fills in one that is missing;
 - on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>-<ts>` (a patch's image, never deployed to
   dev; the next patch candidate takes it, [Patch release](#patch-release-also-hotfixes)).
 
@@ -258,7 +260,8 @@ already passed rather than rebuilding it (`scripts/candidate-images.sh`,
 - **A candidate that brings in `main`** (a new `release/N.x`, or the merge above): every image is the one that `main`
   commit's dev pins name (`deploy/apps/dev`, and `deploy/thirdparty` for thirdparty-mock), which is what dev's smoke
   test passed. Nothing is built, so the gates and the image scan don't run again: each image passed them when it was
-  built on `main`. QA gets the exact bytes dev tested.
+  built on `main`. QA gets the exact bytes dev tested, and the SBOM attached to that digest when it was pushed
+  ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)).
 - **Any other candidate** (the branch head: a patch): each service takes the newest patch image its repository
   built on `release/N.x`, `release-N.x-<sha>-<ts>`, made after the previous `v*` tag on the branch (`<ts>`, its
   commit's time, later than the tag's); a service with none is copied from that previous version's image. An older
@@ -506,6 +509,7 @@ git log v0.2.0..v0.3.0 --oneline           # what changed between two releases
 git show v0.3.0                            # tag message ("Signed off from v0.3.0-rc.N by @<merger>, merging <PR>")
 git cherry -v origin/main origin/release/0.x   # release-branch commits not on main ("+")
 gh release view v0.3.0                     # images with digests, QA Deployment and run, who signed off
+oras discover --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/eshop-api:0.3.0   # an image's SBOM (ADR 0010)
 git log --oneline -- releases/             # every sign-off record (releases/X.Y.Z.md: candidate, digests, evidence)
 git log --oneline -- clusters/local/prod-release.yaml   # every prod promotion and rollback
 ```

@@ -14,7 +14,8 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
-# `gh`, `crane` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
+#   scripts/gates/tags-to-push.sh, attach-sbom.sh   the image push jobs: never an existing tag; each image's SBOM
+# `gh`, `crane`, `oras` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
 
@@ -1635,6 +1636,78 @@ unreadable_registry_fails() {
   ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
 }
 check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
+# --- scripts/gates/attach-sbom.sh (the push jobs: each pushed image's SBOM as a referrer of its digest, ADR 0010) ---
+
+# Fake oras: a digest's referrers are the files in $REGISTRY/.referrers/<digest>/ (named by the attached file's
+# title). FAKE_ORAS_DISCOVER_ERROR=1: discover fails; FAKE_ORAS_ATTACH_ERROR=1: attach fails.
+cat >"$work/bin/oras" <<'ORAS'
+#!/usr/bin/env bash
+echo "oras $*" >>"$ORAS_LOG"
+ref=${*: -1}
+case "$1" in
+  discover) [ -z "${FAKE_ORAS_DISCOVER_ERROR:-}" ] || { echo "Error: TOOMANYREQUESTS" >&2; exit 1; }
+    dir="$REGISTRY/.referrers/${ref#*@}"
+    { [ -d "$dir" ] && ls "$dir"; true; } | jq -R . | jq -s '{referrers: map({annotations: {"org.opencontainers.image.title": .}})}' ;;
+  attach) [ -z "${FAKE_ORAS_ATTACH_ERROR:-}" ] || { echo "Error: denied" >&2; exit 1; }
+    subject=${*: -2:1} file=${ref%:*}
+    [ -f "$file" ] || { echo "Error: no file $file" >&2; exit 1; }
+    mkdir -p "$REGISTRY/.referrers/${subject#*@}" && cp "$file" "$REGISTRY/.referrers/${subject#*@}/$file" ;;
+  *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
+esac
+ORAS
+chmod +x "$work/bin/oras"
+export ORAS_LOG="$work/oras.log"
+export REGISTRY="$work/attach-sbom/registry"
+sbom_dir="$work/attach-sbom/sbom"
+mkdir -p "$sbom_dir" && echo '{"bomFormat":"CycloneDX","from":"this run"}' >"$sbom_dir/svc-a.cdx.json"
+# The generator for an earlier build: records its argument, writes <repository>.cdx.json as sbom.sh does.
+cat >"$work/attach-sbom/generator" <<'GEN'
+#!/usr/bin/env bash
+echo "$1" >>"$GENERATOR_LOG"; repository=${1%@*}
+echo '{"bomFormat":"CycloneDX","from":"registry"}' >"$REPORT_DIR/${repository##*/}.cdx.json"
+GEN
+chmod +x "$work/attach-sbom/generator"
+export SBOM_GENERATOR="$work/attach-sbom/generator" GENERATOR_LOG="$work/attach-sbom/generator.log"
+attach() { : >"$ORAS_LOG"; : >"$GENERATOR_LOG"; "$root/scripts/gates/attach-sbom.sh" "$@" "$sbom_dir/svc-a.cdx.json" >"$work/out" 2>&1; }
+referrer() { cat "$REGISTRY/.referrers/$1/svc-a.cdx.json" 2>/dev/null; }
+put_image svc-a main-aaaaaaa-100 sha256:a1
+attaches_to_digest() {
+  attach docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && grep -qF '"this run"' <(referrer sha256:a1) \
+    && grep -qF 'oras attach --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/svc-a@sha256:a1 svc-a.cdx.json:application/vnd.cyclonedx+json' "$ORAS_LOG"
+}
+check "attach-sbom.sh attaches the SBOM to the digest the tag names, titled by its file name" attaches_to_digest
+keeps_existing() {
+  echo '{"bomFormat":"CycloneDX","from":"first run"}' >"$REGISTRY/.referrers/sha256:a1/svc-a.cdx.json"
+  attach docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && ! grep -q 'oras attach' "$ORAS_LOG" \
+    && grep -qF '"first run"' <(referrer sha256:a1) && grep -qF 'already has an SBOM: kept' "$work/out"
+}
+check "attach-sbom.sh never replaces an SBOM the digest already has" keeps_existing
+put_image svc-a main-bbbbbbb-200 sha256:b1
+earlier_build_regenerates() {
+  attach --earlier-build docker.io/pkhamdee/svc-a:main-bbbbbbb-200 \
+    && [ "$(cat "$GENERATOR_LOG")" = docker.io/pkhamdee/svc-a@sha256:b1 ] && grep -qF '"registry"' <(referrer sha256:b1)
+}
+check "attach-sbom.sh --earlier-build makes the SBOM from the registry digest, not from this run's rebuild" \
+  earlier_build_regenerates
+earlier_build_kept() {
+  attach --earlier-build docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && [ ! -s "$GENERATOR_LOG" ] \
+    && ! grep -q 'oras attach' "$ORAS_LOG"
+}
+check "attach-sbom.sh --earlier-build keeps an earlier build's SBOM without making another" earlier_build_kept
+put_image svc-a main-ccccccc-300 sha256:c1
+unknown_referrers_fail() {
+  ! FAKE_ORAS_DISCOVER_ERROR=1 attach docker.io/pkhamdee/svc-a:main-ccccccc-300 \
+    && grep -qF "can't tell whether it has an SBOM" "$work/out" && [ -z "$(referrer sha256:c1)" ]
+}
+check "attach-sbom.sh fails when the referrers can't be read (unknown is not absent)" unknown_referrers_fail
+attach_failure_fails() { ! FAKE_ORAS_ATTACH_ERROR=1 attach docker.io/pkhamdee/svc-a:main-ccccccc-300; }
+check "attach-sbom.sh fails when the attach fails" attach_failure_fails
+missing_image_fails() {
+  ! attach docker.io/pkhamdee/svc-a:main-0000000-1 && grep -qF 'could not read the digest' "$work/out" \
+    && ! grep -q 'oras attach' "$ORAS_LOG"
+}
+check "attach-sbom.sh fails when the tag doesn't exist" missing_image_fails
 
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 

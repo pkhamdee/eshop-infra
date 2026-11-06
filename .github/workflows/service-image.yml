@@ -14,13 +14,15 @@
 #                        "image / dependency scan …"; scripts/protect-main.sh requires them)
 #   - push to main (or workflow_dispatch on main: a rebuild)
 #                     -> also build each image for arm64, start the temporary copy with it beside the other
-#                        services' newest main images, ZAP and Locust against it, Trivy, then push
+#                        services' newest main images, ZAP and Locust against it, Trivy and an SBOM, then push
 #                        <registry>/<service>:main-<sha> and :main-<sha>-<commit-ts> (Flux deploys the newest to dev)
 #   - push to release/N.x -> the same, pushed as <registry>/<service>:release-N.x-<sha>-<commit-ts> (a patch's
 #                        image; never deployed to dev, swapped into the next patch candidate)
 # Same pipeline as ci-release.yml (ADR 0007): build -> gate -> scan -> push, and a failure anywhere before `push`
 # means no image is pushed. Every image carries the org.opencontainers.image.revision label: the calling
 # repository's commit, which releases/X.Y.Z.md records (scripts/sign-off-pr.sh).
+# Every pushed image's digest carries its CycloneDX SBOM as a registry referrer (ADR 0010; scripts/gates/sbom.sh,
+# scripts/gates/attach-sbom.sh), which its candidate and release tags share: they are copies by digest.
 #
 # The gate scripts come from this repository (inputs infra-repository and infra-ref). The push job uses the calling
 # repository's environment `publish` (deployable from main and release/* only, scripts/protect-main.sh), whose
@@ -242,10 +244,21 @@ jobs:
           name: image-scan-report-${{ matrix.service }}
           path: reports/image-scan/
           if-no-files-found: ignore
+      # A record, not a gate (ADR 0010): failing to write it fails the job, so no image is pushed without one.
+      - name: SBOM (CycloneDX)
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: scripts/gates/sbom.sh "$RUNNER_TEMP/image-$SERVICE/image.tar"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: sbom-${{ matrix.service }}
+          path: reports/sbom/
+          if-no-files-found: ignore
 
   # Only when every build, the temporary copy and its gates, and every scan passed (needs: a skipped or failed job
   # skips this one). A tag that already exists is never pushed again (scripts/gates/tags-to-push.sh). Environment `publish` deploys only from main and release/*, so its Docker Hub token is out of
-  # reach of a run from any other branch.
+  # reach of a run from any other branch. Then each image's SBOM is attached to its digest (ADR 0010).
   push:
     name: push images
     needs: [scan]
@@ -282,3 +295,28 @@ jobs:
             echo "::notice::Every image of this commit is already pushed: nothing to push"
           fi
           while read -r tag; do docker push "$tag"; done < "$RUNNER_TEMP/to-push.txt"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sbom-*
+          path: ${{ runner.temp }}/sbom
+          merge-multiple: true
+      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
+        with:
+          version: 1.3.4
+      # Every image, pushed now or by an earlier run of this commit: an image without an SBOM gets one, one that has
+      # an SBOM keeps it. A failure here leaves the image pushed and fails the run; a re-run fills the SBOM in.
+      - name: Attach SBOMs
+        run: |
+          failed=()
+          for tags in "$RUNNER_TEMP"/images/image-*/tags.txt; do
+            service=$(basename "$(dirname "$tags")")
+            service=${service#image-}
+            image=$(head -n 1 "$tags")
+            earlier=()
+            grep -qxF "$image" "$RUNNER_TEMP/to-push.txt" || earlier=(--earlier-build)
+            scripts/gates/attach-sbom.sh "${earlier[@]}" "$image" "$RUNNER_TEMP/sbom/$service.cdx.json" || failed+=("$service")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::No SBOM attached for ${failed[*]}: the images are pushed; re-run this workflow to attach them"
+            exit 1
+          fi
