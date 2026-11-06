@@ -12,4 +12,4 @@ resources:
 # Tags are written by Flux image automation (image-automation.yaml); do not edit by hand.
 images:
   - name: docker.io/pkhamdee/thirdparty-mock
-    newTag: main-25ba51b-1793873265 # {"$imagepolicy": "thirdparty:thirdparty-mock:tag"}
+    newTag: main-4c51c51-1793927388 # {"$imagepolicy": "thirdparty:thirdparty-mock:tag"}
