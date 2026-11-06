@@ -51,7 +51,7 @@ metadata:
   namespace: flux-system
 spec:
   interval: 1m
-  url: ssh://git@github.com/pkhamdee/modernapp
+  url: ssh://git@github.com/pkhamdee/eshop-infra
   secretRef:
     name: flux-system
   ref:

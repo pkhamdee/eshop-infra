@@ -4,7 +4,7 @@
 #
 #   REPO             the GitHub repository, owner/name
 #   IMAGE_REGISTRY   the registry and namespace of the eShop images: $IMAGE_REGISTRY/<service>:<tag>
-REPO=${REPO:-pkhamdee/modernapp}
+REPO=${REPO:-pkhamdee/eshop-infra}
 IMAGE_REGISTRY=${IMAGE_REGISTRY:-docker.io/pkhamdee}
 
 # gh_read <gh args...>: gh for reading the repository, with SIGN_OFF_READ_TOKEN when set (a workflow's own token may

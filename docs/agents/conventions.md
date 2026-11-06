@@ -31,7 +31,7 @@ terms in `GLOSSARY.md`; decisions in `docs/adr/`. This file points there rather 
   (`scripts/clone-all.sh`): `../eshop-api` (eshop-api and eshop-sync-master, .NET; Testcontainers settings and the
   .NET rules are in its `docs/conventions.md`), `../eshop-web`, `../eshop-node-api`, `../thirdparty-mock`. Each
   one's conventions are in its `docs/conventions.md` and its `CLAUDE.md`; work on a service there, in a branch and
-  PR of its repository, referencing issues as `pkhamdee/modernapp#N`.
+  PR of its repository, referencing issues as `pkhamdee/eshop-infra#N`.
 - What it builds is decided there (its `.github/workflows/ci.yml`); the gates it runs are this repository's
   `.github/workflows/service-image.yml` and `scripts/gates/`, so a gate change here applies to every service
   repository at its next run. Keep the reusable workflow's PR job names stable: they are the service repositories'
