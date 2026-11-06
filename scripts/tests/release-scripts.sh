@@ -5,7 +5,7 @@
 #   scripts/promotion-pr.sh        the promotion PR's branch, pin commit and body
 #   scripts/sign-off-pr.sh         the sign-off PR: opened on QA's pass, closed when stale
 #   scripts/gate-reports.sh        each candidate image's CI run and its Locust and ZAP reports
-#   scripts/sign-off.sh            the merged sign-off PR: its refusals, the release, re-runs
+#   scripts/sign-off.sh            the merged sign-off PR: its refusals, the release (its SBOMs), re-runs
 #   scripts/check-new-images.sh    CI's push job: a version's images are never overwritten
 #   scripts/smoke-targets.sh       the smoke test's targets: what a push to main (promotions and rollbacks
 #                                  included), or a dispatch, tests where
@@ -48,7 +48,7 @@ export GITHUB_REF=refs/heads/main GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1
 #   api .../collaborators/<login>/permission: {role_name} from $FAKE_ROLES (login=role,...; 404 for anyone else)
 #   api repos/<owner>/<repo>/contents/<path>: the file $FAKE_CONTENTS/<owner>/<repo>/contents/<path> (404 without it)
 #   (only the calls these scripts make; gh's own --jq is not emulated beyond that)
-#   release view/create/edit, pr list/create/edit/close: against $GH_STATE (a Release's notes, an open PR's body as
+#   release view/create/edit/upload, pr list/create/edit/close: against $GH_STATE (a Release's notes and assets, an open PR's body as
 #              pr-<head with / as _>; pr list without --head lists them as {headRefName, url}, --jq applied; a closed
 #              one becomes closed-pr-<head>, its comment comment-<head>)
 mkdir -p "$work/bin" "$work/gh-state"
@@ -113,6 +113,9 @@ case "$1 $2" in
     echo "https://github.com/test/releases/tag/$3" ;;
   "release create") cp "$(arg --notes-file "$@")" "$GH_STATE/release-$3"; echo "https://github.com/test/releases/tag/$3" ;;
   "release edit") cp "$(arg --notes-file "$@")" "$GH_STATE/release-$3" ;;
+  "release upload") [ -f "$GH_STATE/release-$3" ] || { echo "release not found" >&2; exit 1; } # its assets: release-<tag>-assets/
+    mkdir -p "$GH_STATE/release-$3-assets"
+    for f in "$@"; do [ -f "$f" ] && cp "$f" "$GH_STATE/release-$3-assets/"; done; true ;;
   "pr list") head=$(arg --head "$@")
     if [ -n "$head" ]; then [ ! -f "$GH_STATE/pr-${head//\//_}" ] || echo "https://github.com/test/pull/1"
     else # every open PR, its head from the file name (the heads used here have one /), --jq applied
@@ -154,8 +157,31 @@ case "$1" in
   *) echo "fake crane: unexpected $*" >&2; exit 1 ;;
 esac
 CRANE
-chmod +x "$work/bin/gh" "$work/bin/crane"
-export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log"
+# Fake oras: a digest's SBOMs (ADR 0010) are the files in $REGISTRY/.referrers/<digest>/, named by the attached file's
+# title; discover lists each as digest sbom/<digest>/<title>, which pull fetches. FAKE_ORAS_DISCOVER_ERROR=1: discover
+# fails; FAKE_ORAS_ATTACH_ERROR=1: attach fails.
+cat >"$work/bin/oras" <<'ORAS'
+#!/usr/bin/env bash
+echo "oras $*" >>"$ORAS_LOG"
+arg() { local name=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$name" ] && { echo "$2"; return; }; shift; done; }
+ref=${*: -1}
+case "$1" in
+  discover) [ -z "${FAKE_ORAS_DISCOVER_ERROR:-}" ] || { echo "Error: TOOMANYREQUESTS" >&2; exit 1; }
+    subject=${ref#*@} dir="$REGISTRY/.referrers/${ref#*@}"
+    { [ -d "$dir" ] && ls "$dir"; true; } | jq -R . \
+      | jq -s --arg s "$subject" '{referrers: map({digest: "sbom/\($s)/\(.)", annotations: {"org.opencontainers.image.title": .}})}' ;;
+  pull) sbom=${ref##*@sbom/}
+    [ -f "$REGISTRY/.referrers/$sbom" ] || { echo "Error: $ref: not found" >&2; exit 1; }
+    cp "$REGISTRY/.referrers/$sbom" "$(arg --output "$@")/" ;;
+  attach) [ -z "${FAKE_ORAS_ATTACH_ERROR:-}" ] || { echo "Error: denied" >&2; exit 1; }
+    subject=${*: -2:1} file=${ref%:*}
+    [ -f "$file" ] || { echo "Error: no file $file" >&2; exit 1; }
+    mkdir -p "$REGISTRY/.referrers/${subject#*@}" && cp "$file" "$REGISTRY/.referrers/${subject#*@}/$file" ;;
+  *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
+esac
+ORAS
+chmod +x "$work/bin/gh" "$work/bin/crane" "$work/bin/oras"
+export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log" ORAS_LOG="$work/oras.log"
 
 # This checkout's clusters/local with the pins as they were before QA's first release candidate (prod on 0.2.0,
 # apps-qa suspended), whatever main pins now: promotions change the live pins, and the tests must not change with them.
@@ -609,6 +635,8 @@ check "promotion-pr.sh refuses a candidate for prod and a release for QA (script
 services=$(jq -r '.[].service' "$root/.github/services.json")
 fake_digest() { echo "sha256:$(echo "$1" | git hash-object --stdin)$(echo "x$1" | git hash-object --stdin | cut -c1-24)"; }
 image() { echo "$REGISTRY/docker.io/pkhamdee/$1/$2"; } # the fake registry's file for image <service> tag <tag>
+sbom_file() { echo "$REGISTRY/.referrers/$(fake_digest "$1")/$1.cdx.json"; } # <service>'s candidate digest's SBOM
+put_sbom() { mkdir -p "$(dirname "$(sbom_file "$1")")" && jq -n --arg s "$1" '{bomFormat: "CycloneDX", service: $s}' >"$(sbom_file "$1")"; }
 # Main pins QA to 0.3.0-rc.1 in a commit made at $pinned_at (sign_off_setup); QA's smoke tests of it run after that.
 pinned_at=2026-10-30T00:00:00Z
 qa_run=https://github.com/test/actions/runs/7
@@ -641,6 +669,7 @@ sign_off_setup() {
   # Every image but thirdparty-mock's carries its source commit (CI's revision label).
   mkdir -p "$REGISTRY/.revision"
   for svc in $services; do [ "$svc" = thirdparty-mock ] || echo "rev-$svc" >"$REGISTRY/.revision/$(fake_digest "$svc")"; done
+  for svc in $services; do put_sbom "$svc"; done # each pushed with its SBOM (ADR 0010)
   qa_tested success
 }
 sign_off_pr() { (cd "$clone" && scripts/sign-off-pr.sh) >"$work/out" 2>&1; }
@@ -686,8 +715,8 @@ opens_sign_off_pr() {
     && [ "$(origin diff --name-only "$branch~1" "$branch")" = releases/0.3.0.md ] \
     && grep -qxF "Candidate: \`v0.3.0-rc.1\`" "$record" && grep -qF "$rc_commit" "$record" \
     && lists_images "$record" 0.3.0-rc.1 \
-    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`" "$record" \
-    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`$" "$record" \
+    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`; SBOM attached" "$record" \
+    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`; SBOM attached$" "$record" \
     && grep -qxF '## Gates' "$record" \
     && grep -qF -- "- eshop-api, built from \`rev-esh\` in pkhamdee/eshop-api: [CI run]($(api_run 500)), Locust [perf-report]($(api_run 500)/artifacts/5001), ZAP [dast-report]($(api_run 500)/artifacts/5002)" "$record" \
     && grep -qF -- "- eshop-web, built from \`rev-esh\` in pkhamdee/eshop-web: no CI run of that commit pushed it" "$record" \
@@ -707,6 +736,20 @@ opens_once() { # after opens_sign_off_pr: nothing new to say, so no push and no 
     && ! grep -qE '^gh pr (create|edit)' "$GH_LOG" && grep -qF 'up to date' "$work/out"
 }
 check "sign-off-pr.sh run again opens no second PR and pushes nothing" opens_once
+flags_missing_sbom() {
+  sign_off_setup sign-off-pr-sbom
+  rm "$(sbom_file eshop-web)"
+  sign_off_pr || return 1
+  local record="$work/record"
+  origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md >"$record" \
+    && grep -qF "eshop-web:0.3.0-rc.1@$(fake_digest eshop-web)\`, built from \`rev-eshop-web\`; **no SBOM: sign-off will refuse it**" "$record" \
+    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`; SBOM attached" "$record" || return 1
+  sign_off_setup sign-off-pr-sbom-unreadable
+  FAKE_ORAS_DISCOVER_ERROR=1 sign_off_pr \
+    && origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md | grep -qF "SBOM not checked (the registry couldn't be read)"
+}
+check "sign-off-pr.sh still opens the PR when an image has no SBOM (or the registry can't be read) and says so on its line" \
+  flags_missing_sbom
 
 no_pr() { # no_pr <expected message part>: sign-off-pr.sh succeeds, opens no PR and pushes no sign-off branch
   : >"$GH_LOG"
@@ -865,6 +908,19 @@ missing_image_refused() {
   return $refused
 }
 check "sign-off.sh refuses when a candidate image is missing (copies none)" missing_image_refused
+missing_sbom_refused() {
+  mv "$(sbom_file eshop-web)" "$work/held-sbom"
+  sign_off_refused 'candidate image docker.io/pkhamdee/eshop-web:0.3.0-rc.1 has no SBOM (ADR 0010)' \
+    && grep -qF 'scripts/gates/attach-sbom.sh --earlier-build docker.io/pkhamdee/eshop-web:0.3.0-rc.1 /dev/null' "$work/out"
+  local refused=$?
+  mv "$work/held-sbom" "$(sbom_file eshop-web)"
+  return $refused
+}
+check "sign-off.sh refuses when a candidate image has no SBOM, saying how to attach one (copies none)" missing_sbom_refused
+unreadable_sbom_refused() {
+  FAKE_ORAS_DISCOVER_ERROR=1 sign_off_refused "could not read the SBOM of docker.io/pkhamdee/eshop-api@$(fake_digest eshop-api)"
+}
+check "sign-off.sh refuses when an SBOM can't be read (unknown is not absent)" unreadable_sbom_refused
 other_release_image_refused() {
   echo sha256:other >"$(image eshop-web 0.3.0)"
   sign_off_refused 'docker.io/pkhamdee/eshop-web:0.3.0 already exists with a different digest'
@@ -896,6 +952,14 @@ same_digests() { # every service's 0.3.0 image exists with its candidate's diges
     [ -f "$(image "$svc" 0.3.0)" ] && [ "$(cat "$(image "$svc" 0.3.0)")" = "$(fake_digest "$svc")" ] || return 1
   done
 }
+release_sboms() { # the Release's assets: every image's SBOM, as <service>-0.3.0.cdx.json
+  local svc
+  [ "$(find "$GH_STATE/release-v0.3.0-assets" -type f | wc -l)" -eq "$(wc -w <<<"$services")" ] || return 1
+  for svc in $services; do
+    [ "$(jq -r .service "$GH_STATE/release-v0.3.0-assets/$svc-0.3.0.cdx.json")" = "$svc" ] || return 1
+  done
+  grep -qE '^gh release upload v0.3.0 --repo pkhamdee/eshop-infra --clobber ' "$GH_LOG"
+}
 signs_off() {
   signed_off_setup sign-off || return 1
   : >"$GH_LOG"; : >"$CRANE_LOG"
@@ -910,13 +974,14 @@ signs_off() {
     && lists_images "$release" 0.3.0 \
     && grep -qF "$qa_run" "$release" && grep -qF '@qa-lead' "$release" && grep -qF 'https://github.com/test/pull/5' "$release" \
     && grep -qF 'gh release create v0.3.0 --repo pkhamdee/eshop-infra --verify-tag' "$GH_LOG" \
+    && release_sboms && grep -qxF '### SBOMs' "$release" \
     && [ "$(origin log -1 --format=%s refs/heads/promote/prod-0.3.0)" = "eshop-prod: deploy v0.3.0" ] \
     && [ "$(origin show refs/heads/promote/prod-0.3.0:clusters/local/prod-release.yaml | grep -c '"0.3.0" # release-pin: prod$')" -ge 2 ] \
     && lists_images "$pr" 0.3.0 && grep -qF "$qa_run" "$pr" && grep -qF '@qa-lead' "$pr" \
     && grep -qF 'https://github.com/test/releases/tag/v0.3.0' "$pr" \
     && grep -qF 'Promotion PR: https://github.com/test/pull/1' "$work/out"
 }
-check "sign-off.sh on the merged sign-off PR tags vX.Y.Z on the candidate's commit (naming the merger), copies its images by digest, publishes the Release and opens the prod promotion PR" \
+check "sign-off.sh on the merged sign-off PR tags vX.Y.Z on the candidate's commit (naming the merger), copies its images by digest, publishes the Release with each image's SBOM and opens the prod promotion PR" \
   signs_off
 signs_off_again() { # after signs_off: the same sign-off again finds every step done and updates the Release and PR
   local tag_object
@@ -926,7 +991,7 @@ signs_off_again() { # after signs_off: the same sign-off again finds every step 
   sign_off \
     && [ "$(origin rev-parse refs/tags/v0.3.0)" = "$tag_object" ] && same_digests \
     && ! grep -q '^crane copy' "$CRANE_LOG" \
-    && grep -q '^gh release edit v0.3.0' "$GH_LOG" && ! grep -q '^gh release create' "$GH_LOG" \
+    && grep -q '^gh release edit v0.3.0' "$GH_LOG" && ! grep -q '^gh release create' "$GH_LOG" && release_sboms \
     && grep -q '^gh pr edit' "$GH_LOG" && ! grep -q '^gh pr create' "$GH_LOG"
 }
 check "sign-off.sh run again (a re-run of the job) changes no tag or image and updates the Release and the PR" \
@@ -1738,25 +1803,6 @@ check "tags-to-push.sh fails when the registry can't be read (unknown is not abs
 
 # --- scripts/gates/attach-sbom.sh (the push jobs: each pushed image's SBOM as a referrer of its digest, ADR 0010) ---
 
-# Fake oras: a digest's referrers are the files in $REGISTRY/.referrers/<digest>/ (named by the attached file's
-# title). FAKE_ORAS_DISCOVER_ERROR=1: discover fails; FAKE_ORAS_ATTACH_ERROR=1: attach fails.
-cat >"$work/bin/oras" <<'ORAS'
-#!/usr/bin/env bash
-echo "oras $*" >>"$ORAS_LOG"
-ref=${*: -1}
-case "$1" in
-  discover) [ -z "${FAKE_ORAS_DISCOVER_ERROR:-}" ] || { echo "Error: TOOMANYREQUESTS" >&2; exit 1; }
-    dir="$REGISTRY/.referrers/${ref#*@}"
-    { [ -d "$dir" ] && ls "$dir"; true; } | jq -R . | jq -s '{referrers: map({annotations: {"org.opencontainers.image.title": .}})}' ;;
-  attach) [ -z "${FAKE_ORAS_ATTACH_ERROR:-}" ] || { echo "Error: denied" >&2; exit 1; }
-    subject=${*: -2:1} file=${ref%:*}
-    [ -f "$file" ] || { echo "Error: no file $file" >&2; exit 1; }
-    mkdir -p "$REGISTRY/.referrers/${subject#*@}" && cp "$file" "$REGISTRY/.referrers/${subject#*@}/$file" ;;
-  *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
-esac
-ORAS
-chmod +x "$work/bin/oras"
-export ORAS_LOG="$work/oras.log"
 export REGISTRY="$work/attach-sbom/registry"
 sbom_dir="$work/attach-sbom/sbom"
 mkdir -p "$sbom_dir" && echo '{"bomFormat":"CycloneDX","from":"this run"}' >"$sbom_dir/svc-a.cdx.json"

@@ -370,7 +370,8 @@ Deployment of it since that pin. If that succeeded and `vX.Y.Z` isn't released, 
 from branch `sign-off/X.Y.Z-rc.N`, whose one commit adds the release's record **`releases/X.Y.Z.md`**:
 
 - ``Candidate: `vX.Y.Z-rc.N` `` (the line sign-off reads) and its commit;
-- the candidate's images with digests (what `X.Y.Z` will be);
+- the candidate's images with digests (what `X.Y.Z` will be), each marked "SBOM attached" or "no SBOM: sign-off will
+  refuse it" ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md));
 - under "Gates", each image's CI run and its Locust and ZAP reports, as in the QA promotion PR
   ([2.](#2-ci-makes-its-images-and-opens-the-qa-promotion-pr), `scripts/gate-reports.sh`);
 - the passing run, its Playwright report (artifact `playwright-report-qa`), and the QA Deployment (id, created at).
@@ -394,12 +395,15 @@ unless:
 - QA's latest Deployment of it, created since `main` last changed QA's pin by a run on `main`, succeeded (none,
   still running, or failed refuses; a Deployment recorded by a run from another branch never counts);
 - every candidate image exists, and no `X.Y.Z` image exists with another digest;
+- every candidate image's digest has its **SBOM** (ADR 0010). One pushed before SBOMs existed has none: attach one
+  made from its digest with `scripts/gates/attach-sbom.sh --earlier-build <image>:X.Y.Z-rc.N /dev/null`, logged in to
+  Docker Hub with push access, then re-run the job;
 - `vX.Y.Z` doesn't exist, unless an earlier sign-off of this same candidate made it.
 
 Then it copies each image to `docker.io/pkhamdee/<service>:X.Y.Z` **by digest** (never rebuilt), tags **`vX.Y.Z`** on
 the candidate's commit ("Signed off from vX.Y.Z-rc.N by @<merger>, merging <PR>"; CI's `plan` skips a plain release
 tag: nothing is built), publishes the **GitHub Release** (images, candidate, QA Deployment and run, who signed off in
-which PR, the record) and opens the **prod promotion PR** `eshop-prod: deploy vX.Y.Z`. Each step is skipped or
+which PR, the record, and each image's SBOM as the asset `<service>-X.Y.Z.cdx.json`) and opens the **prod promotion PR** `eshop-prod: deploy vX.Y.Z`. Each step is skipped or
 updated when already done, so a sign-off that failed half-way is finished by re-running the failed job.
 
 A refused sign-off leaves the record on `main` and no release. Put right what it names (wait for or re-run QA's test,
@@ -518,7 +522,8 @@ git tag -l "v*" --sort=-v:refname          # releases and candidates, highest ve
 git log v0.2.0..v0.3.0 --oneline           # what changed between two releases
 git show v0.3.0                            # tag message ("Signed off from v0.3.0-rc.N by @<merger>, merging <PR>")
 git cherry -v origin/main origin/release/0.x   # release-branch commits not on main ("+")
-gh release view v0.3.0                     # images with digests, QA Deployment and run, who signed off
+gh release view v0.3.0                     # images with digests, QA Deployment and run, who signed off, the SBOMs
+gh release download v0.3.0 -p '*.cdx.json' # each image's SBOM; then: trivy sbom <file> (today's vulnerabilities)
 oras discover --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/eshop-api:0.3.0   # an image's SBOM (ADR 0010)
 git log --oneline -- releases/             # every sign-off record (releases/X.Y.Z.md: candidate, digests, evidence)
 git log --oneline -- clusters/local/prod-release.yaml   # every prod promotion and rollback
