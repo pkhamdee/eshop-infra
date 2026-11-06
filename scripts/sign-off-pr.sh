@@ -8,7 +8,8 @@
 # since main last changed QA's pin (scripts/lib/qa.sh; an older one tested an earlier deployment):
 #   - success, and vX.Y.Z not yet released: opens (or updates) the PR "Sign off vX.Y.Z-rc.N" from branch
 #     sign-off/X.Y.Z-rc.N, made from origin/main, whose only commit adds the release's record releases/X.Y.Z.md: the
-#     candidate and its commit, its images with digests, the passing run, its Playwright report and the Deployment.
+#     candidate and its commit, its images with digests, each image's gate reports (scripts/gate-reports.sh), the
+#     passing run, its Playwright report and the Deployment.
 #     One PR per candidate: when the open PR's record already says the same, nothing is pushed. Merging it is the
 #     sign-off (.github/workflows/sign-off.yml runs scripts/sign-off.sh);
 #   - every other open sign-off PR is closed with a comment saying why: QA is pinned to another candidate (or to
@@ -97,6 +98,10 @@ for svc in $(jq -r '.[].service' .github/services.json); do
     | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null) || revision=""
   images+="$IMAGE_REGISTRY/$svc:$candidate@$digest${revision:+ $revision}"$'\n'
 done
+# Each image's gate reports: the CI run that pushed it, with its Locust and ZAP reports (scripts/gate-reports.sh; it
+# says on the image's line what it can't find, and never fails for that).
+# shellcheck disable=SC2046 # one image per line, no spaces
+gates=$(scripts/gate-reports.sh $(cut -d' ' -f1 <<<"$images"))
 read -r id created log_url < <(jq -r '"\(.id) \(.created_at) \(.log_url)"' <<<"$deployment")
 # The run's Playwright report: e2e.yml uploads it as artifact playwright-report-qa.
 report=""
@@ -123,6 +128,13 @@ trap 'rm -f "$record" "$body"' EXIT
   while read -r image revision; do
     [ -z "$image" ] || echo "- \`$image\`${revision:+, built from \`$revision\`}"
   done <<<"$images"
+  echo
+  echo "## Gates"
+  echo
+  echo "Each image passed the shared gates (the temporary copy with Locust and ZAP, then the image scan) in the CI run"
+  echo "that pushed it; the reports are that run's artifacts:"
+  echo
+  echo "$gates"
   echo
   echo "## QA"
   echo

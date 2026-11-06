@@ -270,6 +270,14 @@ source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `pro
 `main` whose only commit is the pin edit, and a PR **`eshop-qa: deploy vX.Y.Z-rc.N`** listing the candidate's
 commit, its images with digests, each gate's result and the CI run (whose artifacts are the gate reports).
 
+A copied image's gates ran when it was built, not in this run, so the PR also lists, per image, **the CI run that
+pushed it and that run's Locust (`perf-report`) and ZAP (`dast-report`) reports** (`scripts/gate-reports.sh`). The
+run is found from the image's `org.opencontainers.image.revision` label and its service's `repository` in
+`.github/services.json`: that commit's first run whose push job succeeded (a run that failed a gate pushed nothing; a
+later run of the commit pushes nothing either). A patch image links its `release/N.x` build, and an image carried over
+from an earlier release the run that first built it. What can't be found (no label, no such run, a report missing or
+expired: GitHub keeps artifacts 90 days by default) is said on that image's line, and the promotion goes on.
+
 **Merging it is QA's approval**; nothing reaches QA otherwise. A newer candidate's PR supersedes an unmerged older
 one: close the old one. Without `PROMOTION_TOKEN` the job fails after the push and says so; set the secret and re-run
 the job, or open the PR yourself with the same script.
@@ -360,6 +368,8 @@ from branch `sign-off/X.Y.Z-rc.N`, whose one commit adds the release's record **
 
 - ``Candidate: `vX.Y.Z-rc.N` `` (the line sign-off reads) and its commit;
 - the candidate's images with digests (what `X.Y.Z` will be);
+- under "Gates", each image's CI run and its Locust and ZAP reports, as in the QA promotion PR
+  ([2.](#2-ci-makes-its-images-and-opens-the-qa-promotion-pr), `scripts/gate-reports.sh`);
 - the passing run, its Playwright report (artifact `playwright-report-qa`), and the QA Deployment (id, created at).
 
 One PR per candidate: running it again finds the PR up to date and pushes nothing; a later pass of the same

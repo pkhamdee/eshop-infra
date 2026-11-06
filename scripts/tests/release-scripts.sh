@@ -4,6 +4,7 @@
 #   scripts/check-release-tag.sh   CI's decision on a pushed v* tag
 #   scripts/promotion-pr.sh        the promotion PR's branch, pin commit and body
 #   scripts/sign-off-pr.sh         the sign-off PR: opened on QA's pass, closed when stale
+#   scripts/gate-reports.sh        each candidate image's CI run and its Locust and ZAP reports
 #   scripts/sign-off.sh            the merged sign-off PR: its refusals, the release, re-runs
 #   scripts/check-new-images.sh    CI's push job: a version's images are never overwritten
 #   scripts/smoke-targets.sh       the smoke test's targets: what a push to main (promotions and rollbacks
@@ -38,6 +39,10 @@ export GITHUB_REF=refs/heads/main GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1
 #              list newest first, --jq applied (strings printed raw, as gh does)
 #   api .../commits/<sha>/pulls, .../pulls/<n>, .../actions/runs/<id>/artifacts: $FAKE_COMMIT_PULLS, $FAKE_PULL,
 #              $FAKE_ARTIFACTS (GitHub's JSON), --jq applied
+#              (a run with $GH_STATE/artifacts-<id>.json lists that instead)
+#   api repos/<owner>/<repo>/actions/runs?head_sha=<sha>, .../actions/runs/<id>/jobs: a commit's runs and a run's jobs,
+#              from $GH_STATE/runs-<owner>_<repo>-<sha>.json and jobs-<id>.json (ci_run writes them); FAKE_RUNS_ERROR=1
+#              makes listing runs fail
 #   api .../actions/runs/<id>/attempts/<n>: {status} from $GH_STATE/run-<id>-<n> (default completed)
 #   api .../collaborators/<login>/permission: {role_name} from $FAKE_ROLES (login=role,...; 404 for anyone else)
 #   api repos/<owner>/<repo>/contents/<path>: the file $FAKE_CONTENTS/<owner>/<repo>/contents/<path> (404 without it)
@@ -75,7 +80,16 @@ case "$1 $2" in
       cat "$deployments/${BASH_REMATCH[1]}.statuses" 2>/dev/null | jq -s 'reverse' | jq -r "$jq_filter"
     elif [[ "$path" =~ /commits/[0-9a-f]+/pulls$ ]]; then jq -r "$jq_filter" <<<"${FAKE_COMMIT_PULLS:-[]}"
     elif [[ "$path" =~ /pulls/[0-9]+$ ]]; then jq -r "$jq_filter" <<<"${FAKE_PULL:-null}"
-    elif [[ "$path" =~ /actions/runs/[0-9]+/artifacts$ ]]; then jq -r "$jq_filter" <<<"${FAKE_ARTIFACTS:-[]}"
+    elif [[ "$path" =~ ^repos/([^/]+)/([^/]+)/actions/runs$ ]]; then # a commit's runs (?head_sha=), as ci_run wrote them
+      [ -z "${FAKE_RUNS_ERROR:-}" ] || { echo "gh: Server Error (HTTP 500)" >&2; exit 1; }
+      sha=$(sed -nE 's/(^|.*&)head_sha=([^&]*).*/\2/p' <<<"$query")
+      { cat "$GH_STATE/runs-${BASH_REMATCH[1]}_${BASH_REMATCH[2]}-$sha.json" 2>/dev/null || echo '{"workflow_runs":[]}'; } \
+        | jq -r "$jq_filter"
+    elif [[ "$path" =~ /actions/runs/([0-9]+)/jobs$ ]]; then
+      { cat "$GH_STATE/jobs-${BASH_REMATCH[1]}.json" 2>/dev/null || echo '{"jobs":[]}'; } | jq -r "$jq_filter"
+    elif [[ "$path" =~ /actions/runs/([0-9]+)/artifacts$ ]]; then # a run's own (ci_run), else $FAKE_ARTIFACTS
+      if [ -f "$GH_STATE/artifacts-${BASH_REMATCH[1]}.json" ]; then jq -r "$jq_filter" "$GH_STATE/artifacts-${BASH_REMATCH[1]}.json"
+      else jq -r "$jq_filter" <<<"${FAKE_ARTIFACTS:-[]}"; fi
     elif [[ "$path" =~ /actions/runs/([0-9]+)/attempts/([0-9]+)$ ]]; then # its status: $GH_STATE/run-<id>-<attempt>
       status=$(cat "$GH_STATE/run-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}" 2>/dev/null || echo completed)
       jq -n --arg s "$status" '{status: $s}' | jq -r "$jq_filter"
@@ -637,6 +651,23 @@ pin_qa() { # pin_qa <candidate>: tags it (on rc.1's commit) if needed and pins Q
   (cd "$clone" && scripts/pin-release.sh qa "$1" >/dev/null 2>&1)
   git -C "$clone" commit -qam "eshop-qa: deploy v$1" && git -C "$clone" push -q origin HEAD:main
 }
+# A service repository's CI run of a commit, as `gh api` lists it (scripts/gate-reports.sh): its push job ended
+# <push>, and it kept perf-report (id <run>1) and dast-report (id <run>2) unless [artifacts JSON] says otherwise.
+# ci_run <owner/repo> <sha> <run id> <created_at> <event> <push: success|skipped|failure> [artifacts JSON]
+ci_run() {
+  local runs="$GH_STATE/runs-${1/\//_}-$2.json"
+  [ -f "$runs" ] || echo '{"workflow_runs":[]}' >"$runs"
+  jq --argjson id "$3" --arg at "$4" --arg ev "$5" --arg repo "$1" \
+    '.workflow_runs += [{id: $id, created_at: $at, event: $ev, html_url: "https://github.com/\($repo)/actions/runs/\($id)"}]' \
+    "$runs" >"$runs.new" && mv "$runs.new" "$runs"
+  jq -n --arg push "$6" '{jobs: [{name: "image / temporary copy and gates", conclusion: (if $push == "skipped" then "failure" else "success" end)},
+    {name: "image / push images", conclusion: $push}]}' >"$GH_STATE/jobs-$3.json"
+  if [ -n "${7:-}" ]; then echo "$7"; else
+    jq -n --argjson id "$3" --arg at "$4" '{artifacts: [{id: ($id * 10 + 1), name: "perf-report", expired: false, created_at: $at},
+      {id: ($id * 10 + 2), name: "dast-report", expired: false, created_at: $at}]}'
+  fi >"$GH_STATE/artifacts-$3.json"
+}
+api_run() { echo "https://github.com/pkhamdee/eshop-api/actions/runs/$1"; } # an eshop-api run's URL, as ci_run lists it
 lists_images() { # lists_images <file> <tag>: names every service's image at <tag> with its candidate's digest
   local svc
   for svc in $services; do grep -qF "docker.io/pkhamdee/$svc:$2@$(fake_digest "$svc")" "$1" || return 1; done
@@ -644,6 +675,7 @@ lists_images() { # lists_images <file> <tag>: names every service's image at <ta
 
 opens_sign_off_pr() {
   sign_off_setup sign-off-pr
+  ci_run pkhamdee/eshop-api rev-eshop-api 500 2026-10-20T00:00:00Z push success
   : >"$GH_LOG"
   sign_off_pr || return 1
   local branch=refs/heads/sign-off/0.3.0-rc.1 record="$work/record"
@@ -655,12 +687,16 @@ opens_sign_off_pr() {
     && lists_images "$record" 0.3.0-rc.1 \
     && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`" "$record" \
     && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`$" "$record" \
+    && grep -qxF '## Gates' "$record" \
+    && grep -qF -- "- eshop-api, built from \`rev-esh\` in pkhamdee/eshop-api: [CI run]($(api_run 500)), Locust [perf-report]($(api_run 500)/artifacts/5001), ZAP [dast-report]($(api_run 500)/artifacts/5002)" "$record" \
+    && grep -qF -- "- eshop-web, built from \`rev-esh\` in pkhamdee/eshop-web: no CI run of that commit pushed it" "$record" \
+    && grep -qF -- '- thirdparty-mock: no source commit' "$record" \
     && grep -qF "$qa_run" "$record" && grep -qF "$qa_run/artifacts/99" "$record" && grep -qF 'Deployment 1 ' "$record" \
     && grep -qF 'gh pr create --repo pkhamdee/eshop-infra --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
     && grep -qF "$qa_run/artifacts/99" "$GH_STATE/pr-sign-off_0.3.0-rc.1" \
     && grep -qF 'Sign-off PR: https://github.com/test/pull/1' "$work/out"
 }
-check "sign-off-pr.sh opens \"Sign off vX.Y.Z-rc.N\" when QA's Deployment of the candidate it runs succeeded, adding releases/X.Y.Z.md (candidate, digests, run, Playwright report, Deployment)" \
+check "sign-off-pr.sh opens \"Sign off vX.Y.Z-rc.N\" when QA's Deployment of the candidate it runs succeeded, adding releases/X.Y.Z.md (candidate, digests, each image's gate reports, run, Playwright report, Deployment)" \
   opens_sign_off_pr
 opens_once() { # after opens_sign_off_pr: nothing new to say, so no push and no second PR
   local head
@@ -907,6 +943,69 @@ finishes_interrupted_sign_off() {
 }
 check "sign-off.sh interrupted half-way is finished by running it again" finishes_interrupted_sign_off
 no_deployments
+
+# --- scripts/gate-reports.sh (each candidate image's CI run and gate reports: the QA promotion PR, the sign-off record) ---
+
+# A fresh origin (for .github/services.json) and a registry of 0.3.0-rc.1 images: eshop-api and eshop-sync-master
+# built from one eshop-api commit, eshop-web from its own, thirdparty-mock with no revision label.
+reports_setup() {
+  clone=$(fresh "$1")
+  rm -rf "${GH_STATE:?}"/*
+  export REGISTRY="$work/$1/registry"
+  mkdir -p "$REGISTRY/.revision"
+  local svc
+  for svc in eshop-api eshop-sync-master eshop-web thirdparty-mock; do
+    mkdir -p "$(dirname "$(image "$svc" x)")" && fake_digest "$svc" >"$(image "$svc" 0.3.0-rc.1)"
+  done
+  echo aaaaaaa1111 >"$REGISTRY/.revision/$(fake_digest eshop-api)"
+  echo aaaaaaa1111 >"$REGISTRY/.revision/$(fake_digest eshop-sync-master)"
+  echo bbbbbbb2222 >"$REGISTRY/.revision/$(fake_digest eshop-web)"
+}
+reports() { (cd "$clone" && scripts/gate-reports.sh "$@") >"$work/out" 2>&1; }
+candidate_image() { echo "docker.io/pkhamdee/$1:0.3.0-rc.1@$(fake_digest "$1")"; }
+web_run=https://github.com/pkhamdee/eshop-web/actions/runs/400
+
+links_the_run_that_pushed() {
+  reports_setup gate-reports
+  ci_run pkhamdee/eshop-api aaaaaaa1111 300 2026-10-01T00:00:00Z pull_request success # a PR's: never the image's
+  ci_run pkhamdee/eshop-api aaaaaaa1111 303 2026-10-01T03:00:00Z workflow_dispatch success # later: pushed nothing new
+  ci_run pkhamdee/eshop-api aaaaaaa1111 301 2026-10-01T01:00:00Z push skipped # a gate failed: pushed nothing
+  ci_run pkhamdee/eshop-api aaaaaaa1111 302 2026-10-01T02:00:00Z workflow_dispatch success # the one that pushed
+  reports "$(candidate_image eshop-api)" "$(candidate_image eshop-sync-master)" || return 1
+  local links
+  links="[CI run]($(api_run 302)), Locust [perf-report]($(api_run 302)/artifacts/3021), ZAP [dast-report]($(api_run 302)/artifacts/3022)"
+  [ "$(cat "$work/out")" = "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: $links
+- eshop-sync-master, built from \`aaaaaaa\` in pkhamdee/eshop-api: $links" ]
+}
+check "gate-reports.sh links the first run of the image's commit whose push job succeeded, and its Locust and ZAP reports (skipping failed, later and PR runs)" \
+  links_the_run_that_pushed
+each_image_its_own_run() { # after links_the_run_that_pushed: a patch image (its release/N.x build) and one carried
+  # over from an earlier release resolve the same way, each to the run of the commit it was built from
+  ci_run pkhamdee/eshop-web bbbbbbb2222 400 2026-09-01T00:00:00Z push success
+  reports "$(candidate_image eshop-web)" "$(candidate_image eshop-api)" \
+    && grep -qF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: [CI run]($web_run), Locust [perf-report]($web_run/artifacts/4001)" "$work/out" \
+    && grep -qF -- "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: [CI run]($(api_run 302))" "$work/out"
+}
+check "gate-reports.sh links each image to the run of the commit it was built from, in its service's repository" each_image_its_own_run
+says_what_is_missing() {
+  reports_setup gate-reports-missing
+  ci_run pkhamdee/eshop-api aaaaaaa1111 301 2026-10-01T01:00:00Z push skipped
+  ci_run pkhamdee/eshop-web bbbbbbb2222 400 2026-09-01T00:00:00Z push success \
+    '{"artifacts":[{"id":4001,"name":"perf-report","expired":true,"created_at":"2026-09-01T00:00:00Z"}]}'
+  reports "$(candidate_image eshop-api)" "$(candidate_image eshop-web)" "$(candidate_image thirdparty-mock)" \
+    && grep -qxF -- "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: no CI run of that commit pushed it, so its gate reports can't be found" "$work/out" \
+    && grep -qxF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: [CI run]($web_run), Locust perf-report expired, ZAP dast-report not found in the run" "$work/out" \
+    && grep -qF -- "- thirdparty-mock: no source commit (the image has no org.opencontainers.image.revision label)" "$work/out" \
+    && FAKE_RUNS_ERROR=1 reports "$(candidate_image eshop-web)" \
+    && grep -qxF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: could not read its CI runs" "$work/out"
+}
+check "gate-reports.sh says on each image's line what it can't find (no label, no run that pushed, a report expired or missing, runs unreadable) and still succeeds" \
+  says_what_is_missing
+malformed_image_refused() {
+  ! reports docker.io/pkhamdee/eshop-api:0.3.0-rc.1 && grep -qF 'not an image with its digest' "$work/out" \
+    && ! reports && grep -qF 'usage: scripts/gate-reports.sh' "$work/out"
+}
+check "gate-reports.sh refuses an image without its digest, and no image at all" malformed_image_refused
 
 # --- scripts/check-new-images.sh (CI's push job, before pushing a version's images) ---
 

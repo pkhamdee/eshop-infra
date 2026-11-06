@@ -523,9 +523,13 @@ jobs:
         with:
           ref: main
           token: ${{ secrets.PROMOTION_TOKEN }} # git push of the promotion branch
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.1 # scripts/gate-reports.sh reads each image's revision label
       - name: Open the QA promotion PR
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
+          SIGN_OFF_READ_TOKEN: ${{ github.token }} # scripts/gate-reports.sh's reads of the service repositories' runs
           PROMOTION_IMAGES: ${{ needs.push.outputs.images }}
           TAG: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
@@ -538,15 +542,19 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Nothing built: every image is copied from a build that passed these gates when it was made.
-          [ "$GATE" != skipped ] || GATE="not run: nothing built, every image copied"
-          [ "$SCAN" != skipped ] || SCAN="not run: nothing built, every image copied"
+          # Nothing built: every image is copied from a build that passed these gates when it was made, listed below.
+          [ "$GATE" != skipped ] || GATE="not run here: every image copied, see each image's reports below"
+          [ "$SCAN" != skipped ] || SCAN="not run here: every image copied, see each image's run below"
+          # Each image's CI run and its Locust and ZAP reports; a line says what can't be found, never failing the job.
+          # shellcheck disable=SC2046 # one image per line, no spaces
+          GATE_REPORTS=$(scripts/gate-reports.sh $(grep -v '^$' <<<"$PROMOTION_IMAGES"))
           PROMOTION_DETAILS=$(cat <<EOF
           ### Gates
 
           Images: $SOURCE (scripts/candidate-images.sh; copied ones by digest, never rebuilt).
 
-          Every gate passed before any image was pushed ([CI run]($RUN_URL); reports are its artifacts):
+          Every gate passed before any image was pushed ([CI run]($RUN_URL); the reports of what it ran are its
+          artifacts, a copied image's are in the run that built it, below):
 
           | Gate | Result |
           |---|---|
@@ -554,6 +562,12 @@ jobs:
           | Dependency scan (Trivy, fail on critical) | $DEPS |
           | Temporary copy from these images, and the gates against it (Locust, ZAP) | $GATE |
           | Image scan (Trivy, fail on critical) | $SCAN |
+
+          #### Each image's gate reports
+
+          The CI run that pushed each image, with its Locust (perf-report) and ZAP (dast-report) reports:
+
+          $GATE_REPORTS
 
           Candidate: [$TAG]($TAG_URL). Merging this starts QA's smoke test of it (e2e.yml); a pass opens its
           sign-off PR (docs/git-workflow.md, "Releasing").
