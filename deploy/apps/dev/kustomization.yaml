@@ -17,7 +17,7 @@ resources:
 # Tags are written by Flux image automation (image-automation.yaml); do not edit by hand.
 images:
   - name: docker.io/pkhamdee/eshop-api
-    newTag: main-8fb9b10-1793975878 # {"$imagepolicy": "eshop-dev:eshop-api:tag"}
+    newTag: main-9dc55e7-1793979314 # {"$imagepolicy": "eshop-dev:eshop-api:tag"}
   - name: docker.io/pkhamdee/eshop-web
     newTag: main-5d1d51c-1793979320 # {"$imagepolicy": "eshop-dev:eshop-web:tag"}
   - name: docker.io/pkhamdee/eshop-node-api
