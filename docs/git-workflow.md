@@ -374,7 +374,9 @@ from branch `sign-off/X.Y.Z-rc.N`, whose one commit adds the release's record **
 
 - ``Candidate: `vX.Y.Z-rc.N` `` (the line sign-off reads) and its commit;
 - the candidate's images with digests (what `X.Y.Z` will be), each marked "SBOM attached" or "no SBOM: sign-off will
-  refuse it" ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md));
+  refuse it" ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)), and "signed" or "not signed" by
+  eShop's pipeline ([ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md)): shown only,
+  sign-off doesn't refuse an unsigned image, but an environment that enforces the image policy won't run it;
 - under "Gates", each image's CI run and its Locust and ZAP reports, as in the QA promotion PR
   ([2.](#2-ci-makes-its-images-and-opens-the-qa-promotion-pr), `scripts/gate-reports.sh`);
 - the passing run, its Playwright report (artifact `playwright-report-qa`), and the QA Deployment (id, created at).
