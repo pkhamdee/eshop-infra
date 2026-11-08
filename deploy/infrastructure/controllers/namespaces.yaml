@@ -9,6 +9,7 @@ metadata:
   name: eshop-dev
   labels:
     eshop.io/gateway-access: "true"
+    policy.sigstore.dev/include: "true"
 ---
 apiVersion: v1
 kind: Namespace
