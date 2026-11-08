@@ -59,10 +59,12 @@ failed=()
 expect() { # expect pass|fail <image> <what>
   local result=fail
   if "$tester" -policy "$enforced" -image "$2" -log-level error >"$out" 2>&1; then result=pass; fi
+  local said=passes
+  [ "$result" = pass ] || said=fails
   if [ "$result" = "$1" ]; then
-    echo "ok   $3: ${result}es"
+    echo "ok   $3: $said"
   else
-    echo "FAIL $3: ${result}es, expected to $1"
+    echo "FAIL $3: $said, expected to $1"
     sed 's/^/     /' "$out"
     failed+=("$3")
   fi
