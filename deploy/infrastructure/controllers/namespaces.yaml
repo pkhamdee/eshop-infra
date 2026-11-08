@@ -1,13 +1,14 @@
 # Namespaces labelled eshop.io/gateway-access may attach HTTPRoutes to the eshop Gateway.
-# Namespaces labelled policy.sigstore.dev/include are checked by policy-controller (policy-controller.yaml): their
-# docker.io/pkhamdee/* images must be signed by eShop's pipeline (ADR 0011; image-policy.yaml in ../configs).
+# Namespaces labelled policy.sigstore.dev/include enforce the image policy (policy-controller.yaml; image-policy.yaml in
+# ../configs): their docker.io/pkhamdee/* images must be signed by eShop's pipeline, or the pod is refused. The label
+# is the enforcement boundary (ADR 0011); namespaces join one at a time, each once everything it runs is signed:
+# thirdparty, then eshop-dev (#136), eshop-qa (#134), eshop-prod (#137).
 apiVersion: v1
 kind: Namespace
 metadata:
   name: eshop-dev
   labels:
     eshop.io/gateway-access: "true"
-    policy.sigstore.dev/include: "true"
 ---
 apiVersion: v1
 kind: Namespace
@@ -15,7 +16,6 @@ metadata:
   name: eshop-qa
   labels:
     eshop.io/gateway-access: "true"
-    policy.sigstore.dev/include: "true"
 ---
 apiVersion: v1
 kind: Namespace
@@ -23,7 +23,6 @@ metadata:
   name: eshop-prod
   labels:
     eshop.io/gateway-access: "true"
-    policy.sigstore.dev/include: "true"
 ---
 apiVersion: v1
 kind: Namespace
