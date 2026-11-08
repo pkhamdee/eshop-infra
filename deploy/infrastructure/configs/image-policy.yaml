@@ -3,15 +3,15 @@
 # a release/N.x branch. Checked by policy-controller (../controllers/policy-controller.yaml) in the namespaces labelled
 # policy.sigstore.dev/include (../controllers/namespaces.yaml); other images match no policy and are admitted.
 #
-# mode: warn admits an image that fails the check and returns a warning (kubectl prints it; so does
-# `kubectl run --dry-run=server`). Each namespace moves to enforce in its own step (#136 dev, #134 QA, #137 prod),
-# once warn mode shows that everything it runs is signed.
+# mode: enforce refuses a pod (or Deployment, ReplicaSet, ...) whose docker.io/pkhamdee/* image fails the check, in
+# every labelled namespace. Which namespaces enforce is decided by the label alone (ADR 0011).
+# scripts/check-image-policy.sh tests this file in CI.
 apiVersion: policy.sigstore.dev/v1beta1
 kind: ClusterImagePolicy
 metadata:
   name: eshop-images
 spec:
-  mode: warn
+  mode: enforce
   images:
     - glob: "index.docker.io/pkhamdee/**"
     - glob: "docker.io/pkhamdee/**"

@@ -3,9 +3,9 @@
 # (deploy/infrastructure/configs/image-policy.yaml) and replaces their tags with the verified digests.
 #   - no-match-policy allow: an image no policy names (CNPG's postgres, ...) is admitted unchecked; only
 #     docker.io/pkhamdee/* is checked.
-#   - failurePolicy Ignore while every policy is in warn mode: a webhook outage then admits pods unchecked instead of
-#     blocking them. Switching the first namespace to enforce (#136) makes it Fail, so stopping the webhook is never a
-#     way around the check.
+#   - failurePolicy Ignore, for good (ADR 0011): one setting for every labelled namespace, so Fail would let a webhook
+#     outage (a restart, the Mac waking up) block new pods everywhere. Our threat, a stolen Docker Hub token, can't
+#     stop the webhook.
 #   - one replica and no PodDisruptionBudget: a single-node laptop cluster, where a minAvailable 1 budget would only
 #     block draining the node.
 apiVersion: source.toolkit.fluxcd.io/v1
