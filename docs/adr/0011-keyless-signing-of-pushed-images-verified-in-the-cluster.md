@@ -8,10 +8,14 @@ Anyone holding the Docker Hub token could push `docker.io/pkhamdee/<service>:mai
 
 **Why the classic signature format, with cosign v2.** cosign v3 always writes the newer Sigstore bundle (as an OCI referrer). policy-controller 0.15.1, the newest, verifies the classic `sha256-<digest>.sig` tag, and its bundle support is still an open issue (sigstore/policy-controller#1406). So we sign with cosign v2.6.5, whose default is the classic format. We'll move to cosign v3 once policy-controller verifies bundles.
 
+**Where it is enforced, and failing open** (decided while enforcing it, #136). The namespace label `policy.sigstore.dev/include` is the enforcement boundary, as policy-controller intends. The one policy runs in **enforce** mode, and namespaces join one at a time: `thirdparty`, `eshop-dev`, `eshop-qa`, `eshop-prod`, each once everything it runs is signed. Warn mode was only the trial stage, because policy-controller has no per-namespace mode. Until QA and prod are labelled, the sign-off record shows each image's signature before it is promoted there. The webhook's `failurePolicy` is **`Ignore`**: it is one setting for every labelled namespace, and an outage on a laptop cluster (a restart, the Mac waking up) would otherwise block new pods everywhere. Failing open gives up nothing against our threat. A stolen Docker Hub token can't stop the webhook; stopping it takes cluster access that could just as well delete the policy. CI checks the policy with policy-controller's own tester on every change (`scripts/check-image-policy.sh`).
+
 ## Considered options
 
 - **Sign SBOM attestations too** (`cosign attest --type cyclonedx`): deferred. Signing images is what stops a foreign image from running. An unsigned SBOM (ADR 0010) can be replaced by someone with the Docker Hub token, but it can't make the cluster run anything. Revisit if someone outside eShop starts relying on the SBOMs.
-- **Kyverno** instead of policy-controller: it can do the same, but it's a general policy engine; policy-controller does this one job, with less to run on a laptop cluster.
+- **Kyverno** instead of policy-controller: it can do the same, and it has per-namespace enforcement modes, but it's a general policy engine; policy-controller does this one job, with less to run on a laptop cluster.
+- **Per-namespace enforcement inside the policy** (a second policy matched by a workload label, or a CUE rule on `metadata.namespace` with an always-pass authority): workarounds for a feature policy-controller lacks, untested, and harder to read than a namespace label.
+- **Fail closed** (`failurePolicy: Fail`): chosen at first, then dropped for the reasons above.
 
 ## Consequences
 

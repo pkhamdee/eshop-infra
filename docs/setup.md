@@ -467,27 +467,29 @@ The local runner of earlier versions is gone; its cache can be deleted: `rm -rf 
 
 Only images built by eShop's pipeline run in the cluster ([ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md),
 #127). Sigstore **policy-controller** (`deploy/infrastructure/controllers/policy-controller.yaml`, namespace
-`cosign-system`) checks every pod in the namespaces labelled `policy.sigstore.dev/include` (`eshop-dev`, `eshop-qa`,
-`eshop-prod`, `thirdparty`) against the ClusterImagePolicy **`eshop-images`**
+`cosign-system`) checks every pod in the namespaces labelled `policy.sigstore.dev/include` (`deploy/infrastructure/controllers/namespaces.yaml`)
+against the ClusterImagePolicy **`eshop-images`**
 (`deploy/infrastructure/configs/image-policy.yaml`). A `docker.io/pkhamdee/*` image must carry a keyless signature by
 `pkhamdee/eshop-infra`'s `service-image.yml` from `main`, called by one of the four service repositories from its
 `main` or a `release/N.x` branch. Any other image matches no policy and is admitted (`no-match-policy: allow`).
 Admitted pods run their images by the verified digest.
 
-The policy is in **warn** mode: an image that fails is admitted, with a warning. To see what a namespace would refuse
-without creating anything:
+The label is the enforcement boundary (ADR 0011): a labelled namespace is checked, an unlabelled one isn't.
+Namespaces join one at a time, each once everything it runs is signed (no backfill): `thirdparty`, `eshop-dev`
+(#136), `eshop-qa` (#134), `eshop-prod` (#137). Before a namespace joins, check what it runs with `cosign verify`; for
+QA and prod, the sign-off record also shows each image's signature. CI tests the policy itself on every change with
+policy-controller's tester (`scripts/check-image-policy.sh`: a signed image must pass, an unsigned one fail).
+
+While the policy is in warn mode (the trial stage), an image that fails is admitted with a warning; in enforce
+mode it is refused. To see what a labelled namespace does with an image, without creating anything:
 
 ```sh
 kubectl -n eshop-dev run sigcheck --image=docker.io/pkhamdee/eshop-web:main-<sha>-<ts> --dry-run=server -o name
-# Warning: ... failed policy: eshop-images ...   <- unsigned, or signed by another identity; no warning: it passes
+# warn mode: "Warning: ... failed policy: eshop-images"; enforce mode: an error, nothing admitted; neither: it passes
 ```
 
-**Switching a namespace to enforce** (#136 dev, #134 QA, #137 prod) waits until warn mode shows nothing unsigned
-there: every image it runs was pushed after signing started (no backfill; ADR 0011). A ClusterImagePolicy applies to
-an image in every labelled namespace, so enforcing in one namespace only needs the policy to tell them apart (#136
-settles how). The first switch also sets the webhook's `failurePolicy` to `Fail`; until then it is `Ignore`, so a
-webhook outage never blocks a pod in warn mode. Once prod enforces, rolling back to a release from before signing is
-refused: switch prod back to warn first (a PR).
+The webhook's `failurePolicy` is `Ignore` (ADR 0011): while it is down, pods are admitted unchecked. Once prod is
+labelled, rolling back to a release from before signing is refused: remove prod's label first (a PR).
 
 ## Releasing
 
