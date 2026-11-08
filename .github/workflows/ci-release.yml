@@ -90,6 +90,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Manifests (kustomize build + kubeconform)
         run: scripts/validate-manifests.sh
+      # The cluster's image policy (ADR 0011), with policy-controller's own tester against real images: the signed
+      # one must pass, the unsigned one fail, as if enforced. Needs Docker Hub and Sigstore's public services.
+      - name: Image policy (policy-tester)
+        run: scripts/check-image-policy.sh
       # A broken ci-release.yml runs no job at all (the PR just shows no checks); this still guards e2e.yml
       # and every edit that leaves the file parseable. 1.7.12 or later: it knows `environment: {deployment: false}`
       # (e2e.yml's notify job).
