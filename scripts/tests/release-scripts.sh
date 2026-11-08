@@ -181,13 +181,23 @@ case "$1" in
   *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
 esac
 ORAS
-# Fake cosign: `sign` logs its call; FAKE_COSIGN_FAIL=<ref>: signing that ref fails.
+# Fake cosign: `sign` logs its call; FAKE_COSIGN_FAIL=<ref>: signing that ref fails. `verify <repository@digest>`
+# passes when $REGISTRY/.signatures/<digest> names the repository given with --certificate-github-workflow-repository
+# (the source repository the pipeline signed it from), else fails as cosign does: no signature, or none matching.
+# FAKE_COSIGN_VERIFY_ERROR=1: verify fails as when Sigstore can't be reached.
 cat >"$work/bin/cosign" <<'COSIGN'
 #!/usr/bin/env bash
 echo "cosign $*" >>"$COSIGN_LOG"
+arg() { local name=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$name" ] && { echo "$2"; return; }; shift; done; }
 ref=${*: -1}
 case "$1" in
   sign) [ "$ref" != "${FAKE_COSIGN_FAIL:-}" ] || { echo "Error: signing $ref: fulcio unavailable" >&2; exit 1; } ;;
+  verify) [ -z "${FAKE_COSIGN_VERIFY_ERROR:-}" ] || { echo "Error: getting TUF root: connection refused" >&2; exit 1; }
+    signed="$REGISTRY/.signatures/${ref#*@}"
+    [ -f "$signed" ] || { echo "Error: no signatures found" >&2; exit 1; }
+    [ "$(cat "$signed")" = "$(arg --certificate-github-workflow-repository "$@")" ] \
+      || { echo "Error: no matching signatures: certificate extensions" >&2; exit 1; }
+    echo '[{"critical":{}}]' ;;
   *) echo "fake cosign: unexpected $*" >&2; exit 1 ;;
 esac
 COSIGN
@@ -648,6 +658,12 @@ services=$(jq -r '.[].service' "$root/.github/services.json")
 fake_digest() { echo "sha256:$(echo "$1" | git hash-object --stdin)$(echo "x$1" | git hash-object --stdin | cut -c1-24)"; }
 image() { echo "$REGISTRY/docker.io/pkhamdee/$1/$2"; } # the fake registry's file for image <service> tag <tag>
 sbom_file() { echo "$REGISTRY/.referrers/$(fake_digest "$1")/$1.cdx.json"; } # <service>'s candidate digest's SBOM
+# <service>'s candidate digest signed by the pipeline from [repository] (default its own, .github/services.json).
+sign_image() {
+  mkdir -p "$REGISTRY/.signatures"
+  echo "${2:-$(jq -r --arg s "$1" '.[] | select(.service == $s) | .repository' "$root/.github/services.json")}" \
+    >"$REGISTRY/.signatures/$(fake_digest "$1")"
+}
 put_sbom() { mkdir -p "$(dirname "$(sbom_file "$1")")" && jq -n --arg s "$1" '{bomFormat: "CycloneDX", service: $s}' >"$(sbom_file "$1")"; }
 # Main pins QA to 0.3.0-rc.1 in a commit made at $pinned_at (sign_off_setup); QA's smoke tests of it run after that.
 pinned_at=2026-10-30T00:00:00Z
@@ -682,6 +698,7 @@ sign_off_setup() {
   mkdir -p "$REGISTRY/.revision"
   for svc in $services; do [ "$svc" = thirdparty-mock ] || echo "rev-$svc" >"$REGISTRY/.revision/$(fake_digest "$svc")"; done
   for svc in $services; do put_sbom "$svc"; done # each pushed with its SBOM (ADR 0010)
+  for svc in $services; do sign_image "$svc"; done # and signed by the pipeline, from its repository (ADR 0011)
   qa_tested success
 }
 sign_off_pr() { (cd "$clone" && scripts/sign-off-pr.sh) >"$work/out" 2>&1; }
@@ -728,7 +745,7 @@ opens_sign_off_pr() {
     && grep -qxF "Candidate: \`v0.3.0-rc.1\`" "$record" && grep -qF "$rc_commit" "$record" \
     && lists_images "$record" 0.3.0-rc.1 \
     && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`; SBOM attached" "$record" \
-    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`; SBOM attached$" "$record" \
+    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`; SBOM attached; signed$" "$record" \
     && grep -qxF '## Gates' "$record" \
     && grep -qF -- "- eshop-api, built from \`rev-esh\` in pkhamdee/eshop-api: [CI run]($(api_run 500)), Locust [perf-report]($(api_run 500)/artifacts/5001), ZAP [dast-report]($(api_run 500)/artifacts/5002)" "$record" \
     && grep -qF -- "- eshop-web, built from \`rev-esh\` in pkhamdee/eshop-web: no CI run of that commit pushed it" "$record" \
@@ -762,6 +779,24 @@ flags_missing_sbom() {
 }
 check "sign-off-pr.sh still opens the PR when an image has no SBOM (or the registry can't be read) and says so on its line" \
   flags_missing_sbom
+shows_signatures() {
+  sign_off_setup sign-off-pr-signatures
+  rm "$REGISTRY/.signatures/$(fake_digest eshop-web)"                # pushed before signing: unsigned
+  sign_image eshop-node-api pkhamdee/eshop-web                        # signed, but from another service's repository
+  : >"$COSIGN_LOG"
+  sign_off_pr || return 1
+  local record="$work/record"
+  origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md >"$record" \
+    && grep -qF "eshop-web:0.3.0-rc.1@$(fake_digest eshop-web)\`, built from \`rev-eshop-web\`; SBOM attached; **not signed**" "$record" \
+    && grep -qF "eshop-node-api:0.3.0-rc.1@$(fake_digest eshop-node-api)\`, built from \`rev-eshop-node-api\`; SBOM attached; **not signed**" "$record" \
+    && grep -qF "eshop-sync-master:0.3.0-rc.1@$(fake_digest eshop-sync-master)\`, built from \`rev-eshop-sync-master\`; SBOM attached; signed" "$record" \
+    && grep -qF -- "--certificate-identity https://github.com/pkhamdee/eshop-infra/.github/workflows/service-image.yml@refs/heads/main --certificate-github-workflow-repository pkhamdee/eshop-api docker.io/pkhamdee/eshop-sync-master@$(fake_digest eshop-sync-master)" "$COSIGN_LOG" || return 1
+  sign_off_setup sign-off-pr-signatures-unknown
+  FAKE_COSIGN_VERIFY_ERROR=1 sign_off_pr \
+    && origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md | grep -qF "; SBOM attached; signature not checked (cosign couldn't tell)"
+}
+check "sign-off-pr.sh shows each image's signature by eShop's pipeline from its own repository (signed, not signed, not checked) and opens the PR regardless" \
+  shows_signatures
 
 no_pr() { # no_pr <expected message part>: sign-off-pr.sh succeeds, opens no PR and pushes no sign-off branch
   : >"$GH_LOG"

@@ -6,3 +6,4 @@ resources:
   - cert-manager.yaml
   - cloudnative-pg.yaml
   - actions-runner-controller.yaml
+  - policy-controller.yaml

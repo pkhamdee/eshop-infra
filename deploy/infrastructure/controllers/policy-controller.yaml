@@ -1,0 +1,53 @@
+# Sigstore policy-controller (ADR 0011, #127): an admission webhook that, in namespaces labelled
+# policy.sigstore.dev/include (namespaces.yaml), checks each pod's images against the ClusterImagePolicies
+# (deploy/infrastructure/configs/image-policy.yaml) and replaces their tags with the verified digests.
+#   - no-match-policy allow: an image no policy names (CNPG's postgres, ...) is admitted unchecked; only
+#     docker.io/pkhamdee/* is checked.
+#   - failurePolicy Ignore while every policy is in warn mode: a webhook outage then admits pods unchecked instead of
+#     blocking them. Switching the first namespace to enforce (#136) makes it Fail, so stopping the webhook is never a
+#     way around the check.
+#   - one replica and no PodDisruptionBudget: a single-node laptop cluster, where a minAvailable 1 budget would only
+#     block draining the node.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: sigstore
+  namespace: cosign-system
+spec:
+  interval: 24h
+  url: https://sigstore.github.io/helm-charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: policy-controller
+  namespace: cosign-system
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: policy-controller
+      version: "0.10.8" # policy-controller v0.13.1, its image pinned by digest in the chart
+      sourceRef:
+        kind: HelmRepository
+        name: sigstore
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    webhook:
+      failurePolicy: Ignore
+      configData:
+        no-match-policy: allow
+      podDisruptionBudget:
+        enabled: false
+    # The chart's post-delete job; its default is the moving tag latest-dev.
+    leasescleanup:
+      image:
+        repository: cgr.dev/chainguard/kubectl
+        version: sha256:3562a8854a81a77e39eb34cd87106345d1122432f88d74ea2dd4c9595883c033

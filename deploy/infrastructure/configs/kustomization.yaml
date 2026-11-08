@@ -3,4 +3,5 @@ kind: Kustomization
 resources:
   - issuers.yaml
   - gateway.yaml
+  - image-policy.yaml
   - sops-smoke-test.sops.yaml

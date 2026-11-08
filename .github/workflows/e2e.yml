@@ -433,6 +433,10 @@ jobs:
       - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
         with:
           version: 1.3.4
+      # Each image's signature (ADR 0011; scripts/lib/signature.sh), as service-image.yml signs it.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
       - name: Open or close sign-off PRs
         env:
           REPO: ${{ github.repository }}
