@@ -18,6 +18,7 @@
 #     QA served the candidate before and after the test (e2e/check-serving.sh);
 #   - every candidate image $IMAGE_REGISTRY/<service>:X.Y.Z-rc.N (.github/services.json) exists, and any X.Y.Z image
 #     that already exists has the candidate's digest;
+#   - every candidate image's digest has its CycloneDX SBOM (ADR 0010), attached when it was pushed;
 #   - tag vX.Y.Z is absent, or is this candidate's sign-off (same commit, made by this script).
 # Then, in this order, each step skipped or updated when an earlier run already did it, so a failed sign-off is
 # finished by re-running the workflow's job:
@@ -25,14 +26,14 @@
 #   2. tags vX.Y.Z (annotated) on the candidate's commit and pushes it; images first, so the tag never names
 #      images that don't exist. The tag message names the merger and the PR;
 #   3. publishes (or updates) the GitHub Release vX.Y.Z: the images with digests, the QA Deployment and run, who
-#      signed off in which PR;
+#      signed off in which PR, and each image's SBOM as the asset <service>-X.Y.Z.cdx.json;
 #   4. opens (or updates) the prod promotion PR: scripts/promotion-pr.sh prod X.Y.Z.
 #
 # Environment: REPO and IMAGE_REGISTRY (defaults: scripts/lib/repo.sh), SIGN_OFF_RUN_URL (the workflow run, linked in
 # the Release and PR), SIGN_OFF_READ_TOKEN (a token for the checks, e.g. the workflow's own; default: gh's token).
 # Needs a clean checkout of main with <before> and <after>, push access to origin, `gh` with a token that may create
-# Releases and PRs, crane logged in to the registry with push access, and jq. scripts/tests/release-scripts.sh tests
-# it with fake gh and crane against a throwaway origin.
+# Releases and PRs, crane logged in to the registry with push access, oras (reads the SBOMs), and jq. scripts/tests/release-scripts.sh tests
+# it with fake gh, crane and oras against a throwaway origin.
 set -euo pipefail
 # shellcheck source=lib/versions.sh
 . "$(dirname "$0")/lib/versions.sh"
@@ -42,6 +43,8 @@ set -euo pipefail
 . "$(dirname "$0")/lib/images.sh"
 # shellcheck source=lib/qa.sh
 . "$(dirname "$0")/lib/qa.sh"
+# shellcheck source=lib/sbom.sh
+. "$(dirname "$0")/lib/sbom.sh"
 
 usage() { echo "usage: scripts/sign-off.sh <before> <after>" >&2; exit 2; }
 refuse() { echo "Sign-off refused: $*" >&2; exit 1; }
@@ -130,8 +133,13 @@ main() {
   [ "$state" = success ] \
     || refuse "QA's latest Deployment of $candidate is $state$(jq -r '.description | if . != "" then " (\(.))" else "" end' <<<"$deployment"): $qa_run"
 
-  # Each service as "<service> <digest> <exists>": the candidate's digest, and whether X.Y.Z already exists.
-  local images="" plan="" svc digest tags existing
+  # Each service as "<service> <digest> <exists>": the candidate's digest, and whether X.Y.Z already exists. Its SBOM
+  # goes to $sboms/<service>-X.Y.Z.cdx.json, the Release's asset.
+  local images="" plan="" svc digest tags existing sboms notes pulled
+  sboms=$(mktemp -d)
+  notes=$(mktemp)
+  # shellcheck disable=SC2064 # expand now: they are local
+  trap "rm -rf '$sboms' '$notes'" EXIT
   for svc in $(jq -r '.[].service' .github/services.json); do
     digest=$(crane digest "$registry/$svc:$candidate") || refuse "candidate image $registry/$svc:$candidate is missing"
     tags=$(crane ls "$registry/$svc") || refuse "could not list the tags of $registry/$svc"
@@ -141,6 +149,15 @@ main() {
         || refuse "$registry/$svc:$version already exists with a different digest than $candidate's ($digest); release images are never overwritten"
       existing=true
     fi
+    pulled=0
+    sbom_pull "$registry/$svc@$digest" "$sboms/$svc-$version.cdx.json" || pulled=$?
+    case "$pulled" in
+      0) ;;
+      3) refuse "candidate image $registry/$svc:$candidate has no SBOM (ADR 0010). Attach one made from its digest:" \
+        "scripts/gates/attach-sbom.sh --earlier-build $registry/$svc:$candidate /dev/null (logged in to push), then" \
+        "re-run this workflow's job" ;;
+      *) refuse "could not read the SBOM of $registry/$svc@$digest" ;;
+    esac
     plan+="$svc $digest $existing"$'\n'
     images+="$registry/$svc:$version@$digest"$'\n'
   done
@@ -163,10 +180,6 @@ main() {
   fi
   echo "Tag $tag on $commit"
 
-  local notes
-  notes=$(mktemp)
-  # shellcheck disable=SC2064 # expand now: $notes is local
-  trap "rm -f '$notes'" EXIT
   {
     echo "Release **$tag**, signed off by @$actor by merging $pr, from release candidate **$rc_tag** (commit $commit)."
     echo "Its record: [\`$record\`](https://github.com/$repo/blob/$after/$record)."
@@ -182,6 +195,12 @@ main() {
     echo "QA's smoke test of $candidate against https://qa.eshop.localhost passed: GitHub Deployment $qa_deployment_id"
     echo "of \`$rc_tag\` to \`qa\`, [run]($qa_run). It checked that eshop-qa served exactly this candidate before and"
     echo "after the test."
+    echo
+    echo "### SBOMs"
+    echo
+    echo "Each image's CycloneDX SBOM is attached as \`<service>-$version.cdx.json\`: the one its digest carries in the"
+    echo "registry, made when the image was pushed (ADR 0010). Check it against today's vulnerabilities with"
+    echo "\`trivy sbom <file>\`."
     if [ -n "${SIGN_OFF_RUN_URL:-}" ]; then echo; echo "Signed off in [this run]($SIGN_OFF_RUN_URL)."; fi
     echo
     echo "### Deploying"
@@ -194,6 +213,7 @@ main() {
   else
     gh release create "$tag" --repo "$repo" --verify-tag --title "$tag" --notes-file "$notes" >/dev/null
   fi
+  gh release upload "$tag" --repo "$repo" --clobber "$sboms"/*.cdx.json
   local release
   release=$(gh release view "$tag" --repo "$repo" --json url --jq .url)
   echo "Release: $release"

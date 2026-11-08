@@ -4,7 +4,8 @@
 #   scripts/check-release-tag.sh   CI's decision on a pushed v* tag
 #   scripts/promotion-pr.sh        the promotion PR's branch, pin commit and body
 #   scripts/sign-off-pr.sh         the sign-off PR: opened on QA's pass, closed when stale
-#   scripts/sign-off.sh            the merged sign-off PR: its refusals, the release, re-runs
+#   scripts/gate-reports.sh        each candidate image's CI run and its Locust and ZAP reports
+#   scripts/sign-off.sh            the merged sign-off PR: its refusals, the release (its SBOMs), re-runs
 #   scripts/check-new-images.sh    CI's push job: a version's images are never overwritten
 #   scripts/smoke-targets.sh       the smoke test's targets: what a push to main (promotions and rollbacks
 #                                  included), or a dispatch, tests where
@@ -14,7 +15,9 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
-# `gh`, `crane` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
+#   scripts/gates/tags-to-push.sh, attach-sbom.sh, sign-images.sh   the image push jobs: never an existing tag;
+#                                  each image's SBOM; signing only what was pushed
+# `gh`, `crane`, `oras`, `cosign` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
 
@@ -38,11 +41,15 @@ export GITHUB_REF=refs/heads/main GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1
 #              list newest first, --jq applied (strings printed raw, as gh does)
 #   api .../commits/<sha>/pulls, .../pulls/<n>, .../actions/runs/<id>/artifacts: $FAKE_COMMIT_PULLS, $FAKE_PULL,
 #              $FAKE_ARTIFACTS (GitHub's JSON), --jq applied
+#              (a run with $GH_STATE/artifacts-<id>.json lists that instead)
+#   api repos/<owner>/<repo>/actions/runs?head_sha=<sha>, .../actions/runs/<id>/jobs: a commit's runs and a run's jobs,
+#              from $GH_STATE/runs-<owner>_<repo>-<sha>.json and jobs-<id>.json (ci_run writes them); FAKE_RUNS_ERROR=1
+#              makes listing runs fail
 #   api .../actions/runs/<id>/attempts/<n>: {status} from $GH_STATE/run-<id>-<n> (default completed)
 #   api .../collaborators/<login>/permission: {role_name} from $FAKE_ROLES (login=role,...; 404 for anyone else)
 #   api repos/<owner>/<repo>/contents/<path>: the file $FAKE_CONTENTS/<owner>/<repo>/contents/<path> (404 without it)
 #   (only the calls these scripts make; gh's own --jq is not emulated beyond that)
-#   release view/create/edit, pr list/create/edit/close: against $GH_STATE (a Release's notes, an open PR's body as
+#   release view/create/edit/upload, pr list/create/edit/close: against $GH_STATE (a Release's notes and assets, an open PR's body as
 #              pr-<head with / as _>; pr list without --head lists them as {headRefName, url}, --jq applied; a closed
 #              one becomes closed-pr-<head>, its comment comment-<head>)
 mkdir -p "$work/bin" "$work/gh-state"
@@ -75,7 +82,16 @@ case "$1 $2" in
       cat "$deployments/${BASH_REMATCH[1]}.statuses" 2>/dev/null | jq -s 'reverse' | jq -r "$jq_filter"
     elif [[ "$path" =~ /commits/[0-9a-f]+/pulls$ ]]; then jq -r "$jq_filter" <<<"${FAKE_COMMIT_PULLS:-[]}"
     elif [[ "$path" =~ /pulls/[0-9]+$ ]]; then jq -r "$jq_filter" <<<"${FAKE_PULL:-null}"
-    elif [[ "$path" =~ /actions/runs/[0-9]+/artifacts$ ]]; then jq -r "$jq_filter" <<<"${FAKE_ARTIFACTS:-[]}"
+    elif [[ "$path" =~ ^repos/([^/]+)/([^/]+)/actions/runs$ ]]; then # a commit's runs (?head_sha=), as ci_run wrote them
+      [ -z "${FAKE_RUNS_ERROR:-}" ] || { echo "gh: Server Error (HTTP 500)" >&2; exit 1; }
+      sha=$(sed -nE 's/(^|.*&)head_sha=([^&]*).*/\2/p' <<<"$query")
+      { cat "$GH_STATE/runs-${BASH_REMATCH[1]}_${BASH_REMATCH[2]}-$sha.json" 2>/dev/null || echo '{"workflow_runs":[]}'; } \
+        | jq -r "$jq_filter"
+    elif [[ "$path" =~ /actions/runs/([0-9]+)/jobs$ ]]; then
+      { cat "$GH_STATE/jobs-${BASH_REMATCH[1]}.json" 2>/dev/null || echo '{"jobs":[]}'; } | jq -r "$jq_filter"
+    elif [[ "$path" =~ /actions/runs/([0-9]+)/artifacts$ ]]; then # a run's own (ci_run), else $FAKE_ARTIFACTS
+      if [ -f "$GH_STATE/artifacts-${BASH_REMATCH[1]}.json" ]; then jq -r "$jq_filter" "$GH_STATE/artifacts-${BASH_REMATCH[1]}.json"
+      else jq -r "$jq_filter" <<<"${FAKE_ARTIFACTS:-[]}"; fi
     elif [[ "$path" =~ /actions/runs/([0-9]+)/attempts/([0-9]+)$ ]]; then # its status: $GH_STATE/run-<id>-<attempt>
       status=$(cat "$GH_STATE/run-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}" 2>/dev/null || echo completed)
       jq -n --arg s "$status" '{status: $s}' | jq -r "$jq_filter"
@@ -98,6 +114,9 @@ case "$1 $2" in
     echo "https://github.com/test/releases/tag/$3" ;;
   "release create") cp "$(arg --notes-file "$@")" "$GH_STATE/release-$3"; echo "https://github.com/test/releases/tag/$3" ;;
   "release edit") cp "$(arg --notes-file "$@")" "$GH_STATE/release-$3" ;;
+  "release upload") [ -f "$GH_STATE/release-$3" ] || { echo "release not found" >&2; exit 1; } # its assets: release-<tag>-assets/
+    mkdir -p "$GH_STATE/release-$3-assets"
+    for f in "$@"; do [ -f "$f" ] && cp "$f" "$GH_STATE/release-$3-assets/"; done; true ;;
   "pr list") head=$(arg --head "$@")
     if [ -n "$head" ]; then [ ! -f "$GH_STATE/pr-${head//\//_}" ] || echo "https://github.com/test/pull/1"
     else # every open PR, its head from the file name (the heads used here have one /), --jq applied
@@ -139,8 +158,52 @@ case "$1" in
   *) echo "fake crane: unexpected $*" >&2; exit 1 ;;
 esac
 CRANE
-chmod +x "$work/bin/gh" "$work/bin/crane"
-export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log"
+# Fake oras: a digest's SBOMs (ADR 0010) are the files in $REGISTRY/.referrers/<digest>/, named by the attached file's
+# title; discover lists each as digest sbom/<digest>/<title>, which pull fetches. FAKE_ORAS_DISCOVER_ERROR=1: discover
+# fails; FAKE_ORAS_ATTACH_ERROR=1: attach fails.
+cat >"$work/bin/oras" <<'ORAS'
+#!/usr/bin/env bash
+echo "oras $*" >>"$ORAS_LOG"
+arg() { local name=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$name" ] && { echo "$2"; return; }; shift; done; }
+ref=${*: -1}
+case "$1" in
+  discover) [ -z "${FAKE_ORAS_DISCOVER_ERROR:-}" ] || { echo "Error: TOOMANYREQUESTS" >&2; exit 1; }
+    subject=${ref#*@} dir="$REGISTRY/.referrers/${ref#*@}"
+    { [ -d "$dir" ] && ls "$dir"; true; } | jq -R . \
+      | jq -s --arg s "$subject" '{referrers: map({digest: "sbom/\($s)/\(.)", annotations: {"org.opencontainers.image.title": .}})}' ;;
+  pull) sbom=${ref##*@sbom/}
+    [ -f "$REGISTRY/.referrers/$sbom" ] || { echo "Error: $ref: not found" >&2; exit 1; }
+    cp "$REGISTRY/.referrers/$sbom" "$(arg --output "$@")/" ;;
+  attach) [ -z "${FAKE_ORAS_ATTACH_ERROR:-}" ] || { echo "Error: denied" >&2; exit 1; }
+    subject=${*: -2:1} file=${ref%:*}
+    [ -f "$file" ] || { echo "Error: no file $file" >&2; exit 1; }
+    mkdir -p "$REGISTRY/.referrers/${subject#*@}" && cp "$file" "$REGISTRY/.referrers/${subject#*@}/$file" ;;
+  *) echo "fake oras: unexpected $*" >&2; exit 1 ;;
+esac
+ORAS
+# Fake cosign: `sign` logs its call; FAKE_COSIGN_FAIL=<ref>: signing that ref fails. `verify <repository@digest>`
+# passes when $REGISTRY/.signatures/<digest> names the repository given with --certificate-github-workflow-repository
+# (the source repository the pipeline signed it from), else fails as cosign does: no signature, or none matching.
+# FAKE_COSIGN_VERIFY_ERROR=1: verify fails as when Sigstore can't be reached.
+cat >"$work/bin/cosign" <<'COSIGN'
+#!/usr/bin/env bash
+echo "cosign $*" >>"$COSIGN_LOG"
+arg() { local name=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$name" ] && { echo "$2"; return; }; shift; done; }
+ref=${*: -1}
+case "$1" in
+  sign) [ "$ref" != "${FAKE_COSIGN_FAIL:-}" ] || { echo "Error: signing $ref: fulcio unavailable" >&2; exit 1; } ;;
+  verify) [ -z "${FAKE_COSIGN_VERIFY_ERROR:-}" ] || { echo "Error: getting TUF root: connection refused" >&2; exit 1; }
+    signed="$REGISTRY/.signatures/${ref#*@}"
+    [ -f "$signed" ] || { echo "Error: no signatures found" >&2; exit 1; }
+    [ "$(cat "$signed")" = "$(arg --certificate-github-workflow-repository "$@")" ] \
+      || { echo "Error: no matching signatures: certificate extensions" >&2; exit 1; }
+    echo '[{"critical":{}}]' ;;
+  *) echo "fake cosign: unexpected $*" >&2; exit 1 ;;
+esac
+COSIGN
+chmod +x "$work/bin/gh" "$work/bin/crane" "$work/bin/oras" "$work/bin/cosign"
+export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log" ORAS_LOG="$work/oras.log"
+export COSIGN_LOG="$work/cosign.log"
 
 # This checkout's clusters/local with the pins as they were before QA's first release candidate (prod on 0.2.0,
 # apps-qa suspended), whatever main pins now: promotions change the live pins, and the tests must not change with them.
@@ -204,9 +267,9 @@ recorded_off_main() {
   local id
   id=$(jq -n --arg env "$1" --arg ref "$2" '{ref: $ref, environment: $env, auto_merge: false, required_contexts: [],
         payload: {workflow_ref: "refs/heads/feature", run_url: "https://github.com/test/actions/runs/66"}}' \
-    | gh api repos/pkhamdee/modernapp/deployments --method POST --input - --jq .id)
+    | gh api repos/pkhamdee/eshop-infra/deployments --method POST --input - --jq .id)
   jq -n --arg state "$3" '{state: $state, log_url: "https://github.com/test/actions/runs/66"}' \
-    | gh api "repos/pkhamdee/modernapp/deployments/$id/statuses" --method POST --input - >/dev/null
+    | gh api "repos/pkhamdee/eshop-infra/deployments/$id/statuses" --method POST --input - >/dev/null
 }
 
 rc_on_new_series() {
@@ -594,6 +657,14 @@ check "promotion-pr.sh refuses a candidate for prod and a release for QA (script
 services=$(jq -r '.[].service' "$root/.github/services.json")
 fake_digest() { echo "sha256:$(echo "$1" | git hash-object --stdin)$(echo "x$1" | git hash-object --stdin | cut -c1-24)"; }
 image() { echo "$REGISTRY/docker.io/pkhamdee/$1/$2"; } # the fake registry's file for image <service> tag <tag>
+sbom_file() { echo "$REGISTRY/.referrers/$(fake_digest "$1")/$1.cdx.json"; } # <service>'s candidate digest's SBOM
+# <service>'s candidate digest signed by the pipeline from [repository] (default its own, .github/services.json).
+sign_image() {
+  mkdir -p "$REGISTRY/.signatures"
+  echo "${2:-$(jq -r --arg s "$1" '.[] | select(.service == $s) | .repository' "$root/.github/services.json")}" \
+    >"$REGISTRY/.signatures/$(fake_digest "$1")"
+}
+put_sbom() { mkdir -p "$(dirname "$(sbom_file "$1")")" && jq -n --arg s "$1" '{bomFormat: "CycloneDX", service: $s}' >"$(sbom_file "$1")"; }
 # Main pins QA to 0.3.0-rc.1 in a commit made at $pinned_at (sign_off_setup); QA's smoke tests of it run after that.
 pinned_at=2026-10-30T00:00:00Z
 qa_run=https://github.com/test/actions/runs/7
@@ -626,6 +697,8 @@ sign_off_setup() {
   # Every image but thirdparty-mock's carries its source commit (CI's revision label).
   mkdir -p "$REGISTRY/.revision"
   for svc in $services; do [ "$svc" = thirdparty-mock ] || echo "rev-$svc" >"$REGISTRY/.revision/$(fake_digest "$svc")"; done
+  for svc in $services; do put_sbom "$svc"; done # each pushed with its SBOM (ADR 0010)
+  for svc in $services; do sign_image "$svc"; done # and signed by the pipeline, from its repository (ADR 0011)
   qa_tested success
 }
 sign_off_pr() { (cd "$clone" && scripts/sign-off-pr.sh) >"$work/out" 2>&1; }
@@ -637,6 +710,23 @@ pin_qa() { # pin_qa <candidate>: tags it (on rc.1's commit) if needed and pins Q
   (cd "$clone" && scripts/pin-release.sh qa "$1" >/dev/null 2>&1)
   git -C "$clone" commit -qam "eshop-qa: deploy v$1" && git -C "$clone" push -q origin HEAD:main
 }
+# A service repository's CI run of a commit, as `gh api` lists it (scripts/gate-reports.sh): its push job ended
+# <push>, and it kept perf-report (id <run>1) and dast-report (id <run>2) unless [artifacts JSON] says otherwise.
+# ci_run <owner/repo> <sha> <run id> <created_at> <event> <push: success|skipped|failure> [artifacts JSON]
+ci_run() {
+  local runs="$GH_STATE/runs-${1/\//_}-$2.json"
+  [ -f "$runs" ] || echo '{"workflow_runs":[]}' >"$runs"
+  jq --argjson id "$3" --arg at "$4" --arg ev "$5" --arg repo "$1" \
+    '.workflow_runs += [{id: $id, created_at: $at, event: $ev, html_url: "https://github.com/\($repo)/actions/runs/\($id)"}]' \
+    "$runs" >"$runs.new" && mv "$runs.new" "$runs"
+  jq -n --arg push "$6" '{jobs: [{name: "image / temporary copy and gates", conclusion: (if $push == "skipped" then "failure" else "success" end)},
+    {name: "image / push images", conclusion: $push}]}' >"$GH_STATE/jobs-$3.json"
+  if [ -n "${7:-}" ]; then echo "$7"; else
+    jq -n --argjson id "$3" --arg at "$4" '{artifacts: [{id: ($id * 10 + 1), name: "perf-report", expired: false, created_at: $at},
+      {id: ($id * 10 + 2), name: "dast-report", expired: false, created_at: $at}]}'
+  fi >"$GH_STATE/artifacts-$3.json"
+}
+api_run() { echo "https://github.com/pkhamdee/eshop-api/actions/runs/$1"; } # an eshop-api run's URL, as ci_run lists it
 lists_images() { # lists_images <file> <tag>: names every service's image at <tag> with its candidate's digest
   local svc
   for svc in $services; do grep -qF "docker.io/pkhamdee/$svc:$2@$(fake_digest "$svc")" "$1" || return 1; done
@@ -644,6 +734,7 @@ lists_images() { # lists_images <file> <tag>: names every service's image at <ta
 
 opens_sign_off_pr() {
   sign_off_setup sign-off-pr
+  ci_run pkhamdee/eshop-api rev-eshop-api 500 2026-10-20T00:00:00Z push success
   : >"$GH_LOG"
   sign_off_pr || return 1
   local branch=refs/heads/sign-off/0.3.0-rc.1 record="$work/record"
@@ -653,14 +744,18 @@ opens_sign_off_pr() {
     && [ "$(origin diff --name-only "$branch~1" "$branch")" = releases/0.3.0.md ] \
     && grep -qxF "Candidate: \`v0.3.0-rc.1\`" "$record" && grep -qF "$rc_commit" "$record" \
     && lists_images "$record" 0.3.0-rc.1 \
-    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`" "$record" \
-    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`$" "$record" \
+    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`; SBOM attached" "$record" \
+    && grep -qE "thirdparty-mock:0\.3\.0-rc\.1@$(fake_digest thirdparty-mock)\`; SBOM attached; signed$" "$record" \
+    && grep -qxF '## Gates' "$record" \
+    && grep -qF -- "- eshop-api, built from \`rev-esh\` in pkhamdee/eshop-api: [CI run]($(api_run 500)), Locust [perf-report]($(api_run 500)/artifacts/5001), ZAP [dast-report]($(api_run 500)/artifacts/5002)" "$record" \
+    && grep -qF -- "- eshop-web, built from \`rev-esh\` in pkhamdee/eshop-web: no CI run of that commit pushed it" "$record" \
+    && grep -qF -- '- thirdparty-mock: no source commit' "$record" \
     && grep -qF "$qa_run" "$record" && grep -qF "$qa_run/artifacts/99" "$record" && grep -qF 'Deployment 1 ' "$record" \
-    && grep -qF 'gh pr create --repo pkhamdee/modernapp --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
+    && grep -qF 'gh pr create --repo pkhamdee/eshop-infra --base main --head sign-off/0.3.0-rc.1 --title Sign off v0.3.0-rc.1' "$GH_LOG" \
     && grep -qF "$qa_run/artifacts/99" "$GH_STATE/pr-sign-off_0.3.0-rc.1" \
     && grep -qF 'Sign-off PR: https://github.com/test/pull/1' "$work/out"
 }
-check "sign-off-pr.sh opens \"Sign off vX.Y.Z-rc.N\" when QA's Deployment of the candidate it runs succeeded, adding releases/X.Y.Z.md (candidate, digests, run, Playwright report, Deployment)" \
+check "sign-off-pr.sh opens \"Sign off vX.Y.Z-rc.N\" when QA's Deployment of the candidate it runs succeeded, adding releases/X.Y.Z.md (candidate, digests, each image's gate reports, run, Playwright report, Deployment)" \
   opens_sign_off_pr
 opens_once() { # after opens_sign_off_pr: nothing new to say, so no push and no second PR
   local head
@@ -670,6 +765,38 @@ opens_once() { # after opens_sign_off_pr: nothing new to say, so no push and no 
     && ! grep -qE '^gh pr (create|edit)' "$GH_LOG" && grep -qF 'up to date' "$work/out"
 }
 check "sign-off-pr.sh run again opens no second PR and pushes nothing" opens_once
+flags_missing_sbom() {
+  sign_off_setup sign-off-pr-sbom
+  rm "$(sbom_file eshop-web)"
+  sign_off_pr || return 1
+  local record="$work/record"
+  origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md >"$record" \
+    && grep -qF "eshop-web:0.3.0-rc.1@$(fake_digest eshop-web)\`, built from \`rev-eshop-web\`; **no SBOM: sign-off will refuse it**" "$record" \
+    && grep -qF "eshop-api:0.3.0-rc.1@$(fake_digest eshop-api)\`, built from \`rev-eshop-api\`; SBOM attached" "$record" || return 1
+  sign_off_setup sign-off-pr-sbom-unreadable
+  FAKE_ORAS_DISCOVER_ERROR=1 sign_off_pr \
+    && origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md | grep -qF "SBOM not checked (the registry couldn't be read)"
+}
+check "sign-off-pr.sh still opens the PR when an image has no SBOM (or the registry can't be read) and says so on its line" \
+  flags_missing_sbom
+shows_signatures() {
+  sign_off_setup sign-off-pr-signatures
+  rm "$REGISTRY/.signatures/$(fake_digest eshop-web)"                # pushed before signing: unsigned
+  sign_image eshop-node-api pkhamdee/eshop-web                        # signed, but from another service's repository
+  : >"$COSIGN_LOG"
+  sign_off_pr || return 1
+  local record="$work/record"
+  origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md >"$record" \
+    && grep -qF "eshop-web:0.3.0-rc.1@$(fake_digest eshop-web)\`, built from \`rev-eshop-web\`; SBOM attached; **not signed**" "$record" \
+    && grep -qF "eshop-node-api:0.3.0-rc.1@$(fake_digest eshop-node-api)\`, built from \`rev-eshop-node-api\`; SBOM attached; **not signed**" "$record" \
+    && grep -qF "eshop-sync-master:0.3.0-rc.1@$(fake_digest eshop-sync-master)\`, built from \`rev-eshop-sync-master\`; SBOM attached; signed" "$record" \
+    && grep -qF -- "--certificate-identity https://github.com/pkhamdee/eshop-infra/.github/workflows/service-image.yml@refs/heads/main --certificate-github-workflow-repository pkhamdee/eshop-api docker.io/pkhamdee/eshop-sync-master@$(fake_digest eshop-sync-master)" "$COSIGN_LOG" || return 1
+  sign_off_setup sign-off-pr-signatures-unknown
+  FAKE_COSIGN_VERIFY_ERROR=1 sign_off_pr \
+    && origin show refs/heads/sign-off/0.3.0-rc.1:releases/0.3.0.md | grep -qF "; SBOM attached; signature not checked (cosign couldn't tell)"
+}
+check "sign-off-pr.sh shows each image's signature by eShop's pipeline from its own repository (signed, not signed, not checked) and opens the PR regardless" \
+  shows_signatures
 
 no_pr() { # no_pr <expected message part>: sign-off-pr.sh succeeds, opens no PR and pushes no sign-off branch
   : >"$GH_LOG"
@@ -708,7 +835,7 @@ closes_on_pin_move() {
   : >"$GH_LOG"
   sign_off_pr && [ -f "$GH_STATE/closed-pr-sign-off_0.3.0-rc.1" ] \
     && grep -qF 'eshop-qa is pinned to 0.3.0-rc.2 on main' "$GH_STATE/comment-sign-off_0.3.0-rc.1" \
-    && grep -qF 'gh pr close sign-off/0.3.0-rc.1 --repo pkhamdee/modernapp' "$GH_LOG" \
+    && grep -qF 'gh pr close sign-off/0.3.0-rc.1 --repo pkhamdee/eshop-infra' "$GH_LOG" \
     && ! grep -q '^gh pr create' "$GH_LOG"
 }
 check "sign-off-pr.sh closes another candidate's sign-off PR, with a comment, once QA's pin moves" closes_on_pin_move
@@ -768,10 +895,10 @@ FAKE_COMMIT_PULLS='[]' check "sign-off.sh refuses a record that no merged PR bro
   sign_off_refused "no merged pull request brought in $after"
 FAKE_PULL='{"number":5,"html_url":"https://github.com/test/pull/5","merged_by":{"login":"tester"}}' \
   check "sign-off.sh refuses a sign-off PR merged by someone who is not a maintainer (role write)" \
-  sign_off_refused "tester merged https://github.com/test/pull/5 but is not a maintainer of pkhamdee/modernapp (role: write)"
+  sign_off_refused "tester merged https://github.com/test/pull/5 but is not a maintainer of pkhamdee/eshop-infra (role: write)"
 FAKE_PULL='{"number":5,"html_url":"https://github.com/test/pull/5","merged_by":{"login":"stranger"}}' \
   check "sign-off.sh refuses when the merger's role can't be read" \
-  sign_off_refused "could not read stranger's role in pkhamdee/modernapp"
+  sign_off_refused "could not read stranger's role in pkhamdee/eshop-infra"
 
 qa_moved_refused() {
   pin_qa 0.3.0-rc.2
@@ -795,7 +922,7 @@ check "sign-off.sh refuses while apps-qa is suspended on main" qa_suspended_refu
 no_qa_deployment_refused() {
   no_deployments
   sign_off_refused "no Deployment of v0.3.0-rc.1 to qa since eshop-qa was pinned to it ($pinned_at)" \
-    && grep -qF 'gh api repos/pkhamdee/modernapp/deployments?environment=qa&ref=v0.3.0-rc.1' "$GH_LOG" || return 1
+    && grep -qF 'gh api repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=v0.3.0-rc.1' "$GH_LOG" || return 1
   FAKE_NOW=2026-10-29T23:00:00Z qa_tested success # before the pin change: an earlier deployment
   sign_off_refused "no Deployment of v0.3.0-rc.1 to qa since eshop-qa was pinned to it ($pinned_at)"
 }
@@ -828,6 +955,19 @@ missing_image_refused() {
   return $refused
 }
 check "sign-off.sh refuses when a candidate image is missing (copies none)" missing_image_refused
+missing_sbom_refused() {
+  mv "$(sbom_file eshop-web)" "$work/held-sbom"
+  sign_off_refused 'candidate image docker.io/pkhamdee/eshop-web:0.3.0-rc.1 has no SBOM (ADR 0010)' \
+    && grep -qF 'scripts/gates/attach-sbom.sh --earlier-build docker.io/pkhamdee/eshop-web:0.3.0-rc.1 /dev/null' "$work/out"
+  local refused=$?
+  mv "$work/held-sbom" "$(sbom_file eshop-web)"
+  return $refused
+}
+check "sign-off.sh refuses when a candidate image has no SBOM, saying how to attach one (copies none)" missing_sbom_refused
+unreadable_sbom_refused() {
+  FAKE_ORAS_DISCOVER_ERROR=1 sign_off_refused "could not read the SBOM of docker.io/pkhamdee/eshop-api@$(fake_digest eshop-api)"
+}
+check "sign-off.sh refuses when an SBOM can't be read (unknown is not absent)" unreadable_sbom_refused
 other_release_image_refused() {
   echo sha256:other >"$(image eshop-web 0.3.0)"
   sign_off_refused 'docker.io/pkhamdee/eshop-web:0.3.0 already exists with a different digest'
@@ -859,6 +999,14 @@ same_digests() { # every service's 0.3.0 image exists with its candidate's diges
     [ -f "$(image "$svc" 0.3.0)" ] && [ "$(cat "$(image "$svc" 0.3.0)")" = "$(fake_digest "$svc")" ] || return 1
   done
 }
+release_sboms() { # the Release's assets: every image's SBOM, as <service>-0.3.0.cdx.json
+  local svc
+  [ "$(find "$GH_STATE/release-v0.3.0-assets" -type f | wc -l)" -eq "$(wc -w <<<"$services")" ] || return 1
+  for svc in $services; do
+    [ "$(jq -r .service "$GH_STATE/release-v0.3.0-assets/$svc-0.3.0.cdx.json")" = "$svc" ] || return 1
+  done
+  grep -qE '^gh release upload v0.3.0 --repo pkhamdee/eshop-infra --clobber ' "$GH_LOG"
+}
 signs_off() {
   signed_off_setup sign-off || return 1
   : >"$GH_LOG"; : >"$CRANE_LOG"
@@ -872,14 +1020,15 @@ signs_off() {
     && grep -qE '^crane copy docker.io/pkhamdee/eshop-api@sha256:[0-9a-f]+ docker.io/pkhamdee/eshop-api:0.3.0$' "$CRANE_LOG" \
     && lists_images "$release" 0.3.0 \
     && grep -qF "$qa_run" "$release" && grep -qF '@qa-lead' "$release" && grep -qF 'https://github.com/test/pull/5' "$release" \
-    && grep -qF 'gh release create v0.3.0 --repo pkhamdee/modernapp --verify-tag' "$GH_LOG" \
+    && grep -qF 'gh release create v0.3.0 --repo pkhamdee/eshop-infra --verify-tag' "$GH_LOG" \
+    && release_sboms && grep -qxF '### SBOMs' "$release" \
     && [ "$(origin log -1 --format=%s refs/heads/promote/prod-0.3.0)" = "eshop-prod: deploy v0.3.0" ] \
     && [ "$(origin show refs/heads/promote/prod-0.3.0:clusters/local/prod-release.yaml | grep -c '"0.3.0" # release-pin: prod$')" -ge 2 ] \
     && lists_images "$pr" 0.3.0 && grep -qF "$qa_run" "$pr" && grep -qF '@qa-lead' "$pr" \
     && grep -qF 'https://github.com/test/releases/tag/v0.3.0' "$pr" \
     && grep -qF 'Promotion PR: https://github.com/test/pull/1' "$work/out"
 }
-check "sign-off.sh on the merged sign-off PR tags vX.Y.Z on the candidate's commit (naming the merger), copies its images by digest, publishes the Release and opens the prod promotion PR" \
+check "sign-off.sh on the merged sign-off PR tags vX.Y.Z on the candidate's commit (naming the merger), copies its images by digest, publishes the Release with each image's SBOM and opens the prod promotion PR" \
   signs_off
 signs_off_again() { # after signs_off: the same sign-off again finds every step done and updates the Release and PR
   local tag_object
@@ -889,7 +1038,7 @@ signs_off_again() { # after signs_off: the same sign-off again finds every step 
   sign_off \
     && [ "$(origin rev-parse refs/tags/v0.3.0)" = "$tag_object" ] && same_digests \
     && ! grep -q '^crane copy' "$CRANE_LOG" \
-    && grep -q '^gh release edit v0.3.0' "$GH_LOG" && ! grep -q '^gh release create' "$GH_LOG" \
+    && grep -q '^gh release edit v0.3.0' "$GH_LOG" && ! grep -q '^gh release create' "$GH_LOG" && release_sboms \
     && grep -q '^gh pr edit' "$GH_LOG" && ! grep -q '^gh pr create' "$GH_LOG"
 }
 check "sign-off.sh run again (a re-run of the job) changes no tag or image and updates the Release and the PR" \
@@ -907,6 +1056,69 @@ finishes_interrupted_sign_off() {
 }
 check "sign-off.sh interrupted half-way is finished by running it again" finishes_interrupted_sign_off
 no_deployments
+
+# --- scripts/gate-reports.sh (each candidate image's CI run and gate reports: the QA promotion PR, the sign-off record) ---
+
+# A fresh origin (for .github/services.json) and a registry of 0.3.0-rc.1 images: eshop-api and eshop-sync-master
+# built from one eshop-api commit, eshop-web from its own, thirdparty-mock with no revision label.
+reports_setup() {
+  clone=$(fresh "$1")
+  rm -rf "${GH_STATE:?}"/*
+  export REGISTRY="$work/$1/registry"
+  mkdir -p "$REGISTRY/.revision"
+  local svc
+  for svc in eshop-api eshop-sync-master eshop-web thirdparty-mock; do
+    mkdir -p "$(dirname "$(image "$svc" x)")" && fake_digest "$svc" >"$(image "$svc" 0.3.0-rc.1)"
+  done
+  echo aaaaaaa1111 >"$REGISTRY/.revision/$(fake_digest eshop-api)"
+  echo aaaaaaa1111 >"$REGISTRY/.revision/$(fake_digest eshop-sync-master)"
+  echo bbbbbbb2222 >"$REGISTRY/.revision/$(fake_digest eshop-web)"
+}
+reports() { (cd "$clone" && scripts/gate-reports.sh "$@") >"$work/out" 2>&1; }
+candidate_image() { echo "docker.io/pkhamdee/$1:0.3.0-rc.1@$(fake_digest "$1")"; }
+web_run=https://github.com/pkhamdee/eshop-web/actions/runs/400
+
+links_the_run_that_pushed() {
+  reports_setup gate-reports
+  ci_run pkhamdee/eshop-api aaaaaaa1111 300 2026-10-01T00:00:00Z pull_request success # a PR's: never the image's
+  ci_run pkhamdee/eshop-api aaaaaaa1111 303 2026-10-01T03:00:00Z workflow_dispatch success # later: pushed nothing new
+  ci_run pkhamdee/eshop-api aaaaaaa1111 301 2026-10-01T01:00:00Z push skipped # a gate failed: pushed nothing
+  ci_run pkhamdee/eshop-api aaaaaaa1111 302 2026-10-01T02:00:00Z workflow_dispatch success # the one that pushed
+  reports "$(candidate_image eshop-api)" "$(candidate_image eshop-sync-master)" || return 1
+  local links
+  links="[CI run]($(api_run 302)), Locust [perf-report]($(api_run 302)/artifacts/3021), ZAP [dast-report]($(api_run 302)/artifacts/3022)"
+  [ "$(cat "$work/out")" = "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: $links
+- eshop-sync-master, built from \`aaaaaaa\` in pkhamdee/eshop-api: $links" ]
+}
+check "gate-reports.sh links the first run of the image's commit whose push job succeeded, and its Locust and ZAP reports (skipping failed, later and PR runs)" \
+  links_the_run_that_pushed
+each_image_its_own_run() { # after links_the_run_that_pushed: a patch image (its release/N.x build) and one carried
+  # over from an earlier release resolve the same way, each to the run of the commit it was built from
+  ci_run pkhamdee/eshop-web bbbbbbb2222 400 2026-09-01T00:00:00Z push success
+  reports "$(candidate_image eshop-web)" "$(candidate_image eshop-api)" \
+    && grep -qF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: [CI run]($web_run), Locust [perf-report]($web_run/artifacts/4001)" "$work/out" \
+    && grep -qF -- "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: [CI run]($(api_run 302))" "$work/out"
+}
+check "gate-reports.sh links each image to the run of the commit it was built from, in its service's repository" each_image_its_own_run
+says_what_is_missing() {
+  reports_setup gate-reports-missing
+  ci_run pkhamdee/eshop-api aaaaaaa1111 301 2026-10-01T01:00:00Z push skipped
+  ci_run pkhamdee/eshop-web bbbbbbb2222 400 2026-09-01T00:00:00Z push success \
+    '{"artifacts":[{"id":4001,"name":"perf-report","expired":true,"created_at":"2026-09-01T00:00:00Z"}]}'
+  reports "$(candidate_image eshop-api)" "$(candidate_image eshop-web)" "$(candidate_image thirdparty-mock)" \
+    && grep -qxF -- "- eshop-api, built from \`aaaaaaa\` in pkhamdee/eshop-api: no CI run of that commit pushed it, so its gate reports can't be found" "$work/out" \
+    && grep -qxF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: [CI run]($web_run), Locust perf-report expired, ZAP dast-report not found in the run" "$work/out" \
+    && grep -qF -- "- thirdparty-mock: no source commit (the image has no org.opencontainers.image.revision label)" "$work/out" \
+    && FAKE_RUNS_ERROR=1 reports "$(candidate_image eshop-web)" \
+    && grep -qxF -- "- eshop-web, built from \`bbbbbbb\` in pkhamdee/eshop-web: could not read its CI runs" "$work/out"
+}
+check "gate-reports.sh says on each image's line what it can't find (no label, no run that pushed, a report expired or missing, runs unreadable) and still succeeds" \
+  says_what_is_missing
+malformed_image_refused() {
+  ! reports docker.io/pkhamdee/eshop-api:0.3.0-rc.1 && grep -qF 'not an image with its digest' "$work/out" \
+    && ! reports && grep -qF 'usage: scripts/gate-reports.sh' "$work/out"
+}
+check "gate-reports.sh refuses an image without its digest, and no image at all" malformed_image_refused
 
 # --- scripts/check-new-images.sh (CI's push job, before pushing a version's images) ---
 
@@ -1392,7 +1604,7 @@ rm -rf "$GH_STATE/deployments"
 
 # --- scripts/protect-main.sh (main's ruleset and the release environment; applied by a maintainer) ---
 
-repo_api=repos/pkhamdee/modernapp
+repo_api=repos/pkhamdee/eshop-infra
 web_api=repos/pkhamdee/eshop-web
 # eshop-web's CI on its main, as GitHub serves it: a lint job, and the shared gates (service-image.yml) after it.
 export FAKE_CONTENTS="$work/contents"
@@ -1409,7 +1621,7 @@ jobs:
   image:
     name: image
     needs: [lint]
-    uses: pkhamdee/modernapp/.github/workflows/service-image.yml@main
+    uses: pkhamdee/eshop-infra/.github/workflows/service-image.yml@main
     with:
       images: '[{"service": "eshop-web", "context": ".", "dockerfile": "Dockerfile"}]'
     secrets: inherit
@@ -1635,6 +1847,87 @@ unreadable_registry_fails() {
   ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
 }
 check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
+# --- scripts/gates/attach-sbom.sh (the push jobs: each pushed image's SBOM as a referrer of its digest, ADR 0010) ---
+
+export REGISTRY="$work/attach-sbom/registry"
+sbom_dir="$work/attach-sbom/sbom"
+mkdir -p "$sbom_dir" && echo '{"bomFormat":"CycloneDX","from":"this run"}' >"$sbom_dir/svc-a.cdx.json"
+# The generator for an earlier build: records its argument, writes <repository>.cdx.json as sbom.sh does.
+cat >"$work/attach-sbom/generator" <<'GEN'
+#!/usr/bin/env bash
+echo "$1" >>"$GENERATOR_LOG"; repository=${1%@*}
+echo '{"bomFormat":"CycloneDX","from":"registry"}' >"$REPORT_DIR/${repository##*/}.cdx.json"
+GEN
+chmod +x "$work/attach-sbom/generator"
+export SBOM_GENERATOR="$work/attach-sbom/generator" GENERATOR_LOG="$work/attach-sbom/generator.log"
+attach() { : >"$ORAS_LOG"; : >"$GENERATOR_LOG"; "$root/scripts/gates/attach-sbom.sh" "$@" "$sbom_dir/svc-a.cdx.json" >"$work/out" 2>&1; }
+referrer() { cat "$REGISTRY/.referrers/$1/svc-a.cdx.json" 2>/dev/null; }
+put_image svc-a main-aaaaaaa-100 sha256:a1
+attaches_to_digest() {
+  attach docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && grep -qF '"this run"' <(referrer sha256:a1) \
+    && grep -qF 'oras attach --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/svc-a@sha256:a1 svc-a.cdx.json:application/vnd.cyclonedx+json' "$ORAS_LOG"
+}
+check "attach-sbom.sh attaches the SBOM to the digest the tag names, titled by its file name" attaches_to_digest
+keeps_existing() {
+  echo '{"bomFormat":"CycloneDX","from":"first run"}' >"$REGISTRY/.referrers/sha256:a1/svc-a.cdx.json"
+  attach docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && ! grep -q 'oras attach' "$ORAS_LOG" \
+    && grep -qF '"first run"' <(referrer sha256:a1) && grep -qF 'already has an SBOM: kept' "$work/out"
+}
+check "attach-sbom.sh never replaces an SBOM the digest already has" keeps_existing
+put_image svc-a main-bbbbbbb-200 sha256:b1
+earlier_build_regenerates() {
+  attach --earlier-build docker.io/pkhamdee/svc-a:main-bbbbbbb-200 \
+    && [ "$(cat "$GENERATOR_LOG")" = docker.io/pkhamdee/svc-a@sha256:b1 ] && grep -qF '"registry"' <(referrer sha256:b1)
+}
+check "attach-sbom.sh --earlier-build makes the SBOM from the registry digest, not from this run's rebuild" \
+  earlier_build_regenerates
+earlier_build_kept() {
+  attach --earlier-build docker.io/pkhamdee/svc-a:main-aaaaaaa-100 && [ ! -s "$GENERATOR_LOG" ] \
+    && ! grep -q 'oras attach' "$ORAS_LOG"
+}
+check "attach-sbom.sh --earlier-build keeps an earlier build's SBOM without making another" earlier_build_kept
+put_image svc-a main-ccccccc-300 sha256:c1
+unknown_referrers_fail() {
+  ! FAKE_ORAS_DISCOVER_ERROR=1 attach docker.io/pkhamdee/svc-a:main-ccccccc-300 \
+    && grep -qF "can't tell whether it has an SBOM" "$work/out" && [ -z "$(referrer sha256:c1)" ]
+}
+check "attach-sbom.sh fails when the referrers can't be read (unknown is not absent)" unknown_referrers_fail
+attach_failure_fails() { ! FAKE_ORAS_ATTACH_ERROR=1 attach docker.io/pkhamdee/svc-a:main-ccccccc-300; }
+check "attach-sbom.sh fails when the attach fails" attach_failure_fails
+missing_image_fails() {
+  ! attach docker.io/pkhamdee/svc-a:main-0000000-1 && grep -qF 'could not read the digest' "$work/out" \
+    && ! grep -q 'oras attach' "$ORAS_LOG"
+}
+check "attach-sbom.sh fails when the tag doesn't exist" missing_image_fails
+
+# --- scripts/gates/sign-images.sh (service-image.yml's push job: sign only the digests this run pushed, ADR 0011) ---
+
+pushed="$work/sign-images/pushed.txt"
+mkdir -p "$work/sign-images"
+da=sha256:$(printf 'a%.0s' $(seq 64)) db=sha256:$(printf 'b%.0s' $(seq 64))
+sign() { : >"$COSIGN_LOG"; "$root/scripts/gates/sign-images.sh" "$pushed" >"$work/out" 2>&1; }
+signs_each_digest_once() {
+  printf '%s\n' "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  sign && [ "$(cat "$COSIGN_LOG")" = "cosign sign --yes docker.io/pkhamdee/svc-a@$da
+cosign sign --yes docker.io/pkhamdee/svc-b@$db" ]
+}
+check "sign-images.sh signs each pushed digest once (an image's two tags share it), by digest" signs_each_digest_once
+nothing_pushed_signs_nothing() { : >"$pushed"; sign && [ ! -s "$COSIGN_LOG" ] && grep -qF 'nothing to sign' "$work/out"; }
+check "sign-images.sh signs nothing when the run pushed nothing (a re-run never signs an existing image)" \
+  nothing_pushed_signs_nothing
+tag_refused() {
+  printf '%s\n' docker.io/pkhamdee/svc-a:main-aaaaaaa-100 "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  ! sign && ! grep -qF 'svc-a' "$COSIGN_LOG" && grep -qF "svc-b@$db" "$COSIGN_LOG" \
+    && grep -qF 'not a digest reference, not signed: docker.io/pkhamdee/svc-a:main-aaaaaaa-100' "$work/out"
+}
+check "sign-images.sh never signs a tag (it can move), signs the rest, and fails" tag_refused
+failure_tries_all() {
+  printf '%s\n' "docker.io/pkhamdee/svc-a@$da" "docker.io/pkhamdee/svc-b@$db" >"$pushed"
+  ! FAKE_COSIGN_FAIL="docker.io/pkhamdee/svc-a@$da" sign && grep -qF "svc-b@$db" "$COSIGN_LOG" \
+    && grep -qF 'the fix is a new commit' "$work/out"
+}
+check "sign-images.sh tries every image when one fails, then fails saying a new commit is the fix" failure_tries_all
 
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 

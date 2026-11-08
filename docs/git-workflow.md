@@ -153,7 +153,7 @@ Every push to `main`, Flux's image-update commits included, starts the **E2E smo
 runner inside the cluster; nobody dispatches it. The run:
 
 1. records a GitHub **Deployment** of that commit to `dev`, in progress (`scripts/deployment.sh`; Code → Deployments,
-   or `gh api repos/pkhamdee/modernapp/deployments?environment=dev`);
+   or `gh api repos/pkhamdee/eshop-infra/deployments?environment=dev`);
 2. waits until `eshop-dev` serves the commit (`e2e/check-serving.sh --wait dev <commit>`: `apps-dev` applied
    `main@sha1:<commit>` and every Deployment rolled out from it), for up to 15 minutes, else fails as "not deployed";
 3. runs Playwright against `https://eshop.localhost`, retrying a failed test once (a pass on the retry passes, and the
@@ -172,7 +172,7 @@ eShop's services are moving into repositories of their own (ADR 0009): **`pkhamd
 (eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**, **`pkhamdee/eshop-node-api`** and
 **`pkhamdee/thirdparty-mock`**. This
 repository keeps everything that describes and releases the whole system, and the one issue tracker: a service
-repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/modernapp#N`. Clone them beside this one
+repository has no issues and no `v*` tags, and its PRs reference `pkhamdee/eshop-infra#N`. Clone them beside this one
 with `scripts/clone-all.sh` (docs/setup.md, "Service repositories").
 
 A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tests, then calls this repository's
@@ -185,7 +185,12 @@ A service repository's CI (`.github/workflows/ci.yml`) runs its own lint and tes
   `docker.io/pkhamdee/<service>:main-<sha>` and `main-<sha>-<ts>`, where `<sha>` is the service repository's commit
   (also in the image's `org.opencontainers.image.revision` label). A failure anywhere means nothing is pushed, and
   a tag that already exists is never pushed again (`scripts/gates/tags-to-push.sh`): a second run of the same commit
-  leaves the image dev tested in place;
+  leaves the image dev tested in place. Each pushed digest then gets its CycloneDX SBOM as a registry referrer
+  (`scripts/gates/attach-sbom.sh`, [ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)); a second run
+  only fills in one that is missing. Each digest the run pushed is also **signed**, keyless, with the run's GitHub
+  identity (`scripts/gates/sign-images.sh`, [ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md));
+  a second run signs nothing, so an image whose signing failed stays unsigned and the fix is a new commit. The
+  calling `image` job grants `permissions: {contents: read, id-token: write}`;
 - on a push to its `release/N.x`: the same, pushed as `release-N.x-<sha>-<ts>` (a patch's image, never deployed to
   dev; the next patch candidate takes it, [Patch release](#patch-release-also-hotfixes)).
 
@@ -258,7 +263,8 @@ already passed rather than rebuilding it (`scripts/candidate-images.sh`,
 - **A candidate that brings in `main`** (a new `release/N.x`, or the merge above): every image is the one that `main`
   commit's dev pins name (`deploy/apps/dev`, and `deploy/thirdparty` for thirdparty-mock), which is what dev's smoke
   test passed. Nothing is built, so the gates and the image scan don't run again: each image passed them when it was
-  built on `main`. QA gets the exact bytes dev tested.
+  built on `main`. QA gets the exact bytes dev tested, and the SBOM attached to that digest when it was pushed
+  ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)).
 - **Any other candidate** (the branch head: a patch): each service takes the newest patch image its repository
   built on `release/N.x`, `release-N.x-<sha>-<ts>`, made after the previous `v*` tag on the branch (`<ts>`, its
   commit's time, later than the tag's); a service with none is copied from that previous version's image. An older
@@ -269,6 +275,14 @@ A pin or an image it can't resolve fails the run: nothing untested is filled in.
 source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
 `main` whose only commit is the pin edit, and a PR **`eshop-qa: deploy vX.Y.Z-rc.N`** listing the candidate's
 commit, its images with digests, each gate's result and the CI run (whose artifacts are the gate reports).
+
+A copied image's gates ran when it was built, not in this run, so the PR also lists, per image, **the CI run that
+pushed it and that run's Locust (`perf-report`) and ZAP (`dast-report`) reports** (`scripts/gate-reports.sh`). The
+run is found from the image's `org.opencontainers.image.revision` label and its service's `repository` in
+`.github/services.json`: that commit's first run whose push job succeeded (a run that failed a gate pushed nothing; a
+later run of the commit pushes nothing either). A patch image links its `release/N.x` build, and an image carried over
+from an earlier release the run that first built it. What can't be found (no label, no such run, a report missing or
+expired: GitHub keeps artifacts 90 days by default) is said on that image's line, and the promotion goes on.
 
 **Merging it is QA's approval**; nothing reaches QA otherwise. A newer candidate's PR supersedes an unmerged older
 one: close the old one. Without `PROMOTION_TOKEN` the job fails after the push and says so; set the secret and re-run
@@ -295,7 +309,7 @@ cluster serves it), `flux get kustomization apps-qa`, `kubectl -n eshop-qa get d
 **Merging the QA promotion PR starts QA's smoke test automatically**: the push to `main` changes the
 `# release-pin: qa` lines, so the E2E smoke test (`.github/workflows/e2e.yml`, run `E2E push <commit>`) tests
 `eshop-qa` at the newly pinned candidate instead of dev, as [Dev's smoke test](#devs-smoke-test) describes. It records
-a Deployment of **`vX.Y.Z-rc.N`** to `qa` (`gh api 'repos/pkhamdee/modernapp/deployments?environment=qa'`) that ends
+a Deployment of **`vX.Y.Z-rc.N`** to `qa` (`gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa'`) that ends
 success or failure; a success marks QA's previous successful Deployment inactive ("replaced by vX.Y.Z-rc.N"), so the
 active one is what QA runs. A push changing only pins doesn't test dev; a push moving both pins tests both
 environments.
@@ -344,8 +358,8 @@ An older one tested an earlier deployment: rc.1 → rc.2 → rc.1 needs a new te
 merge starts anyway.
 
 ```bash
-gh api 'repos/pkhamdee/modernapp/deployments?environment=qa&ref=vX.Y.Z-rc.N' --jq '.[] | "\(.id) \(.created_at)"'
-gh api repos/pkhamdee/modernapp/deployments/<id>/statuses --jq '.[0] | "\(.state) \(.description) \(.log_url)"'
+gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=vX.Y.Z-rc.N' --jq '.[] | "\(.id) \(.created_at)"'
+gh api repos/pkhamdee/eshop-infra/deployments/<id>/statuses --jq '.[0] | "\(.state) \(.description) \(.log_url)"'
 ```
 
 ### 5. Sign-off
@@ -359,7 +373,12 @@ Deployment of it since that pin. If that succeeded and `vX.Y.Z` isn't released, 
 from branch `sign-off/X.Y.Z-rc.N`, whose one commit adds the release's record **`releases/X.Y.Z.md`**:
 
 - ``Candidate: `vX.Y.Z-rc.N` `` (the line sign-off reads) and its commit;
-- the candidate's images with digests (what `X.Y.Z` will be);
+- the candidate's images with digests (what `X.Y.Z` will be), each marked "SBOM attached" or "no SBOM: sign-off will
+  refuse it" ([ADR 0010](adr/0010-image-sboms-are-unsigned-registry-referrers.md)), and "signed" or "not signed" by
+  eShop's pipeline ([ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md)): shown only,
+  sign-off doesn't refuse an unsigned image, but an environment that enforces the image policy won't run it;
+- under "Gates", each image's CI run and its Locust and ZAP reports, as in the QA promotion PR
+  ([2.](#2-ci-makes-its-images-and-opens-the-qa-promotion-pr), `scripts/gate-reports.sh`);
 - the passing run, its Playwright report (artifact `playwright-report-qa`), and the QA Deployment (id, created at).
 
 One PR per candidate: running it again finds the PR up to date and pushes nothing; a later pass of the same
@@ -381,12 +400,15 @@ unless:
 - QA's latest Deployment of it, created since `main` last changed QA's pin by a run on `main`, succeeded (none,
   still running, or failed refuses; a Deployment recorded by a run from another branch never counts);
 - every candidate image exists, and no `X.Y.Z` image exists with another digest;
+- every candidate image's digest has its **SBOM** (ADR 0010). One pushed before SBOMs existed has none: attach one
+  made from its digest with `scripts/gates/attach-sbom.sh --earlier-build <image>:X.Y.Z-rc.N /dev/null`, logged in to
+  Docker Hub with push access, then re-run the job;
 - `vX.Y.Z` doesn't exist, unless an earlier sign-off of this same candidate made it.
 
 Then it copies each image to `docker.io/pkhamdee/<service>:X.Y.Z` **by digest** (never rebuilt), tags **`vX.Y.Z`** on
 the candidate's commit ("Signed off from vX.Y.Z-rc.N by @<merger>, merging <PR>"; CI's `plan` skips a plain release
 tag: nothing is built), publishes the **GitHub Release** (images, candidate, QA Deployment and run, who signed off in
-which PR, the record) and opens the **prod promotion PR** `eshop-prod: deploy vX.Y.Z`. Each step is skipped or
+which PR, the record, and each image's SBOM as the asset `<service>-X.Y.Z.cdx.json`) and opens the **prod promotion PR** `eshop-prod: deploy vX.Y.Z`. Each step is skipped or
 updated when already done, so a sign-off that failed half-way is finished by re-running the failed job.
 
 A refused sign-off leaves the record on `main` and no release. Put right what it names (wait for or re-run QA's test,
@@ -505,7 +527,9 @@ git tag -l "v*" --sort=-v:refname          # releases and candidates, highest ve
 git log v0.2.0..v0.3.0 --oneline           # what changed between two releases
 git show v0.3.0                            # tag message ("Signed off from v0.3.0-rc.N by @<merger>, merging <PR>")
 git cherry -v origin/main origin/release/0.x   # release-branch commits not on main ("+")
-gh release view v0.3.0                     # images with digests, QA Deployment and run, who signed off
+gh release view v0.3.0                     # images with digests, QA Deployment and run, who signed off, the SBOMs
+gh release download v0.3.0 -p '*.cdx.json' # each image's SBOM; then: trivy sbom <file> (today's vulnerabilities)
+oras discover --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/eshop-api:0.3.0   # an image's SBOM (ADR 0010)
 git log --oneline -- releases/             # every sign-off record (releases/X.Y.Z.md: candidate, digests, evidence)
 git log --oneline -- clusters/local/prod-release.yaml   # every prod promotion and rollback
 ```

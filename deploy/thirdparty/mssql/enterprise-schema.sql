@@ -2,7 +2,7 @@
 -- Applied to the CURRENT database (enterprise_dev, enterprise_prod, or a test database) and safe to re-run.
 -- Used by the mssql pod's schema container (deploy/thirdparty/mssql) and by the Seam-2 tests of
 -- eshop-sync-master (pkhamdee/eshop-api: tests/Eshop.SyncMaster.Tests/enterprise-schema.sql, the source of truth;
--- pkhamdee/modernapp's deploy/thirdparty/mssql holds a copy its CI keeps identical), so both see the same schema.
+-- pkhamdee/eshop-infra's deploy/thirdparty/mssql holds a copy its CI keeps identical), so both see the same schema.
 --
 -- Ownership (ADR-0001): rows in hp_contract are inserted by eshop-sync-master (push, idempotent on
 -- contract_no) and from then on changed only here (the admin tool simulates Payments and cancellations).

@@ -1,5 +1,5 @@
 # GitHub token of the eshop-e2e runner scale set (docs/setup.md, "Cluster runner"): a fine-grained token for
-# pkhamdee/modernapp only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+# pkhamdee/eshop-infra only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,6 +20,6 @@ sops:
             -----END AGE ENCRYPTED FILE-----
           recipient: age1mfq6dc0wrlwaedn2r2dwm96j3j4wg2ze4axed9zdz7vzuraddfssnuh2vh
     encrypted_regex: ^(data|stringData)$
-    lastmodified: "2026-11-05T00:52:47Z"
-    mac: ENC[AES256_GCM,data:Ta6bOnfWElvzKZ2TrEGcEAqfdLBUodUfSeOAProkI39UQjmHgLM3K0IoS1rIc41jCagbVqI68YHXvAThrBpd7y9exfqLC+fHgE8dh0PYqGB6J/SMk4ak+r3avnZ4RH8IiETK2DFpY0q75atkWp0HlOn6fBe6HOE8Z2J37Ugg1q8=,iv:4uoR6Elqs0q3xCOuvHTeU8IgY1kwBQtYaoqmLUBWdvY=,tag:UeSU3sex78zcmX0RLQymVQ==,type:str]
+    lastmodified: "2026-11-06T15:15:44Z"
+    mac: ENC[AES256_GCM,data:6Xu5LWB8zV5kfI6ZTpUBZw/v44YI9ZYhvoGyxhk0N+rq6cKf9W5cWpH16Av7o5LLfmcSHWY42YWxE8weyP3RGMUtJ33k+b7ccfdtvSkYU3jlADu8JZr8AvK5iB8z1/MfN+7AmL/2ReIv9rW4SjqzoaLrNFiQQnAmzAq7NjWT0Og=,iv:hDJ/DKj3l6ygxwHETAAzBpzGwq+NPU0kTd6MEpnY1MU=,tag:NGTDD9TCs41IkpEC8OKcqg==,type:str]
     version: 3.13.3

@@ -17,7 +17,8 @@
 # only from main and v* tags (scripts/protect-main.sh), so a run from another branch never gets those secrets.
 # The jobs a pull request runs are main's required checks, by name: renaming one means re-running
 # scripts/protect-main.sh (docs/git-workflow.md, "Protecting main").
-# Image pipeline (ADR 0007): plan -> build (matrix) -> gate (temporary copy + gates) -> scan (matrix) -> push.
+# Image pipeline (ADR 0007): plan -> build (matrix) -> gate (temporary copy + gates) -> scan (matrix, + SBOM) -> push
+# (+ the SBOM attached to each pushed digest, ADR 0010).
 # A failure anywhere before `push` means no image is pushed.
 #
 # Adding a service: its own repository, whose CI calls service-image.yml (docs/setup.md, "Service repositories"),
@@ -89,6 +90,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Manifests (kustomize build + kubeconform)
         run: scripts/validate-manifests.sh
+      # The cluster's image policy (ADR 0011), with policy-controller's own tester against real images: the signed
+      # one must pass, the unsigned one fail, as if enforced. Needs Docker Hub and Sigstore's public services.
+      - name: Image policy (policy-tester)
+        run: scripts/check-image-policy.sh
       # A broken ci-release.yml runs no job at all (the PR just shows no checks); this still guards e2e.yml
       # and every edit that leaves the file parseable. 1.7.12 or later: it knows `environment: {deployment: false}`
       # (e2e.yml's notify job).
@@ -403,6 +408,17 @@ jobs:
           name: image-scan-report-${{ matrix.service }}
           path: reports/image-scan/
           if-no-files-found: ignore
+      # A record, not a gate (ADR 0010): failing to write it fails the job, so no image is pushed without one.
+      - name: SBOM (CycloneDX)
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: scripts/gates/sbom.sh "$RUNNER_TEMP/image-$SERVICE/image.tar"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: sbom-${{ matrix.service }}
+          path: reports/sbom/
+          if-no-files-found: ignore
 
   # Pushes every image only when every build, the temporary copy (and its gates) and every scan passed, and, for a
   # version, only when none of its images exists yet (scripts/check-new-images.sh). A release candidate's copied
@@ -449,7 +465,7 @@ jobs:
       # A version (X.Y.Z-rc.N, 0.0.0-test.N) is pushed once: never overwrite a candidate QA may have tested.
       # main-<sha>-<ts> tags are unique per commit and need no check.
       - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
-        if: needs.plan.outputs.version != ''
+        if: needs.plan.outputs.version != '' || needs.plan.outputs.matrix != '[]'
         with:
           version: v0.22.1
       - name: Refuse to overwrite ${{ needs.plan.outputs.version }}
@@ -490,6 +506,31 @@ jobs:
             echo "$target@$digest" >> "$pushed"
           done
           { echo "images<<PUSHED"; cat "$pushed"; echo "PUSHED"; } >> "$GITHUB_OUTPUT"
+      # Each image built here gets its SBOM on its digest (ADR 0010); copied candidate images already carry theirs
+      # (a copy by digest). A failure leaves the images pushed and fails the run.
+      - uses: actions/download-artifact@v8
+        if: needs.plan.outputs.matrix != '[]'
+        with:
+          pattern: sbom-*
+          path: ${{ runner.temp }}/sbom
+          merge-multiple: true
+      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
+        if: needs.plan.outputs.matrix != '[]'
+        with:
+          version: 1.3.4
+      - name: Attach SBOMs
+        if: needs.plan.outputs.matrix != '[]'
+        run: |
+          failed=()
+          for tags in "$RUNNER_TEMP"/images/image-*/tags.txt; do
+            service=$(basename "$(dirname "$tags")")
+            service=${service#image-}
+            scripts/gates/attach-sbom.sh "$(head -n 1 "$tags")" "$RUNNER_TEMP/sbom/$service.cdx.json" || failed+=("$service")
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::No SBOM attached for ${failed[*]}: the images are pushed"
+            exit 1
+          fi
 
   # A release candidate's images are pushed (every gate passed): open the QA promotion PR. Merging it is QA's
   # approval, and Flux then deploys the candidate to eshop-qa. Never for main pushes or dry runs (plan.promote is
@@ -523,9 +564,13 @@ jobs:
         with:
           ref: main
           token: ${{ secrets.PROMOTION_TOKEN }} # git push of the promotion branch
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.1 # scripts/gate-reports.sh reads each image's revision label
       - name: Open the QA promotion PR
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
+          SIGN_OFF_READ_TOKEN: ${{ github.token }} # scripts/gate-reports.sh's reads of the service repositories' runs
           PROMOTION_IMAGES: ${{ needs.push.outputs.images }}
           TAG: ${{ github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
@@ -538,15 +583,19 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Nothing built: every image is copied from a build that passed these gates when it was made.
-          [ "$GATE" != skipped ] || GATE="not run: nothing built, every image copied"
-          [ "$SCAN" != skipped ] || SCAN="not run: nothing built, every image copied"
+          # Nothing built: every image is copied from a build that passed these gates when it was made, listed below.
+          [ "$GATE" != skipped ] || GATE="not run here: every image copied, see each image's reports below"
+          [ "$SCAN" != skipped ] || SCAN="not run here: every image copied, see each image's run below"
+          # Each image's CI run and its Locust and ZAP reports; a line says what can't be found, never failing the job.
+          # shellcheck disable=SC2046 # one image per line, no spaces
+          GATE_REPORTS=$(scripts/gate-reports.sh $(grep -v '^$' <<<"$PROMOTION_IMAGES"))
           PROMOTION_DETAILS=$(cat <<EOF
           ### Gates
 
           Images: $SOURCE (scripts/candidate-images.sh; copied ones by digest, never rebuilt).
 
-          Every gate passed before any image was pushed ([CI run]($RUN_URL); reports are its artifacts):
+          Every gate passed before any image was pushed ([CI run]($RUN_URL); the reports of what it ran are its
+          artifacts, a copied image's are in the run that built it, below):
 
           | Gate | Result |
           |---|---|
@@ -554,6 +603,12 @@ jobs:
           | Dependency scan (Trivy, fail on critical) | $DEPS |
           | Temporary copy from these images, and the gates against it (Locust, ZAP) | $GATE |
           | Image scan (Trivy, fail on critical) | $SCAN |
+
+          #### Each image's gate reports
+
+          The CI run that pushed each image, with its Locust (perf-report) and ZAP (dast-report) reports:
+
+          $GATE_REPORTS
 
           Candidate: [$TAG]($TAG_URL). Merging this starts QA's smoke test of it (e2e.yml); a pass opens its
           sign-off PR (docs/git-workflow.md, "Releasing").

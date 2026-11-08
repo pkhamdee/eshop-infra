@@ -1,0 +1,35 @@
+# Which eShop images may run (ADR 0011, #127): docker.io/pkhamdee/* signed keyless by eShop's pipeline, that is
+# pkhamdee/eshop-infra's service-image.yml from main, called by one of the four service repositories from its main or
+# a release/N.x branch. Checked by policy-controller (../controllers/policy-controller.yaml) in the namespaces labelled
+# policy.sigstore.dev/include (../controllers/namespaces.yaml); other images match no policy and are admitted.
+#
+# mode: enforce refuses a pod (or Deployment, ReplicaSet, ...) whose docker.io/pkhamdee/* image fails the check, in
+# every labelled namespace. Which namespaces enforce is decided by the label alone (ADR 0011).
+# scripts/check-image-policy.sh tests this file in CI.
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: eshop-images
+spec:
+  mode: enforce
+  images:
+    - glob: "index.docker.io/pkhamdee/**"
+    - glob: "docker.io/pkhamdee/**"
+  authorities:
+    - name: eshop-pipeline
+      keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subject: https://github.com/pkhamdee/eshop-infra/.github/workflows/service-image.yml@refs/heads/main
+      ctlog:
+        url: https://rekor.sigstore.dev
+  # The certificate's GitHub fields: which repository called the workflow, from which ref. A signature from a pull
+  # request (refs/pull/...) or from any other repository fails.
+  policy:
+    type: cue
+    data: |
+      authorityMatches: "eshop-pipeline": signatures: [...{
+        githubWorkflowRepo: "pkhamdee/eshop-api" | "pkhamdee/eshop-web" | "pkhamdee/eshop-node-api" | "pkhamdee/thirdparty-mock"
+        githubWorkflowRef: =~"^refs/heads/(main|release/[0-9]+\\.x)$"
+      }]

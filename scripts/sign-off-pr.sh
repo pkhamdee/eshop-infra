@@ -8,7 +8,9 @@
 # since main last changed QA's pin (scripts/lib/qa.sh; an older one tested an earlier deployment):
 #   - success, and vX.Y.Z not yet released: opens (or updates) the PR "Sign off vX.Y.Z-rc.N" from branch
 #     sign-off/X.Y.Z-rc.N, made from origin/main, whose only commit adds the release's record releases/X.Y.Z.md: the
-#     candidate and its commit, its images with digests, the passing run, its Playwright report and the Deployment.
+#     candidate and its commit, its images with digests, whether each has its SBOM (ADR 0010; sign-off refuses an
+#     image without one) and whether it is signed by eShop's pipeline (ADR 0011; shown only), each image's gate reports (scripts/gate-reports.sh), the passing run, its Playwright report
+#     and the Deployment.
 #     One PR per candidate: when the open PR's record already says the same, nothing is pushed. Merging it is the
 #     sign-off (.github/workflows/sign-off.yml runs scripts/sign-off.sh);
 #   - every other open sign-off PR is closed with a comment saying why: QA is pinned to another candidate (or to
@@ -18,8 +20,8 @@
 # Environment: REPO and IMAGE_REGISTRY (defaults: scripts/lib/repo.sh), SIGN_OFF_READ_TOKEN (a token for the reads,
 # e.g. the workflow's own; default: gh's token). Needs a clean checkout, push access to origin, `gh` with a token that
 # may open and close PRs (PROMOTION_TOKEN: a PR opened with GITHUB_TOKEN would get no checks), crane (the candidate's
-# digests; reads only) and jq. Commits with the current git identity. scripts/tests/release-scripts.sh tests it with
-# fake gh and crane against a throwaway origin.
+# digests; reads only), oras (whether each has its SBOM; reads only), cosign (its signature; reads only) and jq. Commits with the current git identity. scripts/tests/release-scripts.sh tests it with
+# fake gh, crane, oras and cosign against a throwaway origin.
 set -euo pipefail
 # shellcheck source=lib/versions.sh
 . "$(dirname "$0")/lib/versions.sh"
@@ -27,6 +29,10 @@ set -euo pipefail
 . "$(dirname "$0")/lib/repo.sh"
 # shellcheck source=lib/qa.sh
 . "$(dirname "$0")/lib/qa.sh"
+# shellcheck source=lib/sbom.sh
+. "$(dirname "$0")/lib/sbom.sh"
+# shellcheck source=lib/signature.sh
+. "$(dirname "$0")/lib/signature.sh"
 
 cd "$(git rev-parse --show-toplevel)"
 git fetch --quiet origin main
@@ -88,15 +94,27 @@ git fetch --quiet --force origin "refs/tags/$rc_tag:refs/tags/$rc_tag" \
   || { echo "release candidate $rc_tag is not on origin" >&2; exit 1; }
 commit=$(git rev-parse "$rc_tag^{commit}")
 images=""
-for svc in $(jq -r '.[].service' .github/services.json); do
+# The services on fd 3: crane, oras and cosign below must not read the list.
+while read -r svc source <&3; do
   digest=$(crane digest "$IMAGE_REGISTRY/$svc:$candidate") \
     || { echo "candidate image $IMAGE_REGISTRY/$svc:$candidate is missing" >&2; exit 1; }
   # The commit the image was built from (CI's org.opencontainers.image.revision label): where a patch of this
   # release branches from (ADR 0009). An image without the label is listed without it.
   revision=$(crane config "$IMAGE_REGISTRY/$svc@$digest" 2>/dev/null \
     | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' 2>/dev/null) || revision=""
-  images+="$IMAGE_REGISTRY/$svc:$candidate@$digest${revision:+ $revision}"$'\n'
-done
+  # Its SBOM, which sign-off refuses to go without: attached, missing, or unknown (the registry couldn't be read).
+  sbom=unknown
+  if count=$(sbom_count "$IMAGE_REGISTRY/$svc@$digest"); then
+    if [ "$count" -gt 0 ]; then sbom=attached; else sbom=missing; fi
+  fi
+  # Its signature by eShop's pipeline, from its own repository: signed, unsigned or unknown. Shown, never refused here.
+  signature=$(signature_status "$IMAGE_REGISTRY/$svc@$digest" "$source")
+  images+="$IMAGE_REGISTRY/$svc:$candidate@$digest $sbom $signature${revision:+ $revision}"$'\n'
+done 3< <(jq -r '.[] | "\(.service) \(.repository)"' .github/services.json)
+# Each image's gate reports: the CI run that pushed it, with its Locust and ZAP reports (scripts/gate-reports.sh; it
+# says on the image's line what it can't find, and never fails for that).
+# shellcheck disable=SC2046 # one image per line, no spaces
+gates=$(scripts/gate-reports.sh $(cut -d' ' -f1 <<<"$images"))
 read -r id created log_url < <(jq -r '"\(.id) \(.created_at) \(.log_url)"' <<<"$deployment")
 # The run's Playwright report: e2e.yml uploads it as artifact playwright-report-qa.
 report=""
@@ -118,11 +136,31 @@ trap 'rm -f "$record" "$body"' EXIT
   echo
   echo "## Images"
   echo
-  echo "The candidate's, copied to \`$version\` by digest at sign-off, never rebuilt, each with the commit it was built from:"
+  echo "The candidate's, copied to \`$version\` by digest at sign-off, never rebuilt, each with the commit it was built from"
+  echo "and its SBOM (ADR 0010), which sign-off attaches to the Release and refuses to go without, and whether it is signed"
+  echo "by eShop's pipeline (ADR 0011), which an environment that enforces the image policy requires:"
   echo
-  while read -r image revision; do
-    [ -z "$image" ] || echo "- \`$image\`${revision:+, built from \`$revision\`}"
+  while read -r image sbom signature revision; do
+    [ -n "$image" ] || continue
+    case "$sbom" in
+      attached) sbom="SBOM attached" ;;
+      missing) sbom="**no SBOM: sign-off will refuse it**" ;;
+      *) sbom="SBOM not checked (the registry couldn't be read)" ;;
+    esac
+    case "$signature" in
+      signed) signature="signed" ;;
+      unsigned) signature="**not signed**" ;;
+      *) signature="signature not checked (cosign couldn't tell)" ;;
+    esac
+    echo "- \`$image\`${revision:+, built from \`$revision\`}; $sbom; $signature"
   done <<<"$images"
+  echo
+  echo "## Gates"
+  echo
+  echo "Each image passed the shared gates (the temporary copy with Locust and ZAP, then the image scan) in the CI run"
+  echo "that pushed it; the reports are that run's artifacts:"
+  echo
+  echo "$gates"
   echo
   echo "## QA"
   echo

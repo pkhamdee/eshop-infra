@@ -11,3 +11,4 @@ Until now prod followed the newest `vX.Y.Z` tag automatically, and nothing teste
 - Prod no longer follows the newest tag; `docs/git-workflow.md` describes promotion PRs instead.
 - Each gate is a script in the repo that runs its tool in a container, and the temporary copy is one Compose file, so the gates also run on this Mac and on a future self-managed GitLab (only PR, Release and sign-off steps are GitHub-specific).
 - With one maintainer, the merge itself is the approval: GitHub doesn't let an author approve their own PR.
+- Beside the image scan, each image's CycloneDX SBOM is made before the push and attached to its digest: a record, not a gate ([ADR 0010](0010-image-sboms-are-unsigned-registry-referrers.md)).

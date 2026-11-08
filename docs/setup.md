@@ -72,7 +72,7 @@ grep '^AGE-SECRET-KEY' ~/.config/sops/age/keys.txt |
 ```sh
 export GITHUB_TOKEN=$(gh auth token)
 flux bootstrap github \
-  --owner=pkhamdee --repository=modernapp --branch=main --personal \
+  --owner=pkhamdee --repository=eshop-infra --branch=main --personal \
   --path=clusters/local \
   --components-extra=image-reflector-controller,image-automation-controller \
   --read-write-key
@@ -132,7 +132,7 @@ access tokens), then give it to CI. `gh secret set` prompts for the token, so it
 
 ```sh
 gh variable set DOCKERHUB_USERNAME --body pkhamdee
-gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/modernapp   # since #78 a secret of environment release
+gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/eshop-infra   # since #78 a secret of environment release
 ```
 
 (Since #78 the token is a secret of the `release` environment, not of the repository: [Release
@@ -390,10 +390,10 @@ recording a deployment. **Human**, once, in this order:
 4. **The secret and the variables** (`gh secret set` prompts for the value, so it never lands in shell history):
 
 ```sh
-gh secret set SMTP_PASSWORD --env smoke-test --repo pkhamdee/modernapp           # the app password (step 2)
-gh variable set SMTP_USERNAME --body eshop.smoke.test@gmail.com --repo pkhamdee/modernapp   # the sending account
-gh variable set NOTIFY_EMAIL --body you@example.com --repo pkhamdee/modernapp    # who gets them (comma-separated)
-gh secret list --env smoke-test --repo pkhamdee/modernapp && gh variable list --repo pkhamdee/modernapp
+gh secret set SMTP_PASSWORD --env smoke-test --repo pkhamdee/eshop-infra           # the app password (step 2)
+gh variable set SMTP_USERNAME --body eshop.smoke.test@gmail.com --repo pkhamdee/eshop-infra   # the sending account
+gh variable set NOTIFY_EMAIL --body you@example.com --repo pkhamdee/eshop-infra    # who gets them (comma-separated)
+gh secret list --env smoke-test --repo pkhamdee/eshop-infra && gh variable list --repo pkhamdee/eshop-infra
 ```
 
 Until all three are set, the `notify` job fails on every run, naming what is missing; the smoke test's own job and
@@ -422,7 +422,7 @@ so the apps deploy as usual meanwhile.
 
 1. github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
    Name `modernapp eshop-e2e runner`; resource owner `pkhamdee`; expiration 90 days (or what you accept);
-   **Repository access**: Only select repositories → `pkhamdee/modernapp`; **Repository permissions**:
+   **Repository access**: Only select repositories → `pkhamdee/eshop-infra`; **Repository permissions**:
    Administration **Read and write** (Metadata read-only is added by itself). Nothing else.
 2. Put it in a SOPS Secret without it ever touching the disk in plain text: write the file with a placeholder,
    encrypt it, then replace the placeholder in `sops`' editor:
@@ -430,7 +430,7 @@ so the apps deploy as usual meanwhile.
    ```sh
    cat >deploy/infrastructure/runners/eshop-e2e-github.sops.yaml <<'EOF'
    # GitHub token of the eshop-e2e runner scale set (docs/setup.md, "Cluster runner"): a fine-grained token for
-   # pkhamdee/modernapp only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
+   # pkhamdee/eshop-infra only, Administration read and write. Renew: sops deploy/infrastructure/runners/eshop-e2e-github.sops.yaml
    apiVersion: v1
    kind: Secret
    metadata:
@@ -452,7 +452,7 @@ so the apps deploy as usual meanwhile.
    on it: `e2e/run-on-actions.sh prod X.Y.Z` (the release prod serves) passes.
 5. Keep Settings → Actions → General → "Approval for running fork pull request workflows from contributors" at
    **Require approval for all external contributors** (it is set; check with
-   `gh api repos/pkhamdee/modernapp/actions/permissions/fork-pr-contributor-approval`, `all_external_contributors`).
+   `gh api repos/pkhamdee/eshop-infra/actions/permissions/fork-pr-contributor-approval`, `all_external_contributors`).
    The repository is public, and on a personal account a runner can't be limited to chosen workflows: a fork PR
    whose workflow says `runs-on: eshop-e2e` would run in the cluster. Approve a fork's workflow run only after
    reading what it runs.
@@ -462,6 +462,34 @@ replace the value, PR, merge. An expired token shows as listener errors (`kubect
 listener pod) and runs that stay queued.
 
 The local runner of earlier versions is gone; its cache can be deleted: `rm -rf ~/.cache/eshop-e2e-runner`.
+
+## Image policy
+
+Only images built by eShop's pipeline run in the cluster ([ADR 0011](adr/0011-keyless-signing-of-pushed-images-verified-in-the-cluster.md),
+#127). Sigstore **policy-controller** (`deploy/infrastructure/controllers/policy-controller.yaml`, namespace
+`cosign-system`) checks every pod in the namespaces labelled `policy.sigstore.dev/include` (`deploy/infrastructure/controllers/namespaces.yaml`)
+against the ClusterImagePolicy **`eshop-images`**
+(`deploy/infrastructure/configs/image-policy.yaml`). A `docker.io/pkhamdee/*` image must carry a keyless signature by
+`pkhamdee/eshop-infra`'s `service-image.yml` from `main`, called by one of the four service repositories from its
+`main` or a `release/N.x` branch. Any other image matches no policy and is admitted (`no-match-policy: allow`).
+Admitted pods run their images by the verified digest.
+
+The label is the enforcement boundary (ADR 0011): a labelled namespace is checked, an unlabelled one isn't.
+Namespaces join one at a time, each once everything it runs is signed (no backfill): `thirdparty`, `eshop-dev`
+(#136), `eshop-qa` (#134), `eshop-prod` (#137). Before a namespace joins, check what it runs with `cosign verify`; for
+QA and prod, the sign-off record also shows each image's signature. CI tests the policy itself on every change with
+policy-controller's tester (`scripts/check-image-policy.sh`: a signed image must pass, an unsigned one fail).
+
+While the policy is in warn mode (the trial stage), an image that fails is admitted with a warning; in enforce
+mode it is refused. To see what a labelled namespace does with an image, without creating anything:
+
+```sh
+kubectl -n eshop-dev run sigcheck --image=docker.io/pkhamdee/eshop-web:main-<sha>-<ts> --dry-run=server -o name
+# warn mode: "Warning: ... failed policy: eshop-images"; enforce mode: an error, nothing admitted; neither: it passes
+```
+
+The webhook's `failurePolicy` is `Ignore` (ADR 0011): while it is down, pods are admitted unchecked. Once prod is
+labelled, rolling back to a release from before signing is refused: remove prod's label first (a PR).
 
 ## Releasing
 
@@ -496,8 +524,8 @@ flux get kustomization apps-qa                        # Applied revision: v0.3.0
 kubectl -n eshop-qa get deploy -o wide               # images :0.3.0-rc.1, all READY
 
 #    That merge also starts QA's smoke test (e2e.yml, run "E2E push <commit>"): a Deployment of v0.3.0-rc.1 to qa
-gh api 'repos/pkhamdee/modernapp/deployments?environment=qa&ref=v0.3.0-rc.1' --jq '.[0].id'
-gh api "repos/pkhamdee/modernapp/deployments/<id>/statuses" --jq '.[0].state'   # success
+gh api 'repos/pkhamdee/eshop-infra/deployments?environment=qa&ref=v0.3.0-rc.1' --jq '.[0].id'
+gh api "repos/pkhamdee/eshop-infra/deployments/<id>/statuses" --jq '.[0].state'   # success
 #    (to test it again: e2e/run-on-actions.sh qa 0.3.0-rc.1)
 
 # 4. Its pass opens the sign-off PR "Sign off v0.3.0-rc.1", adding releases/0.3.0.md (candidate, digests, the run and
@@ -542,7 +570,7 @@ you as the actor (the commits themselves are authored by `github-actions[bot]`).
 
 1. github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
 2. Name `modernapp PROMOTION_TOKEN`; resource owner `pkhamdee`; **expiration** 90 days (or what you accept; a calendar
-   reminder a week before helps); **Repository access**: Only select repositories → `pkhamdee/modernapp`.
+   reminder a week before helps); **Repository access**: Only select repositories → `pkhamdee/eshop-infra`.
 3. **Repository permissions**: Contents **Read and write**, Pull requests **Read and write** (Metadata read-only is
    added by itself). Nothing else; add Workflows read and write only if a promotion ever has to change
    `.github/workflows/`.
@@ -550,7 +578,7 @@ you as the actor (the commits themselves are authored by `github-actions[bot]`).
    created by `scripts/protect-main.sh`).
 
 **Renewal**: regenerate the token on the same page (or create a new one with the same settings) and run the same
-`gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/modernapp`. An expired or revoked token makes the promotion job fail at `git push` or `gh pr create` with an
+`gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/eshop-infra`. An expired or revoked token makes the promotion job fail at `git push` or `gh pr create` with an
 authentication error; the images are already pushed, so re-run just that job once the secret is updated. The
 token must belong to a repository admin or maintainer: only they may create `v*` tags (ruleset "Create release
 tags"; git-workflow.md, "Tags"). It pushes only `promote/*` and `sign-off/*` branches and `vX.Y.Z` tags, never
@@ -593,13 +621,13 @@ The two release secrets belong to the `release` environment, so only `main` and 
 created the environment (`gh secret set` prompts for each value, so it never lands in shell history):
 
 ```sh
-gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/modernapp   # a Docker Hub access token, Read & Write
-gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/modernapp   # the fine-grained token (Promotion token)
-gh secret list --env release --repo pkhamdee/modernapp                  # both listed
+gh secret set DOCKERHUB_TOKEN --env release --repo pkhamdee/eshop-infra   # a Docker Hub access token, Read & Write
+gh secret set PROMOTION_TOKEN --env release --repo pkhamdee/eshop-infra   # the fine-grained token (Promotion token)
+gh secret list --env release --repo pkhamdee/eshop-infra                  # both listed
 # then remove the repository-level copies, which any workflow on any branch could read:
-gh secret delete DOCKERHUB_TOKEN --repo pkhamdee/modernapp
-gh secret delete PROMOTION_TOKEN --repo pkhamdee/modernapp              # if it was ever set there
-gh secret list --repo pkhamdee/modernapp                                # neither listed
+gh secret delete DOCKERHUB_TOKEN --repo pkhamdee/eshop-infra
+gh secret delete PROMOTION_TOKEN --repo pkhamdee/eshop-infra              # if it was ever set there
+gh secret list --repo pkhamdee/eshop-infra                                # neither listed
 ```
 
 The variable `DOCKERHUB_USERNAME` stays a repository variable (not secret). An environment secret overrides a
@@ -611,7 +639,7 @@ pushes only from `main` (from another branch `plan` skips the push, with a notic
 
 eShop's services each have their own repository (ADR 0009, #101), cloned beside this one:
 `scripts/clone-all.sh` clones every one that exists into this repository's parent folder (here
-`/Users/pongsak/repos/modernapp/`), so their agent docs find `../modernapp` and the temporary copy builds them from
+`/Users/pongsak/repos/modernapp/`), so their agent docs find `../eshop-infra` and the temporary copy builds them from
 `../<service>`: **`pkhamdee/eshop-api`** (eshop-api and eshop-sync-master), **`pkhamdee/eshop-web`**,
 **`pkhamdee/eshop-node-api`** and **`pkhamdee/thirdparty-mock`**.
 `.github/services.json` names each one's `repository`; this repository's CI never builds them. Each service
@@ -625,7 +653,7 @@ the PR that removes it here). Shown for `svc=eshop-node-api`:
 svc=eshop-node-api
 # 1. Create the repository, empty and public (issues are turned off in step 2), and push the prepared clone. Its
 #    first CI run passes the gates but fails at the push's Docker Hub login until step 3: nothing is pushed.
-gh repo create "pkhamdee/$svc" --public --description "eShop's $svc (see pkhamdee/modernapp)"
+gh repo create "pkhamdee/$svc" --public --description "eShop's $svc (see pkhamdee/eshop-infra)"
 git -C "../$svc" remote add origin "https://github.com/pkhamdee/$svc.git"
 git -C "../$svc" push -u origin main
 # 2. Protection, from the branch of the PR that moves the service (its ci-release.yml no longer has the service's
@@ -687,7 +715,7 @@ Enterprise sync steps can't pass there.
 | `clusters/local/` | Cluster entry point: `flux-system/` (generated by bootstrap) plus the Kustomizations below | `flux-system` |
 | `clusters/local/prod-release.yaml` | What `eshop-prod` runs, the **prod pin**: GitRepository `eshop-release` (one release tag) and Kustomization `apps-prod` with that release's `X.Y.Z` images; the `# release-pin: prod` lines change only in a promotion PR (`scripts/pin-release.sh`) | `flux-system` |
 | `clusters/local/qa-release.yaml` | What `eshop-qa` runs, the **QA pin**, same shape: GitRepository `eshop-qa` (one release-candidate tag) and Kustomization `apps-qa` with its `X.Y.Z-rc.N` images; the `# release-pin: qa` lines change only in a QA promotion PR. Suspended until the first one | `flux-system` |
-| `deploy/infrastructure/controllers/` | Namespaces, Traefik `HelmChartConfig` (Gateway API provider), cert-manager, CloudNativePG operator, Actions Runner Controller | `infra-controllers` |
+| `deploy/infrastructure/controllers/` | Namespaces, Traefik `HelmChartConfig` (Gateway API provider), cert-manager, CloudNativePG operator, Actions Runner Controller, Sigstore policy-controller ([Image policy](#image-policy)) | `infra-controllers` |
 | `deploy/infrastructure/configs/` | Issuers, the `eshop` Gateway and its certificate, platform secrets | `infra-configs` (after controllers) |
 | `deploy/infrastructure/runners/` | The E2E job's runner scale set `eshop-e2e`, its service account's permissions and its GitHub token ([Cluster runner](#cluster-runner)) | `infra-runners` (after controllers; nothing depends on it) |
 | `deploy/apps/base/` | One directory per app, environment-neutral | – |
@@ -700,9 +728,9 @@ Enterprise sync steps can't pass there.
 | `e2e/` | Seam 4: Playwright smoke test of the whole demo against a deployed environment (`npm run e2e`) | – |
 | `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments, and each service repository's ruleset, `publish` environment and issues (admin-run; [Protecting main](#protecting-main)); `clone-all.sh` clones the service repositories beside this one ([Service repositories](#service-repositories)); `check-enterprise-schema.sh` checks that the deployed mock Enterprise schema is the one eshop-sync-master's tests apply (CI's `repo rules` job); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
 | `releases/` | One record per release, `X.Y.Z.md`: the signed-off candidate, its image digests, QA's passing run and Deployment. Added by the sign-off PR (`scripts/sign-off-pr.sh`); merging it signs off (git-workflow.md, "Sign-off") | – |
-| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `artifact-dirs.sh` (puts a downloaded image artifact in its `image-<service>` folder), `tags-to-push.sh` (the service repositories' push: never an existing tag), `image-scan.sh` (Trivy on built images), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
+| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `artifact-dirs.sh` (puts a downloaded image artifact in its `image-<service>` folder), `tags-to-push.sh` (the service repositories' push: never an existing tag), `image-scan.sh` (Trivy on built images), `sbom.sh` and `attach-sbom.sh` (each image's CycloneDX SBOM, attached to its digest, ADR 0010), `sign-images.sh` (keyless cosign signature of each pushed digest, ADR 0011), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
 | `.github/services.json` | Every eShop image a release takes, with the `repository` that builds it ([Service repositories](#service-repositories)); a release candidate copies each one by digest (`scripts/candidate-images.sh`) | – |
-| `.github/workflows/service-image.yml` | The shared gates the service repositories' CI calls: build, SAST, dependency scan, temporary copy, Trivy, push (git-workflow.md, "Service repositories") | – |
+| `.github/workflows/service-image.yml` | The shared gates the service repositories' CI calls: build, SAST, dependency scan, temporary copy, Trivy, SBOM, push, sign and attach the SBOM (git-workflow.md, "Service repositories") | – |
 | `../eshop-web/` (`pkhamdee/eshop-web`) | React + Vite + TypeScript, served by Caddy; its own repository ([Service repositories](#service-repositories)) | – |
 | `../eshop-node-api/` (`pkhamdee/eshop-node-api`) | Image service: Node 24 + Express + TypeScript (run directly by Node), SMB share via `smbclient`; its own repository | – |
 | `../thirdparty-mock/` (`pkhamdee/thirdparty-mock`) | Node 24 + Express (TypeScript run directly): mock SMS (+ inbox page), ID Verification and Credit Check; adjustable delay; mock Enterprise System admin tool; its own repository, its manifests in `deploy/thirdparty/thirdparty-mock/` here | – |
@@ -783,6 +811,26 @@ scripts/gates/deps.sh     # Trivy over every lockfile: fails on a CRITICAL vulne
   ```sh
   scripts/gates/temporary-copy.sh build
   docker save temporary-copy/eshop-api:local -o /tmp/eshop-api.tar && scripts/gates/image-scan.sh /tmp/eshop-api.tar
+  ```
+- **SBOM** (`sbom.sh`, CI: the `scan` job after the image scan, artifact `sbom-<service>`; ADR 0010) writes a
+  CycloneDX JSON SBOM of each built image, from its archive or, given `<repository>@sha256:…`, from the registry:
+  `reports/sbom/<name>.cdx.json`. A record, not a gate: only failing to write it fails. The `push` job attaches it to
+  the pushed digest as an OCI referrer (`attach-sbom.sh`, never replacing one already there). To read a pushed
+  image's SBOM, or check it against today's vulnerabilities:
+
+  ```sh
+  scripts/gates/sbom.sh /tmp/eshop-api.tar
+  oras discover --artifact-type application/vnd.cyclonedx+json docker.io/pkhamdee/eshop-api:0.6.0
+  oras pull -o /tmp/sbom docker.io/pkhamdee/eshop-api@<referrer digest>   # then: trivy sbom /tmp/sbom/eshop-api.cdx.json
+  ```
+- **Signature** (`sign-images.sh`, CI: the `push` job, straight after the push; ADR 0011) signs each digest that run
+  pushed with keyless cosign (v2, the classic `.sig` format), as `service-image.yml` from a service repository's
+  `main` or `release/*`. It never signs an image the run didn't push. To check an image's signature:
+
+  ```sh
+  cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity https://github.com/pkhamdee/eshop-infra/.github/workflows/service-image.yml@refs/heads/main \
+    docker.io/pkhamdee/eshop-api:0.7.0   # the certificate names the service repository and its ref
   ```
 - **Temporary copy** (`temporary-copy.sh`, the copy the image gates run against): see
   [Temporary copy](#temporary-copy-release-gate).

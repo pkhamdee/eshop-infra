@@ -31,7 +31,7 @@ terms in `GLOSSARY.md`; decisions in `docs/adr/`. This file points there rather 
   (`scripts/clone-all.sh`): `../eshop-api` (eshop-api and eshop-sync-master, .NET; Testcontainers settings and the
   .NET rules are in its `docs/conventions.md`), `../eshop-web`, `../eshop-node-api`, `../thirdparty-mock`. Each
   one's conventions are in its `docs/conventions.md` and its `CLAUDE.md`; work on a service there, in a branch and
-  PR of its repository, referencing issues as `pkhamdee/modernapp#N`.
+  PR of its repository, referencing issues as `pkhamdee/eshop-infra#N`.
 - What it builds is decided there (its `.github/workflows/ci.yml`); the gates it runs are this repository's
   `.github/workflows/service-image.yml` and `scripts/gates/`, so a gate change here applies to every service
   repository at its next run. Keep the reusable workflow's PR job names stable: they are the service repositories'
@@ -129,7 +129,7 @@ Agents are denied these; ask the user, giving the exact command:
   send a real email: `scripts/notify.sh` is tested with a fake `curl` in `scripts/tests/release-scripts.sh`;
 - applying `scripts/protect-main.sh` (main's ruleset, the `v*` tag rulesets, the `release` and `smoke-test` environments, and each service repository's ruleset, `publish` environment and issues) or changing any repo setting;
   give the user `scripts/protect-main.sh --dry-run` first. Test `scripts/release.sh`, `scripts/check-release-tag.sh`,
-  `scripts/pin-release.sh`, `scripts/candidate-images.sh`, `scripts/promotion-pr.sh`, `scripts/sign-off-pr.sh`, `scripts/sign-off.sh`, `scripts/check-new-images.sh`, `scripts/smoke-targets.sh`, `scripts/smoke-result.sh`, `scripts/deployment.sh`, `scripts/notify.sh`, `scripts/protect-main.sh`, `scripts/clone-all.sh` and `scripts/check-enterprise-schema.sh` with
+  `scripts/pin-release.sh`, `scripts/candidate-images.sh`, `scripts/promotion-pr.sh`, `scripts/sign-off-pr.sh`, `scripts/gate-reports.sh`, `scripts/sign-off.sh`, `scripts/check-new-images.sh`, `scripts/smoke-targets.sh`, `scripts/smoke-result.sh`, `scripts/deployment.sh`, `scripts/notify.sh`, `scripts/protect-main.sh`, `scripts/clone-all.sh` and `scripts/check-enterprise-schema.sh` with
   `scripts/tests/release-scripts.sh` (throwaway local repos, fake `gh`), never against GitHub.
 
 `main` is protected (`docs/git-workflow.md`, "Protecting main"): agents never push to it; every change is a PR whose
