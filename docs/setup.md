@@ -825,8 +825,9 @@ this repository's `repo rules` job and, for each service repository, in the shar
 
 **Renovate** keeps the pins current. The shared preset is `renovate/default.json5`, and each repository's
 `renovate.json` extends it. Updates come at least 14 days after a release, grouped weekly (actions, container images,
-Helm charts, pipeline tools), and go through the same required checks as any PR. A major version waits on the
-dependency dashboard for approval. eShop's own images and the runner image are never Renovate's: Flux image automation
+Helm charts, pipeline tools), and go through the same required checks as any PR. A major version gets a PR of
+its own, labelled `major`, and merging it is the approval (the service repositories have issues turned off, so
+no dependency dashboard). eShop's own images and the runner image are never Renovate's: Flux image automation
 and promotion PRs move them. Flux's own components are upgraded with `flux install --export`. cosign stays below v3
 (ADR 0011).
 
@@ -841,7 +842,7 @@ chart. `scripts/ci/tools.sh list` shows what is pinned.
 
 Human steps (repository settings): install the [Renovate GitHub App](https://github.com/apps/renovate) on the five
 repositories, and turn on Dependabot security alerts and updates (Settings → Code security). Renovate then opens a
-"Dependency Dashboard" issue in each repository.
+"Dependency Dashboard" issue in eshop-infra (the service repositories have issues turned off).
 
 ### Running the gates locally
 
