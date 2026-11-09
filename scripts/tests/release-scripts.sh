@@ -2194,7 +2194,7 @@ report_cycle() {
   watchdog report cluster "$work/problems" && grep -qF 'nothing wrong' "$work/out" && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 2 ]
 }
 check "watchdog.sh report opens one issue and emails once, updates it silently, then closes it and emails the recovery" report_cycle
-report_needs_mail() { ! SMTP_PASSWORD= watchdog report queue "$work/problems" && grep -qF 'no SMTP_PASSWORD' "$work/out"; }
+report_needs_mail() { ! SMTP_PASSWORD='' watchdog report queue "$work/problems" && grep -qF 'no SMTP_PASSWORD' "$work/out"; }
 check "watchdog.sh report fails, naming it, when a mail setting is missing" report_needs_mail
 unset SMTP_USERNAME SMTP_PASSWORD NOTIFY_EMAIL NOW
 
