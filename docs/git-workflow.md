@@ -273,8 +273,9 @@ already passed rather than rebuilding it (`scripts/candidate-images.sh`,
 
 A pin or an image it can't resolve fails the run: nothing untested is filled in. Every copy is checked against its
 source digest, and no `X.Y.Z-rc.N` image is ever overwritten. Only then its `promote-qa` job runs `scripts/promotion-pr.sh qa X.Y.Z-rc.N`: a branch `promote/qa-X.Y.Z-rc.N` from
-`main` whose only commit is the pin edit, and a PR **`eshop-qa: deploy vX.Y.Z-rc.N`** listing the candidate's
-commit, its images with digests, each gate's result and the CI run (whose artifacts are the gate reports).
+`main` whose only commit is the pin edit, pinning each image by the digest this run pushed, and a PR
+**`eshop-qa: deploy vX.Y.Z-rc.N`** listing the candidate's commit, its images with digests, each gate's result and the
+CI run (whose artifacts are the gate reports).
 
 A copied image's gates ran when it was built, not in this run, so the PR also lists, per image, **the CI run that
 pushed it and that run's Locust (`perf-report`) and ZAP (`dast-report`) reports** (`scripts/gate-reports.sh`). The
@@ -292,8 +293,8 @@ the job, or open the PR yourself with the same script.
 
 `eshop-qa` (`https://qa.eshop.localhost`) runs one release candidate, pinned by the lines ending in
 `# release-pin: qa` in `clusters/local/qa-release.yaml` (GitRepository `eshop-qa`'s `spec.ref`, Kustomization
-`apps-qa`'s `spec.images`): the manifests in `deploy/apps/qa` **as they are in tag `vX.Y.Z-rc.N`**, with the
-`X.Y.Z-rc.N` images. Its PostgreSQL keeps its data from one candidate to the next, as prod's does. Flux applies a
+`apps-qa`'s `spec.images`, a `newTag` and a `digest` per image): the manifests in `deploy/apps/qa` **as they are in tag
+`vX.Y.Z-rc.N`**, with the `X.Y.Z-rc.N` images at the digests pinned, `<image>:X.Y.Z-rc.N@sha256:...`. Its PostgreSQL keeps its data from one candidate to the next, as prod's does. Flux applies a
 merged pin within a minute or two (`flux reconcile kustomization flux-system --with-source` hurries it).
 
 **No release yet.** `deploy/apps/qa` first appears in the first candidate cut after #74 landed, so QA can't run
@@ -400,6 +401,8 @@ unless:
 - QA's latest Deployment of it, created since `main` last changed QA's pin by a run on `main`, succeeded (none,
   still running, or failed refuses; a Deployment recorded by a run from another branch never counts);
 - every candidate image exists, and no `X.Y.Z` image exists with another digest;
+- every candidate image has the digest QA's pin on `main` has (the image QA ran: a tag repointed since differs) and
+  the digest the record lists (the one a rollback to `X.Y.Z` pins);
 - every candidate image's digest has its **SBOM** (ADR 0010). One pushed before SBOMs existed has none: attach one
   made from its digest with `scripts/gates/attach-sbom.sh --earlier-build <image>:X.Y.Z-rc.N /dev/null`, logged in to
   Docker Hub with push access, then re-run the job;
@@ -425,6 +428,13 @@ re-run: revert its merge (a PR), and the next QA run on `main` opens the sign-of
 |---|---|---|
 | `semver: "X.Y.Z" # release-pin: prod` | GitRepository `eshop-release`, `spec.ref` | the source at tag `vX.Y.Z` (an exact version selects exactly that tag) |
 | `newTag: "X.Y.Z" # release-pin: prod` (one per service) | Kustomization `apps-prod`, `spec.images` | the `X.Y.Z` images |
+| `digest: "sha256:..." # release-pin: prod` (under each `newTag`) | Kustomization `apps-prod`, `spec.images` | exactly those images: each runs as `<image>:X.Y.Z@sha256:...` |
+
+**Images are pinned by digest.** Docker Hub tags can be moved; a digest can't. With both set, kustomize writes
+`<image>:X.Y.Z@sha256:...`: the runtime pulls the digest, and the tag only says which release it is (what
+`e2e/check-serving.sh` and the smoke test read). Repointing `X.Y.Z` (or `X.Y.Z-rc.N`) in the registry changes
+nothing that runs or that a new pod pulls. Each digest comes from where the release's images were recorded: CI's push
+for a candidate, the sign-off for a release, and the release's record `releases/X.Y.Z.md` for a rollback.
 
 **Merging the prod promotion PR is the production approval.** Flux then applies `deploy/apps/prod` as it is in tag
 `vX.Y.Z` with the `X.Y.Z` images. Pushing a tag never changes prod, and changes on `main` reach prod only once they are
@@ -436,7 +446,8 @@ success marks prod's previous successful one inactive. To test again by hand: `e
 ```bash
 scripts/pin-release.sh prod                     # the pinned release, from Git
 flux get kustomization apps-prod                # Applied revision: vX.Y.Z@sha1:...
-kubectl -n eshop-prod get deploy -o wide        # images :X.Y.Z
+scripts/pin-release.sh --images prod            # each pinned image, <image>:X.Y.Z@sha256:...
+kubectl -n eshop-prod get deploy -o wide        # images :X.Y.Z@sha256:...
 ```
 
 ### Promotion and rollback
@@ -451,9 +462,15 @@ git commit -am "eshop-prod: deploy vX.Y.Z"      # push, open a PR into main
 ```
 
 `scripts/pin-release.sh <env> <version>` accepts only an exact `X.Y.Z` or `X.Y.Z-rc.N`, rewrites every line ending in
-`# release-pin: <env>` in `clusters/local/*.yaml`, deletes any `# release-pin-until: <env>` line and prints the new
-pin; without a version it prints the current one. CI's `repo rules` job checks every pin (`scripts/validate-manifests.sh`),
-so a hand edit that misses a line fails the PR. Before promoting by hand, check that tag `vX.Y.Z` and every
+`# release-pin: <env>` in `clusters/local/*.yaml` (the version lines, and each image's `digest` line), deletes any
+`# release-pin-until: <env>` line and prints the new pin; without a version it prints the current one, and
+`--images` each pinned image with its digest. The digests come from `PIN_IMAGES` (one `<image>:<version>@sha256:...`
+per line: `scripts/promotion-pr.sh` passes the `PROMOTION_IMAGES` CI and sign-off give it) or, for a release, from its
+record `releases/X.Y.Z.md` (the candidate's images, which `X.Y.Z` copies by digest). Without either it refuses,
+changing nothing; so does an image with no digest there. `scripts/promotion-pr.sh qa X.Y.Z-rc.N` run by hand, without
+`PROMOTION_IMAGES`, takes the candidate's digests from the registry (`crane digest`) and lists them in the PR to
+review. CI's `repo rules` job checks every pin, a sha256 digest for every image included
+(`scripts/validate-manifests.sh`), so a hand edit that misses a line fails the PR. Before promoting by hand, check that tag `vX.Y.Z` and every
 `docker.io/pkhamdee/<service>:X.Y.Z` image exist: a missing tag leaves `eshop-release` not Ready and prod on its
 previous release; a missing image leaves that Deployment's new pod in `ImagePullBackOff` while the old one serves.
 
@@ -465,8 +482,9 @@ scripts/pin-release.sh prod 0.2.0
 git commit -am "eshop-prod: roll back to v0.2.0"   # push, open a PR into main, merge it
 ```
 
-Its merge is smoke-tested like any promotion: a Deployment of `v0.2.0` to `prod`, whose success marks the rolled-back
-release's Deployment inactive.
+It pins the digests `releases/0.2.0.md` records (a release without a record, from before sign-off by PR, needs them
+given: `PIN_IMAGES`). Its merge is smoke-tested like any promotion: a Deployment of `v0.2.0` to `prod`, whose success
+marks the rolled-back release's Deployment inactive.
 
 It moves manifests and images back but **never the data**: eshop-api migrates the database forwards on start-up and
 nothing migrates it back. A rollback is safe only when the earlier release works with the schema the later one left:
@@ -495,8 +513,9 @@ release, and put the label back once prod runs a signed release again.
 - **Adding a service** to releases: an entry in `.github/services.json` and its lint/test job in `plan.needs` (then
   re-run `scripts/protect-main.sh`: the new job is a required check). To run it in prod and QA, add it to
   `deploy/apps/prod` and `deploy/apps/qa`, and an `images:` entry to `apps-prod` / `apps-qa` whose `newTag` line ends
-  in `# release-pin: prod` / `# release-pin: qa` (holding the current pin). It can land before a release that
-  contains the service: an `images:` entry that matches no Deployment changes nothing.
+  in `# release-pin: prod` / `# release-pin: qa`, in the promotion PR of the first release (candidate) that contains
+  the service: `scripts/pin-release.sh` then writes its `digest` line, and reading a pin with an image without one
+  fails.
 
 ## Patch release (also hotfixes)
 

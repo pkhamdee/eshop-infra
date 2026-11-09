@@ -44,14 +44,15 @@ runs() { # <id>=<title>[=<createdAt>]...
     createdAt: (.[2] // "2999-01-01T00:00:00Z")}' | jq -s . >"$FAKE/runs.json"
 }
 
-# eshop-<env> fully on <version>, as e2e/check-serving.sh asks the cluster.
+# eshop-<env> fully on <version>, pinned by digest, as e2e/check-serving.sh asks the cluster.
+digest=sha256:$(printf 'a%.0s' $(seq 64))
 serving() { # <env> <version>
-  jq -n --arg v "$2" '{metadata: {generation: 1}, spec: {images: [{name: "docker.io/pkhamdee/eshop-api", newTag: $v}]},
+  jq -n --arg v "$2" --arg d "$digest" '{metadata: {generation: 1}, spec: {images: [{name: "docker.io/pkhamdee/eshop-api", newTag: $v, digest: $d}]},
     status: {observedGeneration: 1, lastAppliedRevision: ("v" + $v + "@sha1:0123456789abcdef"),
       conditions: [{type: "Ready", status: "True", message: "Applied"}]}}' \
     >"$FAKE/flux-system.kustomization.apps-$1.json"
-  jq -n --arg v "$2" '{items: [{metadata: {name: "eshop-api", generation: 1},
-    spec: {replicas: 1, template: {spec: {containers: [{name: "eshop-api", image: ("docker.io/pkhamdee/eshop-api:" + $v)}]}}},
+  jq -n --arg v "$2" --arg d "$digest" '{items: [{metadata: {name: "eshop-api", generation: 1},
+    spec: {replicas: 1, template: {spec: {containers: [{name: "eshop-api", image: ("docker.io/pkhamdee/eshop-api:" + $v + "@" + $d)}]}}},
     status: {observedGeneration: 1, replicas: 1, updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1}}]}' \
     >"$FAKE/eshop-$1.deployment.json"
 }

@@ -10,9 +10,11 @@
 #
 # Serving X means all of:
 #   - Flux Kustomization apps-<env> is not suspended, has applied its latest spec, is Ready, its last applied
-#     revision is the tag vX@sha1:..., and every image it sets (spec.images) has tag X;
+#     revision is the tag vX@sha1:..., and every image it sets (spec.images) has tag X and a sha256 digest (the pin,
+#     scripts/pin-release.sh);
 #   - every Deployment in eshop-<env> has finished rolling out (no old pod left) and every eShop image
-#     ($IMAGE_REGISTRY/..., scripts/lib/repo.sh) it runs has tag X.
+#     ($IMAGE_REGISTRY/..., scripts/lib/repo.sh; index.docker.io/... counts as docker.io/...) it runs has tag X and
+#     the digest spec.images pins it to.
 # Serving main commit C (dev) means the same with revision main@sha1:C... and no tag rule: dev's tags are pinned in
 # deploy/apps/dev/kustomization.yaml by Flux image automation, so they are part of that revision, and a Deployment
 # that finished rolling out from it runs them.
@@ -93,21 +95,29 @@ ready=$(field '.status.conditions[]? | select(.type == "Ready") | "\(.status): \
 [[ "$ready" == "True: "* ]] || refuse "apps-$env is not Ready: ${ready#*: }"
 revision=$(field '.status.lastAppliedRevision // ""')
 [[ "$revision" == "$revision_wanted"* ]] || refuse "apps-$env applied ${revision:-nothing yet}"
-# QA and prod set every image tag to the version in spec.images; dev's tags are in the applied revision itself.
+# QA and prod set every image to the version, by digest, in spec.images; dev's tags are in the applied revision itself.
+pins='{}'
 if [ -n "$release" ]; then
   # shellcheck disable=SC2016 # $v is a jq variable
-  others=$(field --arg v "$release" '.spec.images[]? | select(.newTag != $v) | "\(.name):\(.newTag)"')
+  others=$(field --arg v "$release" '.spec.images[]?
+    | select(.newTag != $v or ((.digest // "") | test("^sha256:[0-9a-f]{64}$") | not))
+    | "\(.name):\(.newTag)@\(.digest // "(no digest)")"')
   [ -z "$others" ] || refuse "apps-$env sets $(paste -sd ' ' - <<<"$others")"
+  pins=$(field -c '[.spec.images[]? | {(.name): .digest}] | add // {}')
 fi
 
 deployments=$(kubectl -n "$ns" get deployment -o json 2>"$err") || refuse "cannot list Deployments ($(cat "$err"))"
 [ "$(jq '.items | length' <<<"$deployments")" -gt 0 ] || refuse "no Deployments in $ns"
-# Every eShop image ($IMAGE_REGISTRY/...) is the release's tag (QA, prod), and every Deployment has finished
-# rolling out: its newest spec observed, all its pods updated and ready, and no old pod left.
-problems=$(jq -r --arg v "$release" --arg registry "$IMAGE_REGISTRY/" '.items[] | .metadata.name as $d
+# Every eShop image ($IMAGE_REGISTRY/...) is the release's tag at its pinned digest (QA, prod), and every Deployment
+# has finished rolling out: its newest spec observed, all its pods updated and ready, and no old pod left.
+problems=$(jq -r --arg v "$release" --arg registry "$IMAGE_REGISTRY/" --argjson pins "$pins" '.items[] | .metadata.name as $d
   | ([(.spec.template.spec.initContainers // []) + .spec.template.spec.containers | .[].image
-      | select($v != "" and startswith($registry)) | select(test(":" + ($v | gsub("\\."; "\\.")) + "(@|$)") | not)
-      | "\($d) runs \(.)"]
+      | sub("^index\\.docker\\.io/"; "docker.io/")
+      | select($v != "" and startswith($registry))
+      | (split("@")[0] | sub(":[^:/]*$"; "")) as $name
+      | select((test(":" + ($v | gsub("\\."; "\\.")) + "(@|$)") | not)
+          or ($pins[$name] != null and (endswith("@" + $pins[$name]) | not)))
+      | "\($d) runs \(.)" + (if $pins[$name] != null then ", not \($name):\($v)@\($pins[$name])" else "" end)]
     + (.status as $s | .spec.replicas as $r
       | if ($s.observedGeneration // 0) < .metadata.generation or ($s.replicas // 0) != $r
            or ($s.updatedReplicas // 0) != $r or ($s.readyReplicas // 0) != $r or ($s.availableReplicas // 0) != $r

@@ -6,11 +6,14 @@
 #   scripts/promotion-pr.sh prod 0.3.0                       # sign-off; a person may run it too (also rollbacks)
 #   PROMOTION_PUSH=0 scripts/promotion-pr.sh qa 0.3.0-rc.1   # only the local branch and commit; prints the body
 #
-# The PR body says what is promoted (tag, commit, environment) and adds, from the environment:
-#   PROMOTION_IMAGES    the images, one per line (CI: image:tag@digest)
+# The pin carries each image's digest (scripts/pin-release.sh), and the PR body lists the pinned images. From the
+# environment:
+#   PROMOTION_IMAGES    the images, one per line, image:<version>@sha256:<digest> (CI: the candidate's, as pushed;
+#                       sign-off: the release's): the digests pinned. Without it, a release's come from its record
+#                       releases/X.Y.Z.md (a rollback), and a candidate's from the registry now (crane digest: by hand)
 #   PROMOTION_DETAILS   Markdown appended as is (CI: gate results and run link; sign-off: QA run, who signed off)
 # Refuses a version whose tag vX.Y.Z[-rc.N] is not on origin. Re-running for the same version updates the branch
-# and the open PR. Needs a clean checkout, push access to origin and, unless PROMOTION_PUSH=0, `gh` authenticated
+# and the open PR. Needs a clean checkout, push access to origin, crane for a candidate without PROMOTION_IMAGES and, unless PROMOTION_PUSH=0, `gh` authenticated
 # with a token that may open PRs. Commits with the current git identity. The GitHub-specific part is the last
 # step (`gh pr`); scripts/tests/release-scripts.sh tests it against a throwaway origin.
 set -euo pipefail
@@ -38,7 +41,16 @@ git checkout --quiet -B "$branch" origin/main
 first=false
 if scripts/pin-release.sh --suspended "$env"; then first=true; fi
 was=$(scripts/pin-release.sh "$env" 2>/dev/null)
-scripts/pin-release.sh "$env" "$version" >/dev/null
+images=${PROMOTION_IMAGES:-}
+if [ -z "$images" ] && is_candidate "$version"; then
+  # A candidate promoted by hand: its digests as the registry has them now, listed in the PR for review.
+  for name in $(scripts/pin-release.sh --images "$env" | sed -E 's/:[^:@]*@.*$//'); do
+    digest=$(crane digest "$name:$version") || { echo "image $name:$version is missing" >&2; exit 1; }
+    images+="$name:$version@$digest"$'\n'
+  done
+fi
+PIN_IMAGES=$images scripts/pin-release.sh "$env" "$version" >/dev/null
+[ -n "$images" ] || images=$(scripts/pin-release.sh --images "$env")
 if git diff --quiet; then
   echo "eshop-$env is already pinned to $version on main: nothing to promote" >&2; exit 0
 fi
@@ -51,16 +63,14 @@ trap 'rm -f "$body"' EXIT
   echo "Promotes **eshop-$env** to **$tag** (commit $commit; $from). Merging this PR is the approval: Flux then"
   echo "deploys it to https://$env.eshop.localhost within a minute or two."
   echo
-  echo "The only change is the pin: \`scripts/pin-release.sh $env $version\`."
+  echo "The only change is the pin: \`scripts/pin-release.sh $env $version\`, each image pinned by its digest."
   if $first; then
     echo "This is eshop-$env's first release: the same edit removes its suspend line, so merging it starts eshop-$env."
   fi
-  if [ -n "${PROMOTION_IMAGES:-}" ]; then
-    echo
-    echo "### Images"
-    echo
-    image_list <<<"$PROMOTION_IMAGES"
-  fi
+  echo
+  echo "### Images"
+  echo
+  image_list <<<"$images"
   if [ -n "${PROMOTION_DETAILS:-}" ]; then
     echo
     echo "$PROMOTION_DETAILS"
