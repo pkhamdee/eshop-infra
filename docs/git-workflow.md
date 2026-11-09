@@ -480,6 +480,13 @@ environment's overlay (prod: `v0.2.0` or later; QA: the first candidate after #7
 used the old names and can't be rolled back to (docs/setup.md, "Moving to eShop"). A fix to an overlay reaches the
 environment with the next release that contains it.
 
+
+**Rollback and the image policy.** `eshop-prod` enforces the image policy (ADR 0011), so a rollback to a release
+from before `v0.7.0`, whose images are unsigned, is refused: the new pods never start and the old ones keep serving.
+To roll back that far, first remove `policy.sigstore.dev/include` from `eshop-prod` in
+`deploy/infrastructure/controllers/namespaces.yaml` (a PR; it rolls prod once, same images), then promote the older
+release, and put the label back once prod runs a signed release again.
+
 ### Things to know
 
 - **Any release can be promoted**, in any order: a patch on an older series reaches prod only if someone promotes it.
