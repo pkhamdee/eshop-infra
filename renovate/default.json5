@@ -9,11 +9,14 @@
     "config:recommended",
     "helpers:pinGitHubActionDigests",
     "docker:pinDigests",
-    ":dependencyDashboard",
+    ":dependencyDashboard", // eshop-infra only in practice: the service repositories have issues turned off
   ],
   timezone: "Asia/Bangkok",
   schedule: ["before 9am on monday"],
   minimumReleaseAge: "14 days",
+  // Major updates never share a PR with minor and patch ones, groups included (Renovate's default, stated: the
+  // `major` rule below relies on it).
+  separateMajorMinor: true,
   internalChecksFilter: "strict",
   prConcurrentLimit: 5,
   labels: ["dependencies"],
@@ -67,9 +70,12 @@
     { matchManagers: ["flux"], groupName: "Helm charts" },
     { matchManagers: ["custom.regex"], groupName: "pipeline tools" },
     {
-      // A major version is a decision: it waits on the dependency dashboard for approval.
+      // A major version is a decision, so it gets a PR of its own (never grouped with minor and patch updates),
+      // labelled `major`: reviewing and merging that PR is the approval. Not dependency-dashboard approval: the
+      // service repositories have issues turned off (ADR 0009), so they have no dashboard, and a major update waiting
+      // on one would never get a PR there.
       matchUpdateTypes: ["major"],
-      dependencyDashboardApproval: true,
+      addLabels: ["major"],
     },
   ],
   customManagers: [
