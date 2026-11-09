@@ -403,6 +403,37 @@ To check the setup without waiting for a deploy: `e2e/run-on-actions.sh qa <the 
 result. Mails land in the recipient's inbox from the sending account; if not, look in spam and mark it "not spam"
 once.
 
+### Watchdog
+
+Two scheduled workflows catch failures nobody would otherwise hear about (#152). Each kind of problem has one GitHub
+issue, **"Watchdog: queue"** or **"Watchdog: cluster"**. The workflow opens it, and emails the maintainer, when the
+problem starts. It updates the issue silently while the problem lasts, then comments, closes it and emails again when
+the problem clears. The emails use the [smoke test email](#smoke-test-email) settings (`scripts/watchdog.sh`, mail
+through `scripts/lib/mail.sh`).
+
+| Workflow | Runs | Reports |
+|---|---|---|
+| `watchdog.yml` | every 15 min, GitHub-hosted | a job queued 30 min or more for the cluster's runner (`eshop-e2e`): the smoke test, or the cluster check below |
+| `watchdog-cluster.yml` | every 30 min, on the cluster's runner | a Flux Kustomization or HelmRelease not Ready for 15 min (a suspended one is skipped), or policy-controller's webhook with no ready pod |
+
+What each one means, and what to do:
+
+- **A job queued for the cluster's runner:** the runner scale set can't take jobs. Check `kubectl -n arc-runners get
+  ephemeralrunners` and the controller's log (`kubectl -n arc-systems logs deploy/arc-gha-rs-controller`). An
+  EphemeralRunner stuck deleting (as after the rename, #106) is cleared by removing its finalizer. If the runner's
+  GitHub token expired, renewing it is a human step ([Cluster runner](#cluster-runner)).
+- **A Flux object not Ready:** `flux get kustomizations -A` and `flux get helmreleases -A` name it and why. A
+  dependency that isn't ready often clears with `flux reconcile kustomization <name>`; a failed apply needs a fix in
+  Git.
+- **policy-controller's webhook down:** `kubectl -n cosign-system get pods`. Its failure policy is `Ignore` (ADR
+  0011), so until it is back, images in the enforced namespaces are admitted **unchecked**.
+- **"The cluster check itself failed":** the `check` job ran but failed (kubectl couldn't read the cluster, say).
+  Read its log in the run linked from the issue.
+
+The cluster check takes the one runner slot for about a minute every 30 minutes, so a smoke test can wait that long
+behind it. Every workflow job has `timeout-minutes`, so none holds a runner for GitHub's default of 6 hours;
+`scripts/gates/pins.sh` checks that (with the pins), here and in the service repositories.
+
 ### Cluster runner
 
 The E2E job (`runs-on: eshop-e2e`) runs inside the cluster (ADR 0008). Flux installs Actions Runner Controller

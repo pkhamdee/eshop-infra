@@ -65,6 +65,7 @@ jobs:
   sast:
     name: SAST (Semgrep, fail on ERROR)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,6 +92,7 @@ jobs:
   deps:
     name: dependency scan (Trivy, fail on critical)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -117,6 +119,7 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -169,6 +172,7 @@ jobs:
     name: temporary copy and gates
     needs: [build]
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -229,6 +233,7 @@ jobs:
     name: scan ${{ matrix.service }}
     needs: [gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -271,6 +276,7 @@ jobs:
     name: push images
     needs: [scan]
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
     environment: publish
     # id-token: the keyless signature's identity (ADR 0011). The calling job must grant it too (each service
     # repository's ci.yml, `image` job), or this job can't start.

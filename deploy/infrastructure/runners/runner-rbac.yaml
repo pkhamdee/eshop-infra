@@ -127,3 +127,55 @@ subjects:
   - kind: ServiceAccount
     name: eshop-e2e-runner
     namespace: arc-runners
+---
+# The watchdog's cluster check (.github/workflows/watchdog-cluster.yml, scripts/watchdog.sh cluster, #152): read-only,
+# whether Flux's objects are Ready and policy-controller's webhook has a ready pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eshop-e2e-runner-watchdog
+rules:
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    verbs: [get, list]
+  - apiGroups: [helm.toolkit.fluxcd.io]
+    resources: [helmreleases]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eshop-e2e-runner-watchdog
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eshop-e2e-runner-watchdog
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eshop-e2e-runner-watchdog
+  namespace: cosign-system
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [policy-controller-webhook]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eshop-e2e-runner-watchdog
+  namespace: cosign-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eshop-e2e-runner-watchdog
+subjects:
+  - kind: ServiceAccount
+    name: eshop-e2e-runner
+    namespace: arc-runners
