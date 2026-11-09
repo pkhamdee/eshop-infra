@@ -1,0 +1,92 @@
+// eShop's shared Renovate preset (#149). Every eShop repository's renovate.json extends it:
+//   { "extends": ["github>pkhamdee/eshop-infra//renovate/default.json5"] }
+// It keeps the pins scripts/gates/pins.sh requires (actions by commit SHA, images by digest, exact chart versions)
+// current, never sooner than two weeks after a release (the project's rule for new pins), in grouped weekly PRs that
+// run the same required checks as any other PR.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests",
+    ":dependencyDashboard",
+  ],
+  timezone: "Asia/Bangkok",
+  schedule: ["before 9am on monday"],
+  minimumReleaseAge: "14 days",
+  internalChecksFilter: "strict",
+  prConcurrentLimit: 5,
+  labels: ["dependencies"],
+  // Kubernetes manifests and Flux objects live under deploy/ and clusters/ (Renovate only looks in
+  // gotk-components.yaml for Flux by default, and nowhere for plain manifests).
+  kubernetes: { managerFilePatterns: ["/^deploy/.+\\.ya?ml$/"] },
+  flux: { managerFilePatterns: ["/^deploy/.+\\.ya?ml$/", "/^clusters/.+\\.ya?ml$/"] },
+  packageRules: [
+    {
+      // The reusable gates stay at @main: that ref is part of the identity the cluster's image policy trusts (ADR 0011).
+      matchDepNames: ["pkhamdee/eshop-infra"],
+      enabled: false,
+    },
+    {
+      // eShop's own images and the runner image are moved by Flux image automation and by promotion PRs, never by Renovate.
+      matchPackageNames: ["docker.io/pkhamdee/**", "pkhamdee/**", "ghcr.io/actions/actions-runner"],
+      matchDatasources: ["docker"],
+      enabled: false,
+    },
+    {
+      // Flux's own components are upgraded with `flux install --export` (docs/setup.md), not piecemeal.
+      matchFileNames: ["clusters/local/flux-system/**"],
+      enabled: false,
+    },
+    {
+      // cosign stays on v2: v3 writes the bundle format policy-controller can't verify yet (ADR 0011).
+      matchPackageNames: ["sigstore/cosign"],
+      allowedVersions: "<3",
+    },
+    { matchManagers: ["github-actions"], groupName: "GitHub Actions" },
+    { matchDatasources: ["docker"], groupName: "container images" },
+    { matchManagers: ["flux"], groupName: "Helm charts" },
+    { matchManagers: ["custom.regex"], groupName: "pipeline tools" },
+    {
+      // A major version is a decision: it waits on the dependency dashboard for approval.
+      matchUpdateTypes: ["major"],
+      dependencyDashboardApproval: true,
+    },
+  ],
+  customManagers: [
+    {
+      // The gate scripts' tool images: NAME_IMAGE=repo:tag@sha256:digest (scripts/gates/*.sh).
+      customType: "regex",
+      managerFilePatterns: ["/^scripts/.+\\.sh$/"],
+      matchStrings: ["[A-Z_]+_IMAGE=(?<depName>[a-z0-9./_-]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      datasourceTemplate: "docker",
+    },
+    {
+      // crane, as imjasonh/setup-crane installs it.
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      matchStrings: ["imjasonh/setup-crane@\\S+[^\\n]*\\n(?:\\s+if:[^\\n]*\\n)?\\s+with:\\n\\s+version: (?<currentValue>v[0-9.]+)"],
+      depNameTemplate: "google/go-containerregistry",
+      datasourceTemplate: "github-releases",
+    },
+    {
+      // oras, as oras-project/setup-oras installs it (its version has no leading v).
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      matchStrings: ["oras-project/setup-oras@\\S+[^\\n]*\\n(?:\\s+if:[^\\n]*\\n)?\\s+with:\\n\\s+version: (?<currentValue>[0-9.]+)"],
+      depNameTemplate: "oras-project/oras",
+      datasourceTemplate: "github-releases",
+      extractVersionTemplate: "^v(?<version>.+)$",
+    },
+    {
+      // cosign, as sigstore/cosign-installer installs it.
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      matchStrings: ["cosign-release: (?<currentValue>v[0-9.]+)"],
+      depNameTemplate: "sigstore/cosign",
+      datasourceTemplate: "github-releases",
+    },
+    // Not managed: scripts/check-image-policy.sh's TESTER_VERSION moves with its SHA-256 sums and with the
+    // policy-controller chart (deploy/infrastructure/controllers/policy-controller.yaml): bump the three together.
+  ],
+}

@@ -45,7 +45,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: mssql
-          image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04
+          image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090
           env:
             - name: ACCEPT_EULA
               value: "Y"
@@ -94,7 +94,7 @@ spec:
               mountPath: /var/opt/mssql
         # Applies databases, schema and logins once SQL Server answers, then idles (ready = done).
         - name: schema
-          image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04
+          image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090
           command: ["/bin/bash", "/init/init.sh"]
           env:
             - name: HOME

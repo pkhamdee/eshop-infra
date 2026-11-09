@@ -93,7 +93,7 @@ jobs:
       targets: ${{ steps.decide.outputs.targets }}
     steps:
       # Full history: the push's commits, and origin/main for a dispatch's defaults.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Decide the targets
@@ -157,7 +157,7 @@ jobs:
       STAFF_USERNAME: ${{ secrets.E2E_STAFF_USERNAME }}
       STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The stock runner image has neither gh nor kubectl: the versions below, checked against their published
       # SHA-256.
       - name: Install gh and kubectl
@@ -244,7 +244,7 @@ jobs:
           cat serving.txt
           { echo; echo "Serving before the test:"; echo '```'; cat serving.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
       # No `cache: npm`: the download is small next to Chromium's, and the runner pod starts empty either way.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - run: npm ci
@@ -289,7 +289,7 @@ jobs:
       - name: Upload the Playwright report
         id: report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-report-${{ matrix.env }}
           # The report carries no traces in CI (see playwright.config.ts) and never the Staff password.
@@ -353,7 +353,7 @@ jobs:
           echo "${REPORT_URL:-$RUN_URL}" >smoke-result/report-url
       - name: Upload the result for the email
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-result-${{ matrix.env }}
           path: smoke-result
@@ -383,9 +383,9 @@ jobs:
       contents: read
       deployments: read # dev's previous Deployment, prod's last passing release (scripts/notify.sh)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Whatever it finds: notify.sh handles a missing result (not tested).
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           pattern: smoke-result-*
@@ -421,7 +421,7 @@ jobs:
       deployments: read # QA's Deployments
       actions: read # the run's Playwright report artifact
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0 # when main last changed QA's pin

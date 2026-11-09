@@ -728,7 +728,7 @@ Enterprise sync steps can't pass there.
 | `e2e/` | Seam 4: Playwright smoke test of the whole demo against a deployed environment (`npm run e2e`) | – |
 | `scripts/` | Repo tasks: `release.sh X.Y.Z-rc.N` cuts a release candidate (human-run); `promotion-pr.sh <env> <version>` opens a promotion PR (CI); `candidate-images.sh vX.Y.Z-rc.N` says which of a candidate's images CI copies by digest and which it builds (CI); `sign-off-pr.sh` opens and closes sign-off PRs (e2e.yml); `sign-off.sh` signs off a candidate when its sign-off PR is merged (sign-off.yml); `protect-main.sh` sets the rulesets "Protect main", "Protect release tags" and "Create release tags" and the `release` and `smoke-test` environments, and each service repository's ruleset, `publish` environment and issues (admin-run; [Protecting main](#protecting-main)); `clone-all.sh` clones the service repositories beside this one ([Service repositories](#service-repositories)); `check-enterprise-schema.sh` checks that the deployed mock Enterprise schema is the one eshop-sync-master's tests apply (CI's `repo rules` job); tests of all of them in `tests/release-scripts.sh`; `lib/` holds what they share, sourced: `versions.sh` (the version grammar: X.Y.Z, X.Y.Z-rc.N, 0.0.0-test.N, and which environment takes which), `repo.sh` (the GitHub repository and image registry, env-overridable), `images.sh` (the image list in PR and Release bodies), `qa.sh` (QA's pin and Deployments, the evidence sign-off reads); `validate-manifests.sh` builds and schema-checks every Flux path (also CI's `repo rules` job) | – |
 | `releases/` | One record per release, `X.Y.Z.md`: the signed-off candidate, its image digests, QA's passing run and Deployment. Added by the sign-off PR (`scripts/sign-off-pr.sh`); merging it signs off (git-workflow.md, "Sign-off") | – |
-| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `artifact-dirs.sh` (puts a downloaded image artifact in its `image-<service>` folder), `tags-to-push.sh` (the service repositories' push: never an existing tag), `image-scan.sh` (Trivy on built images), `sbom.sh` and `attach-sbom.sh` (each image's CycloneDX SBOM, attached to its digest, ADR 0010), `sign-images.sh` (keyless cosign signature of each pushed digest, ADR 0011), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
+| `scripts/gates/` | Release gates (ADR 0007), one script each, tool from a pinned image, report in `reports/<gate>/`: `sast.sh` (Semgrep), `pins.sh` (actions by commit SHA, base images by digest, exact chart versions; [Pins and dependency updates](#pins-and-dependency-updates)), `deps.sh` (Trivy over the lockfiles), `temporary-copy.sh` (the temporary copy, Compose file in `temporary-copy/`; see [Temporary copy](#temporary-copy-release-gate)), `latest-main-image.sh`, `artifact-dirs.sh` (puts a downloaded image artifact in its `image-<service>` folder), `tags-to-push.sh` (the service repositories' push: never an existing tag), `image-scan.sh` (Trivy on built images), `sbom.sh` and `attach-sbom.sh` (each image's CycloneDX SBOM, attached to its digest, ADR 0010), `sign-images.sh` (keyless cosign signature of each pushed digest, ADR 0011), `perf.sh` (Locust; load, thresholds and locustfile in `perf/`), `dast.sh` (OWASP ZAP against the copy, signed out and as a Customer and Staff via `dast-session.mjs`; accepted alerts in `dast-rules.conf`). See [Running the gates locally](#running-the-gates-locally) | – |
 | `.github/services.json` | Every eShop image a release takes, with the `repository` that builds it ([Service repositories](#service-repositories)); a release candidate copies each one by digest (`scripts/candidate-images.sh`) | – |
 | `.github/workflows/service-image.yml` | The shared gates the service repositories' CI calls: build, SAST, dependency scan, temporary copy, Trivy, SBOM, push, sign and attach the SBOM (git-workflow.md, "Service repositories") | – |
 | `../eshop-web/` (`pkhamdee/eshop-web`) | React + Vite + TypeScript, served by Caddy; its own repository ([Service repositories](#service-repositories)) | – |
@@ -778,6 +778,31 @@ cd ../eshop-node-api
 npm ci && npm run lint && npm test                                  # as CI runs it
 npm run dev                                                         # http://localhost:8081, images in ./.local-share
 ```
+
+### Pins and dependency updates
+
+Nothing the pipeline runs or builds from may move under it (#149):
+
+- every `uses:` names a commit SHA, with the version as a comment (`actions/checkout@3d3c42e… # v7.0.1`). The one
+  exception is `pkhamdee/eshop-infra/.github/workflows/service-image.yml@main` in the service repositories: that ref is
+  part of the identity the cluster's image policy trusts (ADR 0011);
+- every Dockerfile `FROM`, Compose `image:` and gate tool image names a digest (`node:24-alpine@sha256:…`);
+- every Helm chart is at an exact version.
+
+`scripts/gates/pins.sh` checks the first and second for workflows and Dockerfiles and the third for charts. It runs in
+this repository's `repo rules` job and, for each service repository, in the shared gates' SAST job.
+
+**Renovate** keeps the pins current. The shared preset is `renovate/default.json5`, and each repository's
+`renovate.json` extends it. Updates come at least 14 days after a release, grouped weekly (actions, container images,
+Helm charts, pipeline tools), and go through the same required checks as any PR. A major version waits on the
+dependency dashboard for approval. eShop's own images and the runner image are never Renovate's: Flux image automation
+and promotion PRs move them. Flux's own components are upgraded with `flux install --export`. cosign stays below v3
+(ADR 0011). `scripts/check-image-policy.sh`'s `TESTER_VERSION` moves with its SHA-256 sums and the policy-controller
+chart, so it is bumped by hand, together with them.
+
+Human steps (repository settings): install the [Renovate GitHub App](https://github.com/apps/renovate) on the five
+repositories, and turn on Dependabot security alerts and updates (Settings → Code security). Renovate then opens a
+"Dependency Dashboard" issue in each repository.
 
 ### Running the gates locally
 

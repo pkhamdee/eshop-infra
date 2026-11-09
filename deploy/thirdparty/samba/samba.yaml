@@ -37,7 +37,7 @@ spec:
       initContainers:
         # Each environment's share folder belongs to its SMB account (UIDs match UID_* below).
         - name: share-folders
-          image: ghcr.io/servercontainers/samba:smbd-only-a3.24.3-s4.23.8-r0
+          image: ghcr.io/servercontainers/samba:smbd-only-a3.24.3-s4.23.8-r0@sha256:04fb3bd3da742ddb988f621e8c38b0dcbc26e7b4c438c9836abb43d937bc27e6
           command:
             - sh
             - -c
@@ -54,7 +54,7 @@ spec:
         # smbd runs as root and switches to the SMB account per connection (the image's entrypoint creates
         # the accounts from ACCOUNT_* at start).
         - name: samba
-          image: ghcr.io/servercontainers/samba:smbd-only-a3.24.3-s4.23.8-r0
+          image: ghcr.io/servercontainers/samba:smbd-only-a3.24.3-s4.23.8-r0@sha256:04fb3bd3da742ddb988f621e8c38b0dcbc26e7b4c438c9836abb43d937bc27e6
           env:
             - name: AVAHI_DISABLE
               value: "1"

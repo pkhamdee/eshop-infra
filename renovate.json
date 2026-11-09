@@ -1,0 +1,4 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>pkhamdee/eshop-infra//renovate/default.json5"]
+}
