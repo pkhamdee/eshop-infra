@@ -78,6 +78,9 @@ terms in `GLOSSARY.md`; decisions in `docs/adr/`. This file points there rather 
 - Pin everything you add (`scripts/gates/pins.sh` fails otherwise): an action by commit SHA with a `# vX.Y.Z`
   comment, an image by digest (`tag@sha256:...`), a chart at an exact version; resolve them from a release at least 14
   days old. Renovate updates them afterwards (docs/setup.md, "Pins and dependency updates").
+- A command-line tool a workflow needs goes in `scripts/ci/tools.sh` (`pin <tool> <version>` writes its checksums) and
+  is installed with `scripts/ci/tools.sh install <tool>` after the job's `actions/cache` step, never with a
+  third-party installer action or a bare `curl`.
 - Trivy fails CI on any CRITICAL, fixed or not (`scripts/gates/deps.sh`, `scripts/gates/image-scan.sh`). For an
   unfixable one add a `.trivyignore` at the repo root (CVE, reason, date): both gates run Trivy there.
 - An ImagePolicy with no matching tag stays not Ready and blocks a `wait: true` Kustomization: a new service's image

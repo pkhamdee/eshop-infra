@@ -27,18 +27,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The stock runner image has no kubectl: this version, checked against its published SHA-256 (as e2e.yml).
+      # The pinned command-line tools (scripts/ci/tools.sh, #158), kept between runs: a GitHub release-download
+      # outage can't block this job once the cache is warm.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/eshop-tools
+          key: eshop-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/tools.sh') }}
+      # The stock runner image has no kubectl: the pinned version (scripts/ci/tools.sh).
       - name: Install kubectl
-        working-directory: ${{ runner.temp }}
-        env:
-          KUBECTL_VERSION: v1.36.2 # k3s v1.36 (docs/setup.md)
-        run: |
-          case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "::error::no kubectl for $(uname -m)"; exit 1 ;; esac
-          url="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$arch/kubectl"
-          curl -fsSLo kubectl "$url"
-          echo "$(curl -fsSL "$url.sha256")  kubectl" | sha256sum -c -
-          mkdir -p bin && install -m 0755 kubectl bin/kubectl && rm kubectl
-          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+        run: scripts/ci/tools.sh install kubectl
       - name: Check
         run: mkdir -p watchdog && scripts/watchdog.sh cluster | tee watchdog/problems.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

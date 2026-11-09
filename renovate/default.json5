@@ -43,6 +43,25 @@
       matchPackageNames: ["sigstore/cosign"],
       allowedVersions: "<3",
     },
+    {
+      // Renovate changes a tool's version but can't compute its checksums: the PR's install fails until someone runs
+      // `scripts/ci/tools.sh pin <tool> <version>` on its branch.
+      matchFileNames: ["scripts/ci/tools.sh"],
+      prBodyNotes: ["Finish this PR on its branch with `scripts/ci/tools.sh pin {{{depName}}} {{{newVersion}}}`: Renovate can't compute the checksums, so CI fails until then."],
+    },
+    {
+      // kubectl follows the cluster's Kubernetes minor version (k3s), which an upgrade of the cluster moves.
+      matchFileNames: ["scripts/ci/tools.sh"],
+      matchPackageNames: ["kubernetes/kubernetes"],
+      matchUpdateTypes: ["minor", "major"],
+      enabled: false,
+    },
+    {
+      // policy-controller's tester moves with the policy-controller chart (deploy/infrastructure/controllers): together, by hand.
+      matchFileNames: ["scripts/ci/tools.sh"],
+      matchPackageNames: ["sigstore/policy-controller"],
+      enabled: false,
+    },
     { matchManagers: ["github-actions"], groupName: "GitHub Actions" },
     { matchDatasources: ["docker"], groupName: "container images" },
     { matchManagers: ["flux"], groupName: "Helm charts" },
@@ -62,31 +81,11 @@
       datasourceTemplate: "docker",
     },
     {
-      // crane, as imjasonh/setup-crane installs it.
+      // CI's command-line tools: one row each in scripts/ci/tools.sh (name, version, datasource:package, ...).
       customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      matchStrings: ["imjasonh/setup-crane@\\S+[^\\n]*\\n(?:\\s+if:[^\\n]*\\n)?\\s+with:\\n\\s+version: (?<currentValue>v[0-9.]+)"],
-      depNameTemplate: "google/go-containerregistry",
-      datasourceTemplate: "github-releases",
+      managerFilePatterns: ["/^scripts/ci/tools\\.sh$/"],
+      matchStrings: ["(?m)^(?<depName>[a-z][a-z0-9-]*)\\s+(?<currentValue>[0-9][^\\s]*)\\s+(?<datasource>[a-z-]+):(?<packageName>\\S+)\\s"],
+      extractVersionTemplate: "^v?(?<version>.+)$",
     },
-    {
-      // oras, as oras-project/setup-oras installs it (its version has no leading v).
-      customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      matchStrings: ["oras-project/setup-oras@\\S+[^\\n]*\\n(?:\\s+if:[^\\n]*\\n)?\\s+with:\\n\\s+version: (?<currentValue>[0-9.]+)"],
-      depNameTemplate: "oras-project/oras",
-      datasourceTemplate: "github-releases",
-      extractVersionTemplate: "^v(?<version>.+)$",
-    },
-    {
-      // cosign, as sigstore/cosign-installer installs it.
-      customType: "regex",
-      managerFilePatterns: ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      matchStrings: ["cosign-release: (?<currentValue>v[0-9.]+)"],
-      depNameTemplate: "sigstore/cosign",
-      datasourceTemplate: "github-releases",
-    },
-    // Not managed: scripts/check-image-policy.sh's TESTER_VERSION moves with its SHA-256 sums and with the
-    // policy-controller chart (deploy/infrastructure/controllers/policy-controller.yaml): bump the three together.
   ],
 }

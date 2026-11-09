@@ -302,9 +302,14 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      # The pinned command-line tools (scripts/ci/tools.sh, #158), kept between runs: a GitHub release-download
+      # outage can't block this job once the cache is warm.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          version: v0.22.1
+          path: ~/.cache/eshop-tools
+          key: eshop-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/tools.sh') }}
+      - name: Tools (crane)
+        run: scripts/ci/tools.sh install crane
       # Never overwrite a tag (#116): a second run of a commit pushes nothing, and the image already there (the one
       # Flux deployed and dev tested) stays. pushed.txt: each pushed tag's repository@digest, as docker push reports
       # it: what the next step signs.
@@ -321,9 +326,8 @@ jobs:
             [ -n "$digest" ] || { echo "::error::docker push $tag reported no digest"; exit 1; }
             echo "${tag%:*}@$digest" >> "$RUNNER_TEMP/pushed.txt"
           done < "$RUNNER_TEMP/to-push.txt"
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.6.5 # v2: the classic signature format policy-controller verifies (ADR 0011)
+      - name: Tools (cosign)
+        run: scripts/ci/tools.sh install cosign
       # Right after the push, before anything else can fail: only what this run pushed, never an existing image (ADR
       # 0011). A failure leaves the images pushed but unsigned; a re-run pushes and signs nothing, so the fix is a new
       # commit.
@@ -334,9 +338,8 @@ jobs:
           pattern: sbom-*
           path: ${{ runner.temp }}/sbom
           merge-multiple: true
-      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
-        with:
-          version: 1.3.4
+      - name: Tools (oras)
+        run: scripts/ci/tools.sh install oras
       # Every image, pushed now or by an earlier run of this commit: an image without an SBOM gets one, one that has
       # an SBOM keeps it. A failure here leaves the image pushed and fails the run; a re-run fills the SBOM in.
       - name: Attach SBOMs

@@ -828,8 +828,16 @@ this repository's `repo rules` job and, for each service repository, in the shar
 Helm charts, pipeline tools), and go through the same required checks as any PR. A major version waits on the
 dependency dashboard for approval. eShop's own images and the runner image are never Renovate's: Flux image automation
 and promotion PRs move them. Flux's own components are upgraded with `flux install --export`. cosign stays below v3
-(ADR 0011). `scripts/check-image-policy.sh`'s `TESTER_VERSION` moves with its SHA-256 sums and the policy-controller
-chart, so it is bumped by hand, together with them.
+(ADR 0011).
+
+**CI's command-line tools** (crane, oras, cosign, policy-controller's tester, gh, kubectl) come from
+`scripts/ci/tools.sh`. Each has a pinned version and the SHA-256 of its download, both written in that file. Jobs keep
+them in `actions/cache` (`~/.cache/eshop-tools`, keyed by the file's hash), so once the cache is warm a GitHub
+release-download outage can't block a job (#158). A cache miss downloads with retries and refuses a file whose checksum
+differs. Renovate opens a PR for a newer version but can't compute checksums, so finish such a PR on its branch with
+`scripts/ci/tools.sh pin <tool> <version>`, which writes the version and the checksums the project publishes. kubectl
+stays on the cluster's minor version. policy-controller's tester moves by hand, together with the policy-controller
+chart. `scripts/ci/tools.sh list` shows what is pinned.
 
 Human steps (repository settings): install the [Renovate GitHub App](https://github.com/apps/renovate) on the five
 repositories, and turn on Dependabot security alerts and updates (Settings → Code security). Renovate then opens a

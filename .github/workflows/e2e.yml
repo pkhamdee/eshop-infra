@@ -159,26 +159,16 @@ jobs:
       STAFF_PASSWORD: ${{ secrets.E2E_STAFF_PASSWORD }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The stock runner image has neither gh nor kubectl: the versions below, checked against their published
-      # SHA-256.
+      # The pinned command-line tools (scripts/ci/tools.sh, #158), kept between runs: a GitHub release-download
+      # outage can't block this job once the cache is warm.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/eshop-tools
+          key: eshop-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/tools.sh') }}
+      # The stock runner image has neither gh nor kubectl: the pinned versions (scripts/ci/tools.sh), checked against
+      # the SHA-256 written there.
       - name: Install gh and kubectl
-        working-directory: ${{ runner.temp }}
-        env:
-          GH_VERSION: 2.103.3
-          KUBECTL_VERSION: v1.36.2 # k3s v1.36 (docs/setup.md)
-        run: |
-          case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "::error::no binaries for $(uname -m)"; exit 1 ;; esac
-          mkdir -p bin
-          gh_file="gh_${GH_VERSION}_linux_$arch.tar.gz"
-          gh_url="https://github.com/cli/cli/releases/download/v$GH_VERSION"
-          curl -fsSLO "$gh_url/$gh_file"
-          curl -fsSL "$gh_url/gh_${GH_VERSION}_checksums.txt" | grep " $gh_file\$" | sha256sum -c -
-          tar -xzf "$gh_file" && install -m 0755 "${gh_file%.tar.gz}/bin/gh" bin/gh && rm -rf "$gh_file" "${gh_file%.tar.gz}"
-          url="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$arch/kubectl"
-          curl -fsSLo kubectl "$url"
-          echo "$(curl -fsSL "$url.sha256")  kubectl" | sha256sum -c -
-          install -m 0755 kubectl bin/kubectl && rm kubectl
-          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+        run: scripts/ci/tools.sh install gh kubectl
       # The Deployment exists from here on, and the last step always finishes it. A run cancelled while waiting
       # for its turn never got here, so it leaves no Deployment behind (notify reports it as not tested).
       #
@@ -429,17 +419,20 @@ jobs:
           ref: main
           fetch-depth: 0 # when main last changed QA's pin
           token: ${{ secrets.PROMOTION_TOKEN }} # git push of the sign-off branch
-      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      # The pinned command-line tools (scripts/ci/tools.sh, #158), kept between runs: a GitHub release-download
+      # outage can't block this job once the cache is warm.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          version: v0.22.1
+          path: ~/.cache/eshop-tools
+          key: eshop-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/tools.sh') }}
+      - name: Tools (crane)
+        run: scripts/ci/tools.sh install crane
       # Each image's SBOM (ADR 0010; scripts/lib/sbom.sh).
-      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
-        with:
-          version: 1.3.4
+      - name: Tools (oras)
+        run: scripts/ci/tools.sh install oras
       # Each image's signature (ADR 0011; scripts/lib/signature.sh), as service-image.yml signs it.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v2.6.5
+      - name: Tools (cosign)
+        run: scripts/ci/tools.sh install cosign
       - name: Open or close sign-off PRs
         env:
           REPO: ${{ github.repository }}
