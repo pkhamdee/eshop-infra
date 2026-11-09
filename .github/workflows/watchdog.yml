@@ -1,0 +1,44 @@
+# The watchdog's outside check (#152; scripts/watchdog.sh queue): every 15 minutes, on a GitHub-hosted runner, any job
+# that has waited 30 minutes or more for the cluster's runner (e2e.yml's smoke test, watchdog-cluster.yml's check).
+# That is how a broken runner shows: its jobs just queue (13 hours after the rename, #106). The result is one GitHub
+# issue, "Watchdog: queue", opened (and emailed) when it starts and closed (and emailed) when it clears.
+# The cluster's own state is watchdog-cluster.yml's: it needs the cluster's runner, which this check watches.
+name: Watchdog
+
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchdog-queue
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    name: jobs queued for the cluster's runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Its secret SMTP_PASSWORD; deployable from main only, which a schedule always runs on.
+    environment:
+      name: smoke-test
+      deployment: false
+    permissions:
+      contents: read
+      actions: read # the queued jobs
+      issues: write # the watchdog's issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check and report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
+          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          scripts/watchdog.sh queue | tee "$RUNNER_TEMP/problems.txt"
+          scripts/watchdog.sh report queue "$RUNNER_TEMP/problems.txt"

@@ -38,6 +38,8 @@
 set -euo pipefail
 # shellcheck source=lib/repo.sh
 . "$(dirname "$0")/lib/repo.sh"
+# shellcheck source=lib/mail.sh
+. "$(dirname "$0")/lib/mail.sh"
 # shellcheck source=lib/versions.sh
 . "$(dirname "$0")/lib/versions.sh"
 # shellcheck source=lib/deployments.sh
@@ -89,10 +91,9 @@ case "$result" in
   *) usage "unknown result '$result'" ;;
 esac
 
-missing=()
-for setting in SMTP_USERNAME SMTP_PASSWORD NOTIFY_EMAIL; do [ -n "${!setting:-}" ] || missing+=("$setting"); done
-if [ ${#missing[@]} -gt 0 ]; then
-  echo "notify.sh: no ${missing[*]}: can't email the $env result (docs/setup.md, \"Smoke test email\")" >&2
+unset_settings=$(mail_missing)
+if [ -n "$unset_settings" ]; then
+  echo "notify.sh: no $unset_settings: can't email the $env result (docs/setup.md, \"Smoke test email\")" >&2
   exit 1
 fi
 RUN_URL=${RUN_URL:-}
@@ -136,13 +137,6 @@ subject="[eShop] $env $name: $outcome"
 message=$(mktemp)
 trap 'rm -f "$message"' EXIT
 {
-  echo "From: $SMTP_USERNAME"
-  echo "To: $NOTIFY_EMAIL"
-  echo "Subject: $subject"
-  echo "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
-  echo "MIME-Version: 1.0"
-  echo "Content-Type: text/plain; charset=UTF-8"
-  echo
   echo "Environment: $env"
   echo "Tested: $what${id:+ (Deployment $id)}"
   echo "Result: $said"
@@ -168,15 +162,7 @@ trap 'rm -f "$message"' EXIT
       echo "Rollback: no earlier release passed in prod, so there is none to roll back to."
     fi
   fi
-} | sed 's/$/\r/' >"$message"
+} >"$message"
 
-recipients=()
-IFS=, read -ra to <<<"$NOTIFY_EMAIL"
-for r in "${to[@]}"; do r=${r// /}; [ -z "$r" ] || recipients+=(--mail-rcpt "$r"); done
-# The password goes to curl on stdin, never on its command line (which any process on the runner can read); in
-# curl's config syntax, inside quotes, with \ and " escaped.
-quoted=${SMTP_PASSWORD//\\/\\\\} quoted=${quoted//\"/\\\"}
-printf 'user = "%s:%s"\n' "$SMTP_USERNAME" "$quoted" \
-  | curl --silent --show-error --fail --ssl-reqd --url "${SMTP_URL:-smtps://smtp.gmail.com:465}" \
-      --mail-from "$SMTP_USERNAME" "${recipients[@]}" --config - --upload-file "$message"
+mail_send "$subject" "$message"
 echo "emailed $NOTIFY_EMAIL: $subject"

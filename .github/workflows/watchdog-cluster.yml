@@ -1,0 +1,84 @@
+# The watchdog's inside check (#152; scripts/watchdog.sh cluster): every 30 minutes, on the cluster's runner, any Flux
+# Kustomization or HelmRelease not Ready for 15 minutes (a suspended one is skipped), and policy-controller's webhook
+# without a ready pod (it fails open, ADR 0011). The `check` job takes the one runner slot for about a minute, so a
+# smoke test can wait that long behind it. Reported by a GitHub-hosted job, which holds the email secret: one GitHub
+# issue, "Watchdog: cluster", opened (and emailed) when a problem starts and closed (and emailed) when it clears. If
+# the check itself can't run (no runner), watchdog.yml reports this job as queued.
+name: Watchdog (cluster)
+
+on:
+  schedule:
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchdog-cluster
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Flux and the image policy webhook
+    runs-on: eshop-e2e
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The stock runner image has no kubectl: this version, checked against its published SHA-256 (as e2e.yml).
+      - name: Install kubectl
+        working-directory: ${{ runner.temp }}
+        env:
+          KUBECTL_VERSION: v1.36.2 # k3s v1.36 (docs/setup.md)
+        run: |
+          case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "::error::no kubectl for $(uname -m)"; exit 1 ;; esac
+          url="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$arch/kubectl"
+          curl -fsSLo kubectl "$url"
+          echo "$(curl -fsSL "$url.sha256")  kubectl" | sha256sum -c -
+          mkdir -p bin && install -m 0755 kubectl bin/kubectl && rm kubectl
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      - name: Check
+        run: mkdir -p watchdog && scripts/watchdog.sh cluster | tee watchdog/problems.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: watchdog-cluster
+          path: watchdog/
+          if-no-files-found: error
+          retention-days: 1
+
+  report:
+    name: report
+    needs: [check]
+    # Also when the check failed: that is itself a problem to report. Not when it was cancelled.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: smoke-test
+      deployment: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.check.result == 'success'
+        with:
+          name: watchdog-cluster
+          path: watchdog
+      - name: Report
+        env:
+          CHECK: ${{ needs.check.result }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
+          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          mkdir -p watchdog
+          if [ "$CHECK" != success ]; then
+            echo "The cluster check itself failed ($CHECK), so the cluster's state is unknown: see the run" >watchdog/problems.txt
+          fi
+          scripts/watchdog.sh report cluster watchdog/problems.txt

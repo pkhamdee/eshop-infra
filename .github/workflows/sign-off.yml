@@ -37,6 +37,7 @@ jobs:
   sign-off:
     name: sign off
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: # its secrets; deployable from main (and v* tags) only
       name: release
       deployment: false

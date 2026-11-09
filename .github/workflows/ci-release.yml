@@ -58,6 +58,7 @@ jobs:
   sast:
     name: SAST (Semgrep, fail on ERROR)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/gates/sast.sh
@@ -71,6 +72,7 @@ jobs:
   deps:
     name: dependency scan (Trivy, fail on critical)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: scripts/gates/deps.sh
@@ -86,6 +88,7 @@ jobs:
   repo-rules:
     name: repo rules (manifests, workflows, scripts, e2e)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Manifests (kustomize build + kubeconform)
@@ -153,6 +156,7 @@ jobs:
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
       || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       version: ${{ steps.select.outputs.version }}
@@ -253,6 +257,7 @@ jobs:
     needs: [plan]
     if: needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-24.04-arm # native arm64 build for the Apple Silicon cluster
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -309,6 +314,7 @@ jobs:
     name: temporary copy and gates
     needs: [plan, build]
     runs-on: ubuntu-24.04-arm # the images are arm64
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -389,6 +395,7 @@ jobs:
     name: scan ${{ matrix.service }}
     needs: [plan, gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     strategy:
@@ -439,6 +446,7 @@ jobs:
       && (needs.plan.outputs.matrix != '[]' || needs.plan.outputs.copy != '[]')
       && (needs.plan.outputs.matrix == '[]' || (needs.gate.result == 'success' && needs.scan.result == 'success'))
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
     environment: release
     permissions:
       contents: read
@@ -547,6 +555,7 @@ jobs:
     # push succeeds only when gate and scan passed or nothing was built (push's own condition).
     if: always() && needs.plan.outputs.promote == 'qa' && needs.push.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: release
     permissions:
       contents: read
