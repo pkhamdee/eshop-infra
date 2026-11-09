@@ -75,6 +75,9 @@ terms in `GLOSSARY.md`; decisions in `docs/adr/`. This file points there rather 
 - Images whose binary carries a file capability (Caddy, `sqlservr`) fail with "operation not permitted" under
   `drop: [ALL]`: remove the capability in the image (as eshop-web does) or add `NET_BIND_SERVICE` back (as mssql
   does).
+- Pin everything you add (`scripts/gates/pins.sh` fails otherwise): an action by commit SHA with a `# vX.Y.Z`
+  comment, an image by digest (`tag@sha256:...`), a chart at an exact version; resolve them from a release at least 14
+  days old. Renovate updates them afterwards (docs/setup.md, "Pins and dependency updates").
 - Trivy fails CI on any CRITICAL, fixed or not (`scripts/gates/deps.sh`, `scripts/gates/image-scan.sh`). For an
   unfixable one add a `.trivyignore` at the repo root (CVE, reason, date): both gates run Trivy there.
 - An ImagePolicy with no matching tag stays not Ready and blocks a `wait: true` Kustomization: a new service's image

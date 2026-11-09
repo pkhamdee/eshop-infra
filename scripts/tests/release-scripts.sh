@@ -15,6 +15,7 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
+#   scripts/gates/pins.sh          actions, base images and charts pinned (repo rules, the shared gates' SAST job)
 #   scripts/gates/tags-to-push.sh, attach-sbom.sh, sign-images.sh   the image push jobs: never an existing tag;
 #                                  each image's SBOM; signing only what was pushed
 # `gh`, `crane`, `oras`, `cosign` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
@@ -1847,6 +1848,44 @@ unreadable_registry_fails() {
   ! FAKE_CRANE_LS_ERROR=1 to_push && grep -qF "could not list the tags of docker.io/pkhamdee/svc-a" "$work/err"
 }
 check "tags-to-push.sh fails when the registry can't be read (unknown is not absent)" unreadable_registry_fails
+
+# --- scripts/gates/pins.sh (repo rules and the shared gates' SAST job: actions, base images and charts pinned, #149) ---
+
+pins_dir="$work/pins"
+sha=0123456789abcdef0123456789abcdef01234567
+dg=sha256:$(printf 'c%.0s' $(seq 64))
+pins_repo() { # a pinned repository: a workflow, a two-stage Dockerfile, a HelmRelease
+  rm -rf "$pins_dir" && mkdir -p "$pins_dir/.github/workflows" "$pins_dir/deploy" "$pins_dir/svc"
+  cat >"$pins_dir/.github/workflows/ci.yml" <<YML
+jobs:
+  lint:
+    steps:
+      - uses: actions/checkout@$sha # v7.0.1
+      - uses: ./.github/actions/local
+  image:
+    uses: pkhamdee/eshop-infra/.github/workflows/service-image.yml@main
+YML
+  printf 'FROM node:24-alpine@%s AS build\nRUN true\nFROM --platform=linux/arm64 caddy:2@%s\nCOPY --from=build /a /b\n' "$dg" "$dg" >"$pins_dir/svc/Dockerfile"
+  printf 'spec:\n  chart:\n    spec:\n      version: "1.21.3"\n' >"$pins_dir/deploy/release.yaml"
+}
+pins() { GATES_SOURCE="$pins_dir" "$root/scripts/gates/pins.sh" >"$work/out" 2>&1; }
+pins_pass() { pins_repo && pins && grep -qF 'pins: passed' "$work/out"; }
+check "pins.sh passes SHA-pinned actions, local actions, eShop's reusable workflow at @main, digest-pinned images, build stages and exact chart versions" pins_pass
+pins_action_tag() {
+  pins_repo && echo '      - uses: docker/login-action@v4' >>"$pins_dir/.github/workflows/ci.yml"
+  ! pins && grep -qF 'action not pinned by commit SHA: docker/login-action@v4' "$work/out"
+}
+check "pins.sh fails an action pinned by tag" pins_action_tag
+pins_from_tag() {
+  pins_repo && printf 'FROM node:24-alpine\n' >"$pins_dir/svc/Dockerfile.dev"
+  ! pins && grep -qF 'svc/Dockerfile.dev:1: base image without a digest: node:24-alpine' "$work/out"
+}
+check "pins.sh fails a Dockerfile FROM without a digest" pins_from_tag
+pins_chart_floats() {
+  pins_repo && printf 'spec:\n  chart:\n    spec:\n      version: "0.29.x"\n' >"$pins_dir/deploy/cnpg.yaml"
+  ! pins && grep -qF 'deploy/cnpg.yaml:4:' "$work/out" && grep -qF 'chart version floats' "$work/out"
+}
+check "pins.sh fails a floating chart version" pins_chart_floats
 
 # --- scripts/gates/attach-sbom.sh (the push jobs: each pushed image's SBOM as a referrer of its digest, ADR 0010) ---
 

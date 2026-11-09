@@ -66,19 +66,22 @@ jobs:
     name: SAST (Semgrep, fail on ERROR)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: src
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.infra-repository }}
           ref: ${{ inputs.infra-ref }}
           path: infra
+      # Also the pin check (#149: actions by SHA, base images by digest), in this job so the service repositories'
+      # required check names stay the same.
       - name: SAST
         run: |
           [ -e src/.semgrepignore ] || cp infra/.semgrepignore src/.semgrepignore
+          GATES_SOURCE="$PWD/src" REPORT_DIR="$PWD/reports/sast" infra/scripts/gates/pins.sh
           GATES_SOURCE="$PWD/src" REPORT_DIR="$PWD/reports/sast" infra/scripts/gates/sast.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: sast-report
@@ -89,17 +92,17 @@ jobs:
     name: dependency scan (Trivy, fail on critical)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: src
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.infra-repository }}
           ref: ${{ inputs.infra-ref }}
           path: infra
       - name: Dependency scan
         run: GATES_SOURCE="$PWD/src" REPORT_DIR="$PWD/reports/deps" infra/scripts/gates/deps.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: deps-report
@@ -122,7 +125,7 @@ jobs:
       IMAGE: ${{ inputs.registry }}/${{ matrix.service }}
       BRANCH: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: tags
         run: |
           sha=$(git rev-parse --short=7 HEAD)
@@ -135,9 +138,9 @@ jobs:
             # made after the previous tag (scripts/candidate-images.sh, ADR 0009).
             echo "list=${IMAGE}:${BRANCH//\//-}-${sha}-${ts}" >> "$GITHUB_OUTPUT"
           fi
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -153,7 +156,7 @@ jobs:
         env:
           TAGS: ${{ steps.tags.outputs.list }}
         run: tr , '\n' <<<"$TAGS" > "$RUNNER_TEMP/image/tags.txt"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.service }}
           path: ${{ runner.temp }}/image/
@@ -167,11 +170,11 @@ jobs:
     needs: [build]
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.infra-repository }}
           ref: ${{ inputs.infra-ref }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
           path: ${{ runner.temp }}/images
@@ -197,7 +200,7 @@ jobs:
         run: scripts/gates/perf.sh
       - name: Keep the performance report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-report
           path: reports/perf/
@@ -206,7 +209,7 @@ jobs:
         run: scripts/gates/dast.sh
       - name: Keep the ZAP reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dast-report
           path: reports/dast/
@@ -216,7 +219,7 @@ jobs:
         run: scripts/gates/temporary-copy.sh down
       - name: Keep the copy's status and logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: temporary-copy-report
           path: reports/temporary-copy/
@@ -231,11 +234,11 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.images) }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.infra-repository }}
           ref: ${{ inputs.infra-ref }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image-${{ matrix.service }}
           path: ${{ runner.temp }}/image-${{ matrix.service }}
@@ -243,7 +246,7 @@ jobs:
         env:
           SERVICE: ${{ matrix.service }}
         run: scripts/gates/image-scan.sh "$RUNNER_TEMP/image-$SERVICE/image.tar"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: image-scan-report-${{ matrix.service }}
@@ -254,7 +257,7 @@ jobs:
         env:
           SERVICE: ${{ matrix.service }}
         run: scripts/gates/sbom.sh "$RUNNER_TEMP/image-$SERVICE/image.tar"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: sbom-${{ matrix.service }}
@@ -275,11 +278,11 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ inputs.infra-repository }}
           ref: ${{ inputs.infra-ref }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
           path: ${{ runner.temp }}/images
@@ -288,7 +291,7 @@ jobs:
         run: |
           scripts/gates/artifact-dirs.sh "$RUNNER_TEMP/images"
           for archive in "$RUNNER_TEMP"/images/image-*/image.tar; do docker load --input "$archive"; done
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -320,7 +323,7 @@ jobs:
       # commit.
       - name: Sign the pushed images (keyless)
         run: scripts/gates/sign-images.sh "$RUNNER_TEMP/pushed.txt"
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: sbom-*
           path: ${{ runner.temp }}/sbom
