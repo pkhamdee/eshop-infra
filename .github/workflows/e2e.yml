@@ -89,6 +89,7 @@ jobs:
   targets:
     name: What to test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       targets: ${{ steps.decide.outputs.targets }}
     steps:
@@ -376,6 +377,7 @@ jobs:
     needs: [targets, e2e]
     if: ${{ always() && needs.targets.result == 'success' && needs.targets.outputs.targets != '[]' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: smoke-test
       deployment: false
@@ -410,6 +412,7 @@ jobs:
     needs: [targets, e2e]
     if: ${{ always() && github.ref == 'refs/heads/main' && contains(needs.targets.outputs.targets, '"env":"qa"') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: release
       deployment: false

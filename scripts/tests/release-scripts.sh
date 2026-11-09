@@ -15,10 +15,11 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
+#   scripts/watchdog.sh            silent failures: queued smoke tests, Flux objects not Ready, the webhook down
 #   scripts/gates/pins.sh          actions, base images and charts pinned (repo rules, the shared gates' SAST job)
 #   scripts/gates/tags-to-push.sh, attach-sbom.sh, sign-images.sh   the image push jobs: never an existing tag;
 #                                  each image's SBOM; signing only what was pushed
-# `gh`, `crane`, `oras`, `cosign` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
+# `gh`, `crane`, `oras`, `cosign`, `kubectl` and `curl` are fakes on PATH that record their arguments and keep GitHub's and the registry's state in files.
 # Run from anywhere: scripts/tests/release-scripts.sh
 set -euo pipefail
 
@@ -83,6 +84,9 @@ case "$1 $2" in
       cat "$deployments/${BASH_REMATCH[1]}.statuses" 2>/dev/null | jq -s 'reverse' | jq -r "$jq_filter"
     elif [[ "$path" =~ /commits/[0-9a-f]+/pulls$ ]]; then jq -r "$jq_filter" <<<"${FAKE_COMMIT_PULLS:-[]}"
     elif [[ "$path" =~ /pulls/[0-9]+$ ]]; then jq -r "$jq_filter" <<<"${FAKE_PULL:-null}"
+    elif [[ "$path" =~ /actions/runs$ && "$query" == *status=* ]]; then # runs by status (watchdog): runs-status-<status>.json
+      status=$(sed -nE 's/(^|.*&)status=([^&]*).*/\2/p' <<<"$query")
+      { cat "$GH_STATE/runs-status-$status.json" 2>/dev/null || echo '{"workflow_runs":[]}'; } | jq -r "$jq_filter"
     elif [[ "$path" =~ ^repos/([^/]+)/([^/]+)/actions/runs$ ]]; then # a commit's runs (?head_sha=), as ci_run wrote them
       [ -z "${FAKE_RUNS_ERROR:-}" ] || { echo "gh: Server Error (HTTP 500)" >&2; exit 1; }
       sha=$(sed -nE 's/(^|.*&)head_sha=([^&]*).*/\2/p' <<<"$query")
@@ -128,6 +132,17 @@ case "$1 $2" in
   "pr create") head=$(arg --head "$@"); cp "$(arg --body-file "$@")" "$GH_STATE/pr-${head//\//_}"
     echo "https://github.com/test/pull/1" ;;
   "pr edit") ;;
+  # Issues (the watchdog): $GH_STATE/issue-<n>.json {number, title, body, state}, comments in issue-<n>.comments.
+  "issue list") for f in "$GH_STATE"/issue-*.json; do [ ! -f "$f" ] || cat "$f"; done | jq -s 'map(select(.state == "open"))' \
+      | jq -r "$(arg --jq "$@")" ;;
+  "issue create") n=$(( $(find "$GH_STATE" -name 'issue-*.json' | wc -l) + 1 ))
+    jq -n --argjson n "$n" --arg t "$(arg --title "$@")" --rawfile b "$(arg --body-file "$@")" \
+      '{number: $n, title: $t, body: $b, state: "open"}' >"$GH_STATE/issue-$n.json"
+    echo "https://github.com/test/issues/$n" ;;
+  "issue edit") jq --rawfile b "$(arg --body-file "$@")" '.body = $b' "$GH_STATE/issue-$3.json" >"$GH_STATE/issue.tmp" \
+      && mv "$GH_STATE/issue.tmp" "$GH_STATE/issue-$3.json" ;;
+  "issue comment") arg --body "$@" >>"$GH_STATE/issue-$3.comments" ;;
+  "issue close") jq '.state = "closed"' "$GH_STATE/issue-$3.json" >"$GH_STATE/issue.tmp" && mv "$GH_STATE/issue.tmp" "$GH_STATE/issue-$3.json" ;;
   "pr close") mv "$GH_STATE/pr-${3//\//_}" "$GH_STATE/closed-pr-${3//\//_}"; arg --comment "$@" >"$GH_STATE/comment-${3//\//_}" ;;
 esac
 GH
@@ -1859,6 +1874,8 @@ pins_repo() { # a pinned repository: a workflow, a two-stage Dockerfile, a HelmR
   cat >"$pins_dir/.github/workflows/ci.yml" <<YML
 jobs:
   lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@$sha # v7.0.1
       - uses: ./.github/actions/local
@@ -1886,6 +1903,12 @@ pins_chart_floats() {
   ! pins && grep -qF 'deploy/cnpg.yaml:4:' "$work/out" && grep -qF 'chart version floats' "$work/out"
 }
 check "pins.sh fails a floating chart version" pins_chart_floats
+pins_no_timeout() {
+  pins_repo && printf '  scan:\n    runs-on: ubuntu-latest\n    steps: []\n' >>"$pins_dir/.github/workflows/ci.yml"
+  ! pins && grep -qF 'job scan (line ' "$work/out" && grep -qF 'has runs-on but no timeout-minutes' "$work/out" \
+    && ! grep -qF 'job image' "$work/out" && ! grep -qF 'job lint' "$work/out"
+}
+check "pins.sh fails a job with runs-on but no timeout-minutes (not a reusable-workflow call, which can't have one)" pins_no_timeout
 
 # --- scripts/gates/attach-sbom.sh (the push jobs: each pushed image's SBOM as a referrer of its digest, ADR 0010) ---
 
@@ -1967,6 +1990,82 @@ failure_tries_all() {
     && grep -qF 'the fix is a new commit' "$work/out"
 }
 check "sign-images.sh tries every image when one fails, then fails saying a new commit is the fix" failure_tries_all
+
+# --- scripts/watchdog.sh (watchdog.yml and watchdog-cluster.yml: silent failures, one issue and email each, #152) ---
+
+# Fake kubectl: `get <kind> --all-namespaces -o json` prints $KUBE_STATE/<kind>.json (none: no items); the webhook's
+# Deployment prints $KUBE_STATE/webhook-ready (its readyReplicas; none: empty, as kubectl prints a missing field).
+cat >"$work/bin/kubectl" <<'KUBECTL'
+#!/usr/bin/env bash
+case "$*" in
+  "get "*" --all-namespaces -o json") cat "$KUBE_STATE/$2.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "-n cosign-system get deployment policy-controller-webhook "*) cat "$KUBE_STATE/webhook-ready" 2>/dev/null || true ;;
+  *) echo "fake kubectl: unexpected $*" >&2; exit 1 ;;
+esac
+KUBECTL
+chmod +x "$work/bin/kubectl"
+export KUBE_STATE="$work/kube" NOW=2026-11-09T12:00:00Z
+mkdir -p "$KUBE_STATE"
+watchdog() { "$root/scripts/watchdog.sh" "$@" >"$work/out" 2>&1; }
+flux_object() { # flux_object <kind file> <name> <Ready status> <since> [suspend]
+  jq -n --arg n "$2" --arg s "$3" --arg t "$4" --argjson sus "${5:-false}" \
+    '{items: [{kind: "Kustomization", metadata: {namespace: "flux-system", name: $n}, spec: {suspend: $sus},
+      status: {conditions: [{type: "Ready", status: $s, reason: "DependencyNotReady", lastTransitionTime: $t,
+      message: "dependency flux-system/infra-configs is not ready"}]}}]}' >"$KUBE_STATE/$1.json"
+}
+echo 1 >"$KUBE_STATE/webhook-ready"
+cluster_healthy() {
+  flux_object kustomizations.kustomize.toolkit.fluxcd.io apps-qa True 2026-11-09T00:00:00Z
+  watchdog cluster && [ ! -s "$work/out" ]
+}
+check "watchdog.sh cluster says nothing when every Flux object is Ready and the webhook has a ready pod" cluster_healthy
+cluster_not_ready() {
+  flux_object kustomizations.kustomize.toolkit.fluxcd.io apps-qa False 2026-11-09T11:50:00Z
+  watchdog cluster && [ ! -s "$work/out" ] || return 1 # 10 minutes: not yet
+  flux_object kustomizations.kustomize.toolkit.fluxcd.io apps-qa False 2026-11-09T11:40:00Z
+  watchdog cluster && grep -qF 'Kustomization flux-system/apps-qa not Ready for 20 minutes: DependencyNotReady: dependency flux-system/infra-configs is not ready' "$work/out" || return 1
+  flux_object kustomizations.kustomize.toolkit.fluxcd.io apps-qa False 2026-11-09T11:40:00Z true
+  watchdog cluster && [ ! -s "$work/out" ] # suspended on purpose
+}
+check "watchdog.sh cluster names a Flux object not Ready for 15 minutes, not sooner, and skips a suspended one" cluster_not_ready
+webhook_down() {
+  rm -f "$KUBE_STATE"/*.json; : >"$KUBE_STATE/webhook-ready"
+  watchdog cluster && grep -qF "policy-controller's webhook (cosign-system/policy-controller-webhook) has no ready pod" "$work/out"
+  local found=$?; echo 1 >"$KUBE_STATE/webhook-ready"; return $found
+}
+check "watchdog.sh cluster says when policy-controller's webhook has no ready pod" webhook_down
+queued_runner() {
+  echo '{"workflow_runs":[{"id":71}]}' >"$GH_STATE/runs-status-in_progress.json"
+  jq -n '{jobs: [
+    {name: "Playwright demo (dev abc)", status: "queued", labels: ["eshop-e2e"], created_at: "2026-11-09T11:00:00Z", html_url: "https://github.com/test/job/1"},
+    {name: "What to test", status: "queued", labels: ["ubuntu-latest"], created_at: "2026-11-09T10:00:00Z", html_url: "https://github.com/test/job/2"},
+    {name: "Playwright demo (qa 1.0.0)", status: "queued", labels: ["eshop-e2e"], created_at: "2026-11-09T11:45:00Z", html_url: "https://github.com/test/job/3"}]}' \
+    >"$GH_STATE/jobs-71.json"
+  watchdog queue && grep -qF 'Job "Playwright demo (dev abc)" has waited 60 minutes' "$work/out" \
+    && [ "$(wc -l <"$work/out")" -eq 1 ]
+}
+check "watchdog.sh queue names a cluster-runner job queued 30 minutes or more, not a hosted one or a newer one" queued_runner
+export SMTP_USERNAME=bot@example.invalid SMTP_PASSWORD=secret NOTIFY_EMAIL=maintainer@example.invalid
+report_cycle() {
+  rm -f "$GH_STATE"/issue-* && : >"$CURL_LOG"
+  printf 'apps-qa not Ready\n' >"$work/problems"
+  watchdog report cluster "$work/problems" && grep -qF 'opened https://github.com/test/issues/1' "$work/out" \
+    && [ "$(jq -r .title "$GH_STATE/issue-1.json")" = "Watchdog: cluster" ] && grep -qF -- '- apps-qa not Ready' "$GH_STATE/issue-1.json" \
+    && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 1 ] || return 1
+  watchdog report cluster "$work/problems" && grep -qF 'already open: same problems' "$work/out" \
+    && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 1 ] || return 1 # no second email
+  printf 'apps-qa not Ready\nwebhook down\n' >"$work/problems"
+  watchdog report cluster "$work/problems" && grep -qF 'updated #1' "$work/out" && grep -qF -- '- webhook down' "$GH_STATE/issue-1.json" \
+    && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 1 ] || return 1
+  : >"$work/problems"
+  watchdog report cluster "$work/problems" && grep -qF 'closed #1' "$work/out" && [ "$(jq -r .state "$GH_STATE/issue-1.json")" = closed ] \
+    && grep -qF 'Recovered' "$GH_STATE/issue-1.comments" && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 2 ] || return 1
+  watchdog report cluster "$work/problems" && grep -qF 'nothing wrong' "$work/out" && [ "$(grep -c '^curl ' "$CURL_LOG")" -eq 2 ]
+}
+check "watchdog.sh report opens one issue and emails once, updates it silently, then closes it and emails the recovery" report_cycle
+report_needs_mail() { ! SMTP_PASSWORD= watchdog report queue "$work/problems" && grep -qF 'no SMTP_PASSWORD' "$work/out"; }
+check "watchdog.sh report fails, naming it, when a mail setting is missing" report_needs_mail
+unset SMTP_USERNAME SMTP_PASSWORD NOTIFY_EMAIL NOW
 
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 

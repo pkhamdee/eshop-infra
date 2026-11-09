@@ -5,7 +5,9 @@
 #     reusable workflow pkhamdee/eshop-infra/.github/workflows/service-image.yml@main, whose ref is part of the
 #     identity the cluster's image policy trusts (ADR 0011);
 #   - a Dockerfile `FROM` without a digest (image:tag@sha256:...). Excepted: an earlier stage of the same file, scratch;
-#   - a chart version that floats (1.2.x, *, ^1.2, ~1.2, >=1) under deploy/ or clusters/.
+#   - a chart version that floats (1.2.x, *, ^1.2, ~1.2, >=1) under deploy/ or clusters/;
+#   - a workflow job that runs on a runner (runs-on) without timeout-minutes (#152): a stuck job holds its runner
+#     for GitHub's default of 6 hours.
 # Renovate keeps the pins current (renovate/default.json); this check keeps new ones pinned.
 #
 #   scripts/gates/pins.sh                              # this repository (CI: the `repo rules` job)
@@ -36,6 +38,20 @@ if [ -d .github ]; then
   done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
 fi
 
+# --- Job timeouts ---
+if [ -d .github/workflows ]; then
+  while IFS= read -r file; do
+    while IFS= read -r hit; do note "$file: $hit"; done < <(awk '
+      /^jobs:/ { injobs = 1; next }
+      injobs && /^[^ #]/ { injobs = 0 }
+      function flush() { if (job != "" && runs && !timeout) print "job " job " (line " line ") has runs-on but no timeout-minutes" }
+      injobs && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); job = $1; sub(":", "", job); line = NR; runs = 0; timeout = 0; next }
+      injobs && /^    runs-on:/ { runs = 1 }
+      injobs && /^    timeout-minutes:/ { timeout = 1 }
+      END { flush() }' "$file")
+  done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+fi
+
 # --- Dockerfiles ---
 while IFS= read -r file; do
   stages=" scratch "
@@ -64,8 +80,8 @@ done
 
 if [ ${#found[@]} -gt 0 ]; then
   printf '%s\n' "${found[@]}"
-  echo "pins: FAILED: ${#found[@]} unpinned reference(s) above. Pin actions by commit SHA (# vX.Y.Z comment), images by" \
-    "digest (tag@sha256:...) and charts to an exact version; Renovate keeps them current." >&2
+  echo "pins: FAILED: ${#found[@]} problem(s) above. Pin actions by commit SHA (# vX.Y.Z comment), images by digest" \
+    "(tag@sha256:...) and charts to an exact version (Renovate keeps them current); give every job timeout-minutes." >&2
   exit 1
 fi
-echo "pins: passed: every action, base image and chart version is pinned"
+echo "pins: passed: every action, base image and chart version is pinned, and every job has a timeout"
