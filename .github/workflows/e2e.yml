@@ -168,6 +168,7 @@ jobs:
       # The stock runner image has neither gh nor kubectl: the pinned versions (scripts/ci/tools.sh), checked against
       # the SHA-256 written there.
       - name: Install gh and kubectl
+        working-directory: . # this job's steps run in e2e/ by default
         run: scripts/ci/tools.sh install gh kubectl
       # The Deployment exists from here on, and the last step always finishes it. A run cancelled while waiting
       # for its turn never got here, so it leaves no Deployment behind (notify reports it as not tested).
