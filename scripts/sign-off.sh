@@ -18,6 +18,8 @@
 #     QA served the candidate before and after the test (e2e/check-serving.sh);
 #   - every candidate image $IMAGE_REGISTRY/<service>:X.Y.Z-rc.N (.github/services.json) exists, and any X.Y.Z image
 #     that already exists has the candidate's digest;
+#   - every candidate image has the digest QA's pin on origin/main pins it to (the image QA ran and tested; a tag
+#     repointed since differs) and the digest the record lists (which a rollback to X.Y.Z pins);
 #   - every candidate image's digest has its CycloneDX SBOM (ADR 0010), attached when it was pushed;
 #   - tag vX.Y.Z is absent, or is this candidate's sign-off (same commit, made by this script).
 # Then, in this order, each step skipped or updated when an earlier run already did it, so a failed sign-off is
@@ -119,6 +121,8 @@ main() {
     *) refuse "eshop-qa's pin on main is unreadable" ;;
   esac
   [ "$qa" = "$candidate" ] || refuse "eshop-qa is pinned to $qa on main, not $candidate: QA must be running the candidate it signs off"
+  local qa_images
+  qa_images=$(pin_at origin/main --images qa 2>/dev/null) || refuse "eshop-qa's pinned images on main are unreadable"
 
   local pinned_at deployment state qa_run qa_deployment_id
   pinned_at=$(qa_pinned_at)
@@ -135,13 +139,26 @@ main() {
 
   # Each service as "<service> <digest> <exists>": the candidate's digest, and whether X.Y.Z already exists. Its SBOM
   # goes to $sboms/<service>-X.Y.Z.cdx.json, the Release's asset.
-  local images="" plan="" svc digest tags existing sboms notes pulled
+  local images="" plan="" svc digest tags existing sboms notes pulled pinned_digest recorded checked=0
   sboms=$(mktemp -d)
   notes=$(mktemp)
   # shellcheck disable=SC2064 # expand now: they are local
   trap "rm -rf '$sboms' '$notes'" EXIT
   for svc in $(jq -r '.[].service' .github/services.json); do
     digest=$(crane digest "$registry/$svc:$candidate") || refuse "candidate image $registry/$svc:$candidate is missing"
+    # QA's pin names the image QA ran: a tag repointed since it was pinned has another digest (a service QA doesn't
+    # run has no pin).
+    pinned_digest=$(awk -v p="$registry/$svc:$candidate@" 'index($0, p) == 1 { print substr($0, length(p) + 1) }' <<<"$qa_images")
+    [ -z "$pinned_digest" ] || checked=$((checked + 1))
+    [ -z "$pinned_digest" ] || [ "$pinned_digest" = "$digest" ] \
+      || refuse "$registry/$svc:$candidate is $digest, not $pinned_digest as eshop-qa's pin on main has it: the tag was" \
+        "repointed after QA's promotion, so QA did not test this image"
+    # shellcheck disable=SC2016 # Markdown's backticks, not an expansion
+    recorded=$(git show "$after:$record" | awk -v p="\`$registry/$svc:$candidate@" \
+      '{ i = index($0, p); if (i) { s = substr($0, i + length(p)); sub(/`.*$/, "", s); print s; exit } }')
+    [ "$recorded" = "$digest" ] \
+      || refuse "$record lists $registry/$svc:$candidate@${recorded:-(none)}, but its digest is $digest: the record" \
+        "must name the images released (a rollback pins them)"
     tags=$(crane ls "$registry/$svc") || refuse "could not list the tags of $registry/$svc"
     existing=false
     if grep -qxF -- "$version" <<<"$tags"; then
@@ -161,6 +178,9 @@ main() {
     plan+="$svc $digest $existing"$'\n'
     images+="$registry/$svc:$version@$digest"$'\n'
   done
+  [ "$checked" -eq "$(grep -c . <<<"$qa_images")" ] \
+    || refuse "eshop-qa's pin on main names images that are not $registry/<service>:$candidate (.github/services.json):" \
+      "$(paste -sd ' ' - <<<"$qa_images")"
 
   # --- Sign-off ---
 

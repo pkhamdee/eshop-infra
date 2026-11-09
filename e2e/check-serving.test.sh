@@ -31,13 +31,18 @@ export PATH="$work/bin:$PATH"
 failures=0
 fresh() { export FAKE="$work/fake.$RANDOM$RANDOM"; mkdir -p "$FAKE"; }
 
-# A Kustomization that applied `revision`, with `images` newTags, Ready and up to date.
+# The digests the pins hold (scripts/pin-release.sh), and another one.
+api_digest=sha256:$(printf 'a%.0s' $(seq 64))
+web_digest=sha256:$(printf 'b%.0s' $(seq 64))
+other_digest=sha256:$(printf 'c%.0s' $(seq 64))
+
+# A Kustomization that applied `revision`, with `images` newTags and digests, Ready and up to date.
 kustomization() { # <env> <revision> <tag> [suspend]
-  jq -n --arg rev "$2" --arg tag "$3" --argjson suspend "${4:-false}" '{
+  jq -n --arg rev "$2" --arg tag "$3" --argjson suspend "${4:-false}" --arg api "$api_digest" --arg web "$web_digest" '{
     metadata: {generation: 3},
     spec: {suspend: $suspend, images: [
-      {name: "docker.io/pkhamdee/eshop-api", newTag: $tag},
-      {name: "docker.io/pkhamdee/eshop-web", newTag: $tag}]},
+      {name: "docker.io/pkhamdee/eshop-api", newTag: $tag, digest: $api},
+      {name: "docker.io/pkhamdee/eshop-web", newTag: $tag, digest: $web}]},
     status: {observedGeneration: 3, lastAppliedRevision: $rev,
       conditions: [{type: "Ready", status: "True", observedGeneration: 3, message: ("Applied revision: " + $rev)}]}
   }' >"$FAKE/flux-system.kustomization.apps-$1.json"
@@ -55,7 +60,7 @@ deployments() { # <env> <name=image>...
 
 serving() { # <env> <version>: QA (or prod) fully on that version
   kustomization "$1" "v$2@sha1:0123456789abcdef0123456789abcdef01234567" "$2"
-  deployments "$1" "eshop-api=docker.io/pkhamdee/eshop-api:$2" "eshop-web=docker.io/pkhamdee/eshop-web:$2"
+  deployments "$1" "eshop-api=docker.io/pkhamdee/eshop-api:$2@$api_digest" "eshop-web=docker.io/pkhamdee/eshop-web:$2@$web_digest"
 }
 
 # expect <refuse|serve> <message part> <args...>: runs check-serving.sh with args.
@@ -120,18 +125,18 @@ refuses_when_the_kustomization_sets_other_image_tags() {
   fresh; serving qa 0.3.0-rc.1
   f="$FAKE/flux-system.kustomization.apps-qa.json"
   jq '.spec.images[1].newTag = "0.3.0-rc.2"' "$f" >"$f.x" && mv "$f.x" "$f"
-  expect refuse "apps-qa sets docker.io/pkhamdee/eshop-web:0.3.0-rc.2" qa 0.3.0-rc.1
+  expect refuse "apps-qa sets docker.io/pkhamdee/eshop-web:0.3.0-rc.2@$web_digest" qa 0.3.0-rc.1
 }
 
 refuses_when_a_deployment_runs_another_image() {
   fresh; serving qa 0.3.0-rc.1
-  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1" "eshop-web=docker.io/pkhamdee/eshop-web:0.2.0"
+  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$api_digest" "eshop-web=docker.io/pkhamdee/eshop-web:0.2.0"
   expect refuse "eshop-web runs docker.io/pkhamdee/eshop-web:0.2.0" qa 0.3.0-rc.1
 }
 
 ignores_images_that_are_not_eshop_releases() {
   fresh; serving qa 0.3.0-rc.1
-  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1" "proxy=docker.io/library/busybox:1.37"
+  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$api_digest" "proxy=docker.io/library/busybox:1.37"
   expect serve "apps-qa applied v0.3.0-rc.1@" qa 0.3.0-rc.1
 }
 
@@ -161,10 +166,30 @@ refuses_an_image_whose_tag_only_starts_with_the_version() {
   expect refuse "eshop-api runs docker.io/pkhamdee/eshop-api:0.3.0-rc.10" qa 0.3.0-rc.1
 }
 
-accepts_an_image_pinned_by_digest_too() {
+refuses_an_image_at_another_digest_than_the_pin() { # the tag repointed in the registry: not the pinned image
   fresh; serving qa 0.3.0-rc.1
-  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1@sha256:abc123"
-  expect serve "apps-qa applied v0.3.0-rc.1@" qa 0.3.0-rc.1
+  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$other_digest"
+  expect refuse "eshop-api runs docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$other_digest, not docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$api_digest" \
+    qa 0.3.0-rc.1
+  deployments qa "eshop-api=docker.io/pkhamdee/eshop-api:0.3.0-rc.1"
+  expect refuse "eshop-api runs docker.io/pkhamdee/eshop-api:0.3.0-rc.1, not" qa 0.3.0-rc.1
+}
+
+refuses_when_the_kustomization_pins_no_digest() {
+  fresh; serving qa 0.3.0-rc.1
+  f="$FAKE/flux-system.kustomization.apps-qa.json"
+  jq 'del(.spec.images[1].digest)' "$f" >"$f.x" && mv "$f.x" "$f"
+  expect refuse "apps-qa sets docker.io/pkhamdee/eshop-web:0.3.0-rc.1@(no digest)" qa 0.3.0-rc.1
+}
+
+reads_index_docker_io_as_docker_io() { # how the image policy's webhook writes a tag it resolved to a digest
+  fresh; serving qa 0.3.0-rc.1
+  deployments qa "eshop-api=index.docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$api_digest"
+  expect serve "eshop-qa serves 0.3.0-rc.1" qa 0.3.0-rc.1
+  deployments qa "eshop-api=index.docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$other_digest"
+  expect refuse "eshop-api runs docker.io/pkhamdee/eshop-api:0.3.0-rc.1@$other_digest" qa 0.3.0-rc.1
+  deployments qa "eshop-api=index.docker.io/pkhamdee/eshop-api:0.2.0@$api_digest"
+  expect refuse "eshop-api runs docker.io/pkhamdee/eshop-api:0.2.0@" qa 0.3.0-rc.1
 }
 
 qa_takes_only_a_release_candidate() {
@@ -252,7 +277,9 @@ dev_takes_only_a_commit() {
 
 refuses_when_the_environment_has_no_kustomization
 refuses_an_image_whose_tag_only_starts_with_the_version
-accepts_an_image_pinned_by_digest_too
+refuses_an_image_at_another_digest_than_the_pin
+refuses_when_the_kustomization_pins_no_digest
+reads_index_docker_io_as_docker_io
 qa_takes_only_a_release_candidate
 prod_takes_only_a_release
 serves_dev_at_the_main_commit_flux_applied

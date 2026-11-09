@@ -206,12 +206,20 @@ chmod +x "$work/bin/gh" "$work/bin/crane" "$work/bin/oras" "$work/bin/cosign"
 export PATH="$work/bin:$PATH" GH_LOG="$work/gh.log" GH_STATE="$work/gh-state" CRANE_LOG="$work/crane.log" ORAS_LOG="$work/oras.log"
 export COSIGN_LOG="$work/cosign.log"
 
+# A service's fake digest (sha256 and 64 hex digits), the same at every version; and every service's image at a
+# version, one per line (<name>:<version>@<digest>), as CI and sign-off list them: images_at <version> [registry]
+services=$(jq -r '.[].service' "$root/.github/services.json")
+fake_digest() { echo "sha256:$(echo "$1" | git hash-object --stdin)$(echo "x$1" | git hash-object --stdin | cut -c1-24)"; }
+images_at() { local svc; for svc in $services; do echo "${2:-docker.io/pkhamdee}/$svc:$1@$(fake_digest "$svc")"; done; }
+# pin-release.sh <env> <version> in $clone with every service's fake digest (PIN_IMAGES), as a promotion pins it.
+pin_in_clone() { (cd "$clone" && PIN_IMAGES=$(images_at "$2") scripts/pin-release.sh "$1" "$2" >/dev/null 2>&1); }
+
 # This checkout's clusters/local with the pins as they were before QA's first release candidate (prod on 0.2.0,
 # apps-qa suspended), whatever main pins now: promotions change the live pins, and the tests must not change with them.
 clusters="$work/clusters"
 cp -R "$root/clusters/local" "$clusters"
-for f in "$clusters"/*.yaml; do
-  sed -E 's|: "?[^" #]*"? +(# release-pin: [a-z]+)$|: "0.2.0" \1|' "$f" >"$f.pins" && mv "$f.pins" "$f"
+for env in qa prod; do
+  PIN_DIR=$clusters PIN_IMAGES=$(images_at 0.2.0) "$root/scripts/pin-release.sh" "$env" 0.2.0 >/dev/null
 done
 if ! grep -q ' # release-pin-until: qa$' "$clusters/qa-release.yaml"; then
   awk '{ print } /^  name: apps-qa$/ { found = 1 } found && /^spec:$/ { print "  suspend: true # release-pin-until: qa"; found = 0 }' \
@@ -587,7 +595,8 @@ pin() { PIN_DIR="$work/pins" "$root/scripts/pin-release.sh" "$@" >"$work/out" 2>
 suspended_until_first_release() {
   # QA has no release yet in $clusters: suspended until the first candidate is pinned; prod never is.
   pin --suspended qa && ! pin --suspended prod \
-    && pin qa 0.3.0-rc.1 && ! pin --suspended qa && pin qa && [ "$(cat "$work/out")" = 0.3.0-rc.1 ]
+    && PIN_IMAGES=$(images_at 0.3.0-rc.1) pin qa 0.3.0-rc.1 && ! pin --suspended qa && pin qa \
+    && [ "$(cat "$work/out")" = 0.3.0-rc.1 ]
 }
 check "pin-release.sh --suspended <env> says (exit code) whether the env has no release yet; pinning one starts it" \
   suspended_until_first_release
@@ -597,6 +606,67 @@ no_pin_is_an_error() { # exit 2, not 1: "not suspended" must not be read into a 
   [ "$status" = 2 ] && grep -qF "no '# release-pin: dev' lines" "$work/out"
 }
 check "pin-release.sh --suspended fails (exit 2) for an env with no pin" no_pin_is_an_error
+pins_state() { cat "$work/pins"/*.yaml; }
+pins_digests_from_images() {
+  # Each pinned image gets the digest PIN_IMAGES lists at that version (other versions' and services' lines ignored);
+  # --images reads them back, and the version stays alone on its own lines.
+  PIN_IMAGES="$(images_at 0.3.0-rc.2)
+docker.io/pkhamdee/eshop-web:0.3.0-rc.1@sha256:$(printf 'f%.0s' $(seq 64))" pin qa 0.3.0-rc.2 || return 1
+  pin --images qa && [ "$(cat "$work/out")" = "$(images_at 0.3.0-rc.2 | grep -v thirdparty-mock)" ] \
+    && [ "$(grep -c '^      digest: "sha256:[0-9a-f]\{64\}" # release-pin: qa$' "$work/pins/qa-release.yaml")" -eq 4 ] \
+    && [ "$(grep -c '"0.3.0-rc.2" # release-pin: qa$' "$work/pins/qa-release.yaml")" -eq 5 ] \
+    && PIN_IMAGES=$(images_at 0.3.0-rc.2) pin qa 0.3.0-rc.2 && [ "$(grep -c 'digest:' "$work/pins/qa-release.yaml")" -eq 4 ]
+}
+check "pin-release.sh <env> <version> pins each image's digest from PIN_IMAGES beside its tag; --images reads them" \
+  pins_digests_from_images
+missing_digest_changes_nothing() {
+  local before
+  before=$(pins_state)
+  ! PIN_IMAGES=$(images_at 0.3.0-rc.3 | grep -v eshop-web) pin qa 0.3.0-rc.3 \
+    && grep -qF 'no digest at 0.3.0-rc.3 for: docker.io/pkhamdee/eshop-web (in PIN_IMAGES); nothing changed' "$work/out" \
+    && [ "$(pins_state)" = "$before" ] \
+    && ! pin qa 0.3.0-rc.3 && grep -qF 'no digests for 0.3.0-rc.3: give its images in PIN_IMAGES' "$work/out" \
+    && [ "$(pins_state)" = "$before" ]
+}
+check "pin-release.sh refuses, changing nothing, when an image has no digest at the version (or none is given)" \
+  missing_digest_changes_nothing
+# shellcheck disable=SC2016 # Markdown's backticks, not expansions
+rollback_pins_recorded_digests() {
+  # A rollback to 0.2.0: the digests its record lists for its candidate's images (0.2.0 copies them by digest).
+  local records="$work/records" before
+  mkdir -p "$records"
+  { printf '# Release 0.2.0\n\nCandidate: `v0.2.0-rc.3`\n\n## Images\n\n'
+    images_at 0.2.0-rc.3 | sed -E 's/^(.*)$/- `\1`, built from `abc`; SBOM attached; signed/'
+    echo "- \`docker.io/pkhamdee/eshop-api:0.2.0-rc.2@sha256:$(printf 'e%.0s' $(seq 64))\`, an earlier candidate"
+  } >"$records/0.2.0.md"
+  RELEASES_DIR=$records pin prod 0.2.0 && pin --images prod \
+    && [ "$(cat "$work/out")" = "$(images_at 0.2.0 | grep -v thirdparty-mock)" ] || return 1
+  before=$(pins_state)
+  ! RELEASES_DIR=$records pin prod 0.1.9 && grep -qF 'or, for a release, its record releases/0.1.9.md' "$work/out" \
+    && [ "$(pins_state)" = "$before" ] || return 1
+  sed 's/^Candidate: .*$/Candidate: `v0.1.0-rc.1`/' "$records/0.2.0.md" >"$records/0.2.1.md"
+  ! RELEASES_DIR=$records pin prod 0.2.1 && grep -qF 'names no candidate of 0.2.1' "$work/out" && [ "$(pins_state)" = "$before" ]
+}
+check "pin-release.sh prod X.Y.Z (a rollback) pins the digests releases/X.Y.Z.md records; refuses without a record" \
+  rollback_pins_recorded_digests
+reading_needs_digests() {
+  local f="$work/pins/prod-release.yaml"
+  cp "$f" "$work/prod-pin"
+  # An image added with only its newTag line: unreadable until the next pin writes its digest.
+  awk '{ print } /^  images:$/ { print "    - name: docker.io/pkhamdee/eshop-new\n      newTag: \"0.2.0\" # release-pin: prod" }' \
+    "$work/prod-pin" >"$f"
+  ! pin prod && grep -qF "prod pins no sha256 digest for: docker.io/pkhamdee/eshop-new" "$work/out" || return 1
+  PIN_IMAGES="$(images_at 0.2.0)
+docker.io/pkhamdee/eshop-new:0.2.0@$(fake_digest eshop-new)" pin prod 0.2.0 \
+    && pin --images prod && grep -qxF "docker.io/pkhamdee/eshop-new:0.2.0@$(fake_digest eshop-new)" "$work/out" || return 1
+  sed 's/^\(      digest: "sha256:\)[0-9a-f]*/\1abc/' "$work/prod-pin" >"$f"
+  ! pin prod && grep -qF "prod pins no sha256 digest for: docker.io/pkhamdee/eshop-api" "$work/out"
+  local status=$?
+  cp "$work/prod-pin" "$f"
+  return $status
+}
+check "pin-release.sh fails to read a pin with an image without a sha256 digest; pinning writes a new entry's digest" \
+  reading_needs_digests
 
 # --- scripts/promotion-pr.sh (CI's QA promotion job; sign-off's prod promotion) ---
 
@@ -607,8 +677,8 @@ rc_commit=$(git -C "$clone" rev-parse 'v0.3.0-rc.1^{commit}')
 git -C "$clone" commit -q --allow-empty -m "main moves on"
 git -C "$clone" push -q origin HEAD:main
 git -C "$clone" reset -q --hard HEAD~1                       # a stale checkout: the PR must start from origin/main
-export PROMOTION_IMAGES="docker.io/pkhamdee/eshop-api:0.3.0-rc.1@sha256:aaaa
-docker.io/pkhamdee/eshop-web:0.3.0-rc.1@sha256:bbbb"
+PROMOTION_IMAGES=$(images_at 0.3.0-rc.1)
+export PROMOTION_IMAGES
 export PROMOTION_DETAILS="### Gates
 CI run: https://github.com/test/run/1"
 promote() { (cd "$clone" && scripts/promotion-pr.sh "$@") >"$work/out" 2>&1; }
@@ -620,9 +690,10 @@ pin_commit_and_body() {
   [ "$(git -C "$clone" rev-parse "$branch~1")" = "$(origin rev-parse main)" ] \
     && [ "$(git -C "$clone" log -1 --format=%s "$branch")" = "eshop-qa: deploy v0.3.0-rc.1" ] \
     && [ "$(git -C "$clone" diff --name-only "$branch~1" "$branch")" = clusters/local/qa-release.yaml ] \
-    && (cd "$clone" && git checkout -q "$branch" && [ "$(scripts/pin-release.sh qa 2>/dev/null)" = 0.3.0-rc.1 ]) \
+    && (cd "$clone" && git checkout -q "$branch" && [ "$(scripts/pin-release.sh qa 2>/dev/null)" = 0.3.0-rc.1 ] \
+      && [ "$(scripts/pin-release.sh --images qa)" = "$(images_at 0.3.0-rc.1 | grep -v thirdparty-mock)" ]) \
     && ! grep -q 'release-pin-until: qa$' "$clone/clusters/local/qa-release.yaml" \
-    && grep -qF 'docker.io/pkhamdee/eshop-web:0.3.0-rc.1@sha256:bbbb' "$work/out" \
+    && grep -qF "docker.io/pkhamdee/eshop-web:0.3.0-rc.1@$(fake_digest eshop-web)" "$work/out" \
     && grep -qF 'CI run: https://github.com/test/run/1' "$work/out" \
     && grep -qF "$rc_commit" "$work/out" \
     && grep -qF 'https://qa.eshop.localhost' "$work/out" \
@@ -652,11 +723,41 @@ wrong_env_refused() {
     && ! PROMOTION_PUSH=0 promote qa 0.3.0 && grep -qF 'eshop-qa takes a release candidate X.Y.Z-rc.N' "$work/out"
 }
 check "promotion-pr.sh refuses a candidate for prod and a release for QA (scripts/lib/versions.sh)" wrong_env_refused
+by_hand_resolves_candidate_digests() {
+  # No PROMOTION_IMAGES (a person runs it): the candidate's digests as the registry has them now, listed in the body.
+  local svc
+  git -C "$clone" checkout -q main
+  for svc in eshop-api eshop-web eshop-node-api eshop-sync-master; do put_image "$svc" 0.3.0-rc.1 "$(fake_digest "$svc")"; done
+  PROMOTION_IMAGES='' PROMOTION_PUSH=0 promote qa 0.3.0-rc.1 \
+    && (cd "$clone" && [ "$(scripts/pin-release.sh --images qa)" = "$(images_at 0.3.0-rc.1 | grep -v thirdparty-mock)" ]) \
+    && grep -qF -- "- \`docker.io/pkhamdee/eshop-sync-master:0.3.0-rc.1@$(fake_digest eshop-sync-master)\`" "$work/out" || return 1
+  git -C "$clone" checkout -q main
+  rm "$REGISTRY/docker.io/pkhamdee/eshop-web/0.3.0-rc.1"
+  ! PROMOTION_IMAGES='' PROMOTION_PUSH=0 promote qa 0.3.0-rc.1 && grep -qF 'image docker.io/pkhamdee/eshop-web:0.3.0-rc.1 is missing' "$work/out"
+}
+check "promotion-pr.sh for a candidate without PROMOTION_IMAGES pins and lists the registry's digests (refuses a missing image)" \
+  by_hand_resolves_candidate_digests
+# shellcheck disable=SC2016 # Markdown's backticks, not expansions
+rollback_pr_pins_recorded_digests() {
+  # A rollback by hand: prod back to 0.2.5, whose record on main names its images; no PROMOTION_IMAGES.
+  git -C "$clone" checkout -q -B main origin/main
+  mkdir -p "$clone/releases"
+  { printf '# Release 0.2.5\n\nCandidate: `v0.2.5-rc.1`\n\n## Images\n\n'
+    for svc in $services; do echo "- \`docker.io/pkhamdee/$svc:0.2.5-rc.1@sha256:$(printf '%s' "$svc" | shasum -a 256 | cut -c1-64)\`"; done
+  } >"$clone/releases/0.2.5.md"
+  git -C "$clone" add releases && git -C "$clone" commit -qm "Sign off v0.2.5-rc.1" && git -C "$clone" push -q origin HEAD:main
+  git -C "$clone" tag -a v0.2.5 -m "Release 0.2.5" && git -C "$clone" push -q origin refs/tags/v0.2.5
+  PROMOTION_IMAGES='' PROMOTION_PUSH=0 promote prod 0.2.5 \
+    && (cd "$clone" && scripts/pin-release.sh --images prod >"$work/pinned") \
+    && [ "$(grep -c . "$work/pinned")" -eq 4 ] \
+    && grep -qxF "docker.io/pkhamdee/eshop-web:0.2.5@sha256:$(printf eshop-web | shasum -a 256 | cut -c1-64)" "$work/pinned" \
+    && grep -qF -- "- \`docker.io/pkhamdee/eshop-web:0.2.5@sha256:$(printf eshop-web | shasum -a 256 | cut -c1-64)\`" "$work/out"
+}
+check "promotion-pr.sh prod X.Y.Z without PROMOTION_IMAGES (a rollback) pins and lists the digests releases/X.Y.Z.md records" \
+  rollback_pr_pins_recorded_digests
 
 # --- scripts/sign-off-pr.sh and scripts/sign-off.sh (sign-off by PR: e2e.yml opens it, sign-off.yml acts on its merge) ---
 
-services=$(jq -r '.[].service' "$root/.github/services.json")
-fake_digest() { echo "sha256:$(echo "$1" | git hash-object --stdin)$(echo "x$1" | git hash-object --stdin | cut -c1-24)"; }
 image() { echo "$REGISTRY/docker.io/pkhamdee/$1/$2"; } # the fake registry's file for image <service> tag <tag>
 sbom_file() { echo "$REGISTRY/.referrers/$(fake_digest "$1")/$1.cdx.json"; } # <service>'s candidate digest's SBOM
 # <service>'s candidate digest signed by the pipeline from [repository] (default its own, .github/services.json).
@@ -690,7 +791,7 @@ sign_off_setup() {
   git -C "$clone" tag -a v0.3.0-rc.1 -m "Release candidate 0.3.0-rc.1"
   git -C "$clone" push -q origin refs/tags/v0.3.0-rc.1
   rc_commit=$(git -C "$clone" rev-parse 'v0.3.0-rc.1^{commit}')
-  (cd "$clone" && scripts/pin-release.sh qa 0.3.0-rc.1 >/dev/null 2>&1)
+  pin_in_clone qa 0.3.0-rc.1
   GIT_COMMITTER_DATE=$pinned_at git -C "$clone" commit -qam "eshop-qa: deploy v0.3.0-rc.1"
   git -C "$clone" push -q origin HEAD:main
   export REGISTRY="$work/$1/registry"
@@ -708,7 +809,7 @@ pin_qa() { # pin_qa <candidate>: tags it (on rc.1's commit) if needed and pins Q
   origin rev-parse -q --verify "refs/tags/v$1" >/dev/null || {
     git -C "$clone" tag -a "v$1" -m "Release candidate $1" 'v0.3.0-rc.1^{commit}' && git -C "$clone" push -q origin "refs/tags/v$1"
   }
-  (cd "$clone" && scripts/pin-release.sh qa "$1" >/dev/null 2>&1)
+  pin_in_clone qa "$1"
   git -C "$clone" commit -qam "eshop-qa: deploy v$1" && git -C "$clone" push -q origin HEAD:main
 }
 # A service repository's CI run of a commit, as `gh api` lists it (scripts/gate-reports.sh): its push job ended
@@ -977,6 +1078,34 @@ other_release_image_refused() {
   return $refused
 }
 check "sign-off.sh refuses to overwrite a release image with another digest" other_release_image_refused
+repointed_candidate_refused() {
+  # The candidate's tag repointed after QA's promotion pinned its digest: QA never ran that image.
+  local repointed
+  repointed=sha256:$(printf 'd%.0s' $(seq 64))
+  echo "$repointed" >"$(image eshop-web 0.3.0-rc.1)"
+  sign_off_refused "docker.io/pkhamdee/eshop-web:0.3.0-rc.1 is $repointed, not $(fake_digest eshop-web) as eshop-qa's pin on main has it"
+  local refused=$?
+  fake_digest eshop-web >"$(image eshop-web 0.3.0-rc.1)"
+  return $refused
+}
+check "sign-off.sh refuses when a candidate image's digest differs from the one QA's pin on main has (the tag was repointed)" \
+  repointed_candidate_refused
+record_digest_refused() {
+  # The record (what a rollback to 0.3.0 pins) lists another digest than the candidate's.
+  local saved_before=$before saved_after=$after other
+  other=sha256:$(printf 'd%.0s' $(seq 64))
+  sed "s/$(fake_digest eshop-node-api)/$other/" "$clone/releases/0.3.0.md" >"$work/record" \
+    && mv "$work/record" "$clone/releases/0.3.0.md"
+  git -C "$clone" commit -qam "Sign off v0.3.0-rc.1" && git -C "$clone" push -q origin HEAD:main
+  before=$after after=$(origin rev-parse refs/heads/main)
+  sign_off_refused "releases/0.3.0.md lists docker.io/pkhamdee/eshop-node-api:0.3.0-rc.1@$other, but its digest is $(fake_digest eshop-node-api)"
+  local refused=$?
+  git -C "$clone" reset -q --hard HEAD~1 && git -C "$clone" push -q --force origin HEAD:main
+  before=$saved_before after=$saved_after
+  return $refused
+}
+check "sign-off.sh refuses when the record lists another digest than the candidate's (a rollback pins the record's)" \
+  record_digest_refused
 released_refused() {
   git -C "$clone" tag -a v0.3.0 -m "Release 0.3.0" origin/main # not this candidate's commit, not a sign-off
   git -C "$clone" push -q origin refs/tags/v0.3.0
@@ -1025,6 +1154,8 @@ signs_off() {
     && release_sboms && grep -qxF '### SBOMs' "$release" \
     && [ "$(origin log -1 --format=%s refs/heads/promote/prod-0.3.0)" = "eshop-prod: deploy v0.3.0" ] \
     && [ "$(origin show refs/heads/promote/prod-0.3.0:clusters/local/prod-release.yaml | grep -c '"0.3.0" # release-pin: prod$')" -ge 2 ] \
+    && origin show refs/heads/promote/prod-0.3.0:clusters/local/prod-release.yaml \
+      | grep -qxF "      digest: \"$(fake_digest eshop-sync-master)\" # release-pin: prod" \
     && lists_images "$pr" 0.3.0 && grep -qF "$qa_run" "$pr" && grep -qF '@qa-lead' "$pr" \
     && grep -qF 'https://github.com/test/releases/tag/v0.3.0' "$pr" \
     && grep -qF 'Promotion PR: https://github.com/test/pull/1' "$work/out"
@@ -1198,7 +1329,7 @@ clone=$(fresh promotion-targets)
 promoted() { # promoted <env> <version>...: pins each <env> to its <version> in one commit pushed to main; prints before, after
   local before
   before=$(git -C "$clone" rev-parse HEAD)
-  while [ $# -gt 0 ]; do (cd "$clone" && scripts/pin-release.sh "$1" "$2" >/dev/null 2>&1) || return 1; shift 2; done
+  while [ $# -gt 0 ]; do pin_in_clone "$1" "$2" || return 1; shift 2; done
   git -C "$clone" commit -qam "promote" && git -C "$clone" push -q origin HEAD:main
   echo "$before $(git -C "$clone" rev-parse HEAD)"
 }

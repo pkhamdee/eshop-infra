@@ -1,7 +1,8 @@
 # eshop-qa = one release candidate, pinned here: its manifests (deploy/apps/qa at tag vX.Y.Z-rc.N) and its
 # X.Y.Z-rc.N images. Same shape as prod-release.yaml.
 #
-# The pin is the lines ending in `# release-pin: qa`; they always hold the same exact version. QA moves only when
+# The pin is the lines ending in `# release-pin: qa`; they always hold the same exact version, and each image's
+# digest (it runs as <image>:X.Y.Z-rc.N@sha256:..., so a repointed tag changes nothing). QA moves only when
 # a QA promotion PR changes them and is merged (merging is QA's approval). Nothing follows tags automatically.
 #
 #   scripts/pin-release.sh qa                 # the pinned release candidate
@@ -40,16 +41,20 @@ spec:
     provider: sops
     secretRef:
       name: sops-age
-  # The pinned release candidate's images (deploy/apps/qa has no tags). Every QA service needs a line here.
+  # The pinned release candidate's images, by digest (deploy/apps/qa has no tags). Every QA service needs an entry here.
   images:
     - name: docker.io/pkhamdee/eshop-api
       newTag: "0.7.0-rc.1" # release-pin: qa
+      digest: "sha256:447fb7736b852a69cde1e1a31dcc00758fe4116013a2f1db29f3f5956725f1f4" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-web
       newTag: "0.7.0-rc.1" # release-pin: qa
+      digest: "sha256:78b4c5d89659985aa8c9c8eefc17d3ae9c2ff86d7cf326ff947f1810d445ca0d" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-node-api
       newTag: "0.7.0-rc.1" # release-pin: qa
+      digest: "sha256:f767947a56876e315e3b165e6a78c83de408c84f48ff4b19b217d4b1c6c3ef9d" # release-pin: qa
     - name: docker.io/pkhamdee/eshop-sync-master
       newTag: "0.7.0-rc.1" # release-pin: qa
+      digest: "sha256:aaa6d312411b1cac742b9cdd10509038869eaf3b86ebca3a7bef2cd8dff6253e" # release-pin: qa
 ---
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
