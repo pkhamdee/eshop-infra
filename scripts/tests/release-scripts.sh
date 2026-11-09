@@ -15,6 +15,7 @@
 #                                  and each service repository's ruleset, publish environment and issues (dry run
 #                                  and apply)
 #   scripts/clone-all.sh           clones the service repositories beside this one
+#   scripts/ci/tools.sh            CI's tools: pinned version and SHA-256, cached, retried
 #   scripts/watchdog.sh            silent failures: queued smoke tests, Flux objects not Ready, the webhook down
 #   scripts/gates/pins.sh          actions, base images and charts pinned (repo rules, the shared gates' SAST job)
 #   scripts/gates/tags-to-push.sh, attach-sbom.sh, sign-images.sh   the image push jobs: never an existing tag;
@@ -1578,10 +1579,19 @@ rm -rf "$GH_STATE/deployments"
 
 # Fake curl: logs its arguments to $CURL_LOG, keeps the --config it reads on stdin (the credentials) as
 # $CURL_MAIL.config and the message it would upload (--upload-file) as $CURL_MAIL, also appended to $CURL_MAIL.all
-# (every message since notify() started). Sends nothing.
+# (every message since notify() started). Sends nothing. A download (--output <file> <url>) is the file named like the
+# URL's last part in $FAKE_DOWNLOADS, or fails as a 504 would (also for a URL matching $FAKE_DOWNLOAD_FAIL).
 cat >"$work/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 echo "curl $*" >>"$CURL_LOG"
+if [[ " $* " == *" --output "* ]]; then
+  url=${*: -1} out=""
+  args=("$@"); for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" != --output ] || out=${args[$((i + 1))]}; done
+  if [ -n "${FAKE_DOWNLOAD_FAIL:-}" ] && [[ "$url" == *$FAKE_DOWNLOAD_FAIL* ]] || [ ! -f "${FAKE_DOWNLOADS:-/nonexistent}/${url##*/}" ]; then
+    echo "curl: (22) The requested URL returned error: 504" >&2; exit 22
+  fi
+  cp "$FAKE_DOWNLOADS/${url##*/}" "$out"; exit 0
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --upload-file) cp "$2" "$CURL_MAIL"; cat "$2" >>"$CURL_MAIL.all" ;;
@@ -2197,6 +2207,50 @@ check "watchdog.sh report opens one issue and emails once, updates it silently, 
 report_needs_mail() { ! SMTP_PASSWORD='' watchdog report queue "$work/problems" && grep -qF 'no SMTP_PASSWORD' "$work/out"; }
 check "watchdog.sh report fails, naming it, when a mail setting is missing" report_needs_mail
 unset SMTP_USERNAME SMTP_PASSWORD NOTIFY_EMAIL NOW
+
+# --- scripts/ci/tools.sh (CI's tools: pinned version and SHA-256, cached, retried; #158) ---
+
+tools_dir="$work/tools"
+export FAKE_DOWNLOADS="$tools_dir/downloads" TOOLS_CACHE="$tools_dir/cache" TOOLS_ARCH=amd64
+tools_setup() { # a copy of tools.sh, and crane 9.9.9 (an archive) and cosign 9.9.9 (a binary) published with checksums
+  rm -rf "$tools_dir" && mkdir -p "$tools_dir/scripts/ci" "$FAKE_DOWNLOADS" "$tools_dir/build"
+  cp "$root/scripts/ci/tools.sh" "$tools_dir/scripts/ci/tools.sh"
+  local a
+  for a in x86_64 arm64; do
+    printf '#!/bin/sh\necho crane-%s\n' "$a" >"$tools_dir/build/crane" && chmod +x "$tools_dir/build/crane"
+    tar -czf "$FAKE_DOWNLOADS/go-containerregistry_Linux_$a.tar.gz" -C "$tools_dir/build" crane
+  done
+  for a in amd64 arm64; do printf '#!/bin/sh\necho cosign-%s\n' "$a" >"$FAKE_DOWNLOADS/cosign-linux-$a"; done
+  (cd "$FAKE_DOWNLOADS" && shasum -a 256 go-containerregistry_Linux_*.tar.gz >checksums.txt && shasum -a 256 cosign-linux-* >cosign_checksums.txt)
+}
+tools() { : >"$CURL_LOG"; "$tools_dir/scripts/ci/tools.sh" "$@" >"$work/out" 2>&1; }
+tools_pin_install() {
+  tools_setup && tools pin crane 9.9.9 && tools pin cosign v9.9.9 || return 1
+  grep -qE '^crane +9\.9\.9 +github-releases:google/go-containerregistry ' "$tools_dir/scripts/ci/tools.sh" \
+    && grep -qF "$(shasum -a 256 "$FAKE_DOWNLOADS/go-containerregistry_Linux_x86_64.tar.gz" | cut -d' ' -f1)" "$tools_dir/scripts/ci/tools.sh" || return 1
+  tools install crane cosign && [ "$("$TOOLS_CACHE/bin/crane")" = crane-x86_64 ] && [ "$("$TOOLS_CACHE/bin/cosign")" = cosign-amd64 ] || return 1
+  tools install crane cosign && grep -qF 'crane 9.9.9: from the cache' "$work/out" && grep -qF 'cosign 9.9.9: from the cache' "$work/out" \
+    && ! grep -q -- '--output' "$CURL_LOG"
+}
+check "tools.sh pin writes a version and its published checksums; install puts archive and binary tools on the path, then reuses the cache" \
+  tools_pin_install
+tools_checksum_mismatch() {
+  tools_setup && tools pin cosign 9.9.9 || return 1
+  echo tampered >"$FAKE_DOWNLOADS/cosign-linux-amd64"
+  ! tools install cosign && grep -qF 'not the pinned' "$work/out" && grep -qF 'scripts/ci/tools.sh pin cosign 9.9.9' "$work/out" \
+    && [ ! -e "$TOOLS_CACHE/bin/cosign" ]
+}
+check "tools.sh install refuses a download whose SHA-256 isn't the pinned one, installing nothing and saying how to re-pin" \
+  tools_checksum_mismatch
+tools_download_fails() {
+  tools_setup && tools pin crane 9.9.9 && tools pin cosign 9.9.9 || return 1
+  ! FAKE_DOWNLOAD_FAIL=go-containerregistry tools install crane cosign && grep -qF 'FAILED: crane not installed' "$work/out" \
+    && [ "$("$TOOLS_CACHE/bin/cosign")" = cosign-amd64 ] && grep -qF -- '--retry 6' "$CURL_LOG" && grep -qF -- '--retry-all-errors' "$CURL_LOG"
+}
+check "tools.sh install retries a failing download, installs the other tools, then fails naming the one it couldn't" tools_download_fails
+tools_unknown() { tools_setup && ! tools install crane nope && grep -qF 'unknown tool nope' "$work/out" && ! grep -q -- '--output' "$CURL_LOG"; }
+check "tools.sh install refuses an unknown tool before downloading anything" tools_unknown
+unset FAKE_DOWNLOADS TOOLS_CACHE TOOLS_ARCH
 
 # --- scripts/check-enterprise-schema.sh (the deployed mock Enterprise schema is the one the sync master is tested with) ---
 
